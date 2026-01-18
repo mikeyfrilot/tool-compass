@@ -57,6 +57,9 @@ dmypy.json
 .env.*.local
 *.env
 
+# Local config (use compass_config.example.json as template)
+compass_config.json
+
 # Database files (generated at runtime)
 db/*.db
 db/*.hnsw

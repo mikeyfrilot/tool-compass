@@ -51,20 +51,20 @@ def main():
     
     # Run tests
     print("\n[4/4] Running tests...")
-    run("python compass_server.py --test")
+    run("python gateway.py --test")
     
     print("\n" + "="*60)
     print("SETUP COMPLETE!")
     print("="*60)
     print("\nTo start the server:")
-    print("  python compass_server.py")
+    print("  python gateway.py")
     print("\nTo use with Claude Desktop, add to config:")
     print('''
 {
   "mcpServers": {
     "tool-compass": {
       "command": "python",
-      "args": ["/path/to/tool-compass/compass_server.py"]
+      "args": ["/path/to/tool-compass/gateway.py"]
     }
   }
 }

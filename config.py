@@ -15,6 +15,7 @@ from pathlib import Path
 import json
 import os
 import sys
+import re
 
 
 @dataclass
@@ -83,9 +84,29 @@ class CompassConfig:
 
     @classmethod
     def from_file(cls, path: Path) -> "CompassConfig":
-        """Load config from JSON file."""
+        """Load config from JSON file with variable substitution."""
         with open(path) as f:
             data = json.load(f)
+
+        # Get defaults for variable substitution
+        defaults = data.get("defaults", {})
+
+        # Also check environment variables (env vars take precedence)
+        def resolve_var(match):
+            var_name = match.group(1)
+            return os.environ.get(var_name, defaults.get(var_name, match.group(0)))
+
+        # Recursively substitute ${VAR} patterns
+        def substitute(obj):
+            if isinstance(obj, str):
+                return re.sub(r'\$\{(\w+)\}', resolve_var, obj)
+            elif isinstance(obj, dict):
+                return {k: substitute(v) for k, v in obj.items()}
+            elif isinstance(obj, list):
+                return [substitute(item) for item in obj]
+            return obj
+
+        data = substitute(data)
         return cls.from_dict(data)
 
     @classmethod

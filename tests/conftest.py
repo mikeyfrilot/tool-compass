@@ -239,6 +239,117 @@ def test_analytics(temp_analytics_db):
 
 
 # =============================================================================
+# Backend Client Fixtures
+# =============================================================================
+
+@pytest.fixture
+def mock_backend_manager():
+    """Mock BackendManager for gateway tests."""
+    manager = Mock()
+    manager._backends = {}
+    manager.connect_backend = AsyncMock(return_value=True)
+    manager.connect_all = AsyncMock(return_value={})
+    manager.disconnect_all = AsyncMock()
+    manager.get_all_tools = Mock(return_value=[])
+    manager.get_backend_tools = Mock(return_value=[])
+    manager.get_tool_schema = Mock(return_value=None)
+    manager.execute_tool = AsyncMock(return_value={"success": True, "result": "ok"})
+    manager.get_stats = Mock(return_value={
+        "configured_backends": [],
+        "connected_backends": [],
+        "total_tools": 0,
+        "tools_by_backend": {},
+    })
+
+    return manager
+
+
+# =============================================================================
+# Chain Indexer Fixtures
+# =============================================================================
+
+@pytest.fixture
+def temp_chain_db(temp_db_dir: Path) -> Path:
+    """Path for temporary chain database."""
+    import sqlite3
+
+    db_path = temp_db_dir / "test_chains.db"
+
+    # Create required tables
+    db = sqlite3.connect(str(db_path))
+    db.execute("""
+        CREATE TABLE IF NOT EXISTS tool_chains (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            chain_name TEXT UNIQUE NOT NULL,
+            chain_tools TEXT NOT NULL,
+            description TEXT,
+            use_count INTEGER DEFAULT 0,
+            is_auto_detected INTEGER DEFAULT 0,
+            embedding_text TEXT,
+            last_used_at TIMESTAMP,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    db.commit()
+    db.close()
+
+    return db_path
+
+
+@pytest.fixture
+def test_chain_indexer(mock_embedder, temp_chain_db, temp_db_dir):
+    """Test chain indexer with temp storage."""
+    from chain_indexer import ChainIndexer
+
+    chain_index_path = temp_db_dir / "test_chains.hnsw"
+
+    with patch("chain_indexer.ANALYTICS_DB_PATH", temp_chain_db):
+        with patch("chain_indexer.CHAIN_INDEX_PATH", chain_index_path):
+            with patch("chain_indexer.DB_DIR", temp_db_dir):
+                indexer = ChainIndexer(
+                    embedder=mock_embedder,
+                    analytics=None,
+                    top_chains_cache_size=5,
+                )
+                yield indexer
+                indexer.close()
+
+
+# =============================================================================
+# Sync Manager Fixtures
+# =============================================================================
+
+@pytest.fixture
+def temp_sync_db(temp_db_dir: Path) -> Path:
+    """Path for temporary sync state database."""
+    return temp_db_dir / "test_sync.db"
+
+
+@pytest.fixture
+def test_sync_manager(test_config, mock_backend_manager, temp_sync_db, temp_index_path, temp_db_path, mock_embedder, sample_tools):
+    """Test sync manager with mocks."""
+    from sync_manager import SyncManager
+    from indexer import CompassIndex
+    import asyncio
+
+    # Create a real index for sync manager
+    index = CompassIndex(
+        index_path=temp_index_path,
+        db_path=temp_db_path,
+        embedder=mock_embedder,
+    )
+
+    with patch("sync_manager.ANALYTICS_DB_PATH", temp_sync_db):
+        manager = SyncManager(
+            config=test_config,
+            index=index,
+            backends=mock_backend_manager,
+        )
+        yield manager
+        manager.close()
+
+
+# =============================================================================
 # Integration Test Markers
 # =============================================================================
 

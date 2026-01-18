@@ -172,7 +172,7 @@ class CompassAnalytics:
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 session_id TEXT,
                 tool_sequence TEXT NOT NULL,
-                sequence_hash TEXT,
+                sequence_hash TEXT UNIQUE,
                 occurrence_count INTEGER DEFAULT 1,
                 first_seen_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 last_seen_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
