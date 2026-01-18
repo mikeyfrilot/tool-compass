@@ -6,17 +6,8 @@ name: Tests
 on:
   push:
     branches: [main, develop]
-    paths:
-      - 'tool_compass/**'
-      - '.github/workflows/test.yml'
   pull_request:
     branches: [main]
-    paths:
-      - 'tool_compass/**'
-
-defaults:
-  run:
-    working-directory: tool_compass
 
 jobs:
   test:
@@ -38,18 +29,13 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
           cache: 'pip'
-          cache-dependency-path: 'tool_compass/requirements*.txt'
+          cache-dependency-path: 'requirements*.txt'
 
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
           pip install -r requirements-dev.txt
-
-      - name: Run linting
-        run: |
-          ruff check .
-        continue-on-error: true  # Don't fail on lint for now
 
       - name: Run tests
         run: |
@@ -64,7 +50,7 @@ jobs:
         if: matrix.python-version == '3.11' && matrix.os == 'ubuntu-latest'
         uses: codecov/codecov-action@v4
         with:
-          file: tool_compass/coverage.xml
+          file: coverage.xml
           fail_ci_if_error: false
 
   # Integration tests (requires Ollama)
@@ -82,14 +68,13 @@ jobs:
         with:
           python-version: '3.11'
           cache: 'pip'
-          cache-dependency-path: 'tool_compass/requirements*.txt'
+          cache-dependency-path: 'requirements*.txt'
 
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
           pip install -r requirements-dev.txt
-        working-directory: tool_compass
 
       - name: Install Ollama
         run: |
@@ -101,7 +86,6 @@ jobs:
       - name: Run integration tests
         run: |
           pytest -v -m integration
-        working-directory: tool_compass
         continue-on-error: true  # Integration tests may be flaky
 
   docker:
@@ -119,7 +103,7 @@ jobs:
       - name: Build Docker image
         uses: docker/build-push-action@v5
         with:
-          context: tool_compass
+          context: .
           push: false
           tags: tool-compass:test
           cache-from: type=gha

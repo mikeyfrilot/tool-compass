@@ -206,16 +206,15 @@ All backends are synced with valid hashes:
 ## 10. Test Commands
 
 ```bash
-# Run semantic search test
-cd F:/AI/mcp-tool-shop/tool_compass
-../venv/Scripts/python.exe -c "
+# Run semantic search test (from project root with venv activated)
+python -c "
 import asyncio
 from gateway import compass
 asyncio.run(compass('read a file'))
 "
 
 # Check backend status
-../venv/Scripts/python.exe -c "
+python -c "
 import asyncio
 from gateway import get_backends
 async def check():
@@ -226,7 +225,7 @@ asyncio.run(check())
 "
 
 # Launch Gradio UI
-../venv/Scripts/python.exe ui.py
+python ui.py
 ```
 
 ---

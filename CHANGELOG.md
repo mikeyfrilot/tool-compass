@@ -7,8 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.0.1] - 2026-01-18
+
 ### Added
-- Preparing for open-source release
+- `pyproject.toml` for modern Python packaging (PEP 517/518)
+- PyPI publishing workflow (GitHub Actions)
+- Optional dependencies: `[ui]`, `[dev]`, `[all]`
+
+### Changed
+- Fixed CI workflow paths for standalone repository
+- Removed hardcoded paths from documentation
+
+### Infrastructure
+- Published to PyPI as `tool-compass`
+- Added `PYPI_API_TOKEN` secret for automated releases
 
 ## [2.0.0] - 2026-01-17
 
@@ -107,7 +119,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 | 1.1.0 | 2026-01-16 | Workflows, analytics, sync |
 | 1.0.0 | 2026-01-15 | Initial release |
 
-[Unreleased]: https://github.com/mikeyfrilot/tool-compass/compare/v2.0.0...HEAD
+[Unreleased]: https://github.com/mikeyfrilot/tool-compass/compare/v2.0.1...HEAD
+[2.0.1]: https://github.com/mikeyfrilot/tool-compass/compare/v2.0.0...v2.0.1
 [2.0.0]: https://github.com/mikeyfrilot/tool-compass/compare/v1.1.0...v2.0.0
 [1.1.0]: https://github.com/mikeyfrilot/tool-compass/compare/v1.0.0...v1.1.0
 [1.0.0]: https://github.com/mikeyfrilot/tool-compass/releases/tag/v1.0.0
