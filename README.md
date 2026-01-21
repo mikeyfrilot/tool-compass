@@ -5,6 +5,7 @@
 **Semantic navigator for MCP tools - Find the right tool by intent, not memory**
 
 [![Tests](https://github.com/mikeyfrilot/tool-compass/actions/workflows/test.yml/badge.svg)](https://github.com/mikeyfrilot/tool-compass/actions/workflows/test.yml)
+[![codecov](https://codecov.io/gh/mikeyfrilot/tool-compass/graph/badge.svg)](https://codecov.io/gh/mikeyfrilot/tool-compass)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg?logo=python&logoColor=white)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Docker](https://img.shields.io/badge/docker-ready-blue.svg?logo=docker&logoColor=white)](https://www.docker.com/)
