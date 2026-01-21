@@ -47,7 +47,7 @@ dependencies = [
 
 [project.optional-dependencies]
 ui = [
-    "gradio>=5.0.0,<6.0.0",
+    "gradio>=5.0.0,<7.0.0",
 ]
 dev = [
     "pytest>=8.0.0",
