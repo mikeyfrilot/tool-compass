@@ -5,13 +5,12 @@ Tests HNSW index building, searching, and metadata management.
 """
 
 import pytest
-import numpy as np
 from pathlib import Path
 import sys
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from indexer import CompassIndex, SearchResult, EMBEDDING_DIM
+from indexer import CompassIndex, SearchResult
 from tool_manifest import ToolDefinition
 
 
@@ -19,7 +18,9 @@ class TestCompassIndex:
     """Test CompassIndex core functionality."""
 
     @pytest.mark.asyncio
-    async def test_build_index(self, temp_index_path, temp_db_path, mock_embedder, sample_tools):
+    async def test_build_index(
+        self, temp_index_path, temp_db_path, mock_embedder, sample_tools
+    ):
         """Should build index from tool definitions."""
         index = CompassIndex(
             index_path=temp_index_path,
@@ -37,7 +38,9 @@ class TestCompassIndex:
         await index.close()
 
     @pytest.mark.asyncio
-    async def test_load_index(self, test_index, temp_index_path, temp_db_path, mock_embedder):
+    async def test_load_index(
+        self, test_index, temp_index_path, temp_db_path, mock_embedder
+    ):
         """Should load existing index from disk."""
         # test_index fixture already built the index
         # Create new instance and load
@@ -95,7 +98,9 @@ class TestCompassIndex:
     @pytest.mark.asyncio
     async def test_search_category_filter(self, test_index):
         """Should filter results by category."""
-        results = await test_index.search("operations", top_k=10, category_filter="file")
+        results = await test_index.search(
+            "operations", top_k=10, category_filter="file"
+        )
 
         assert len(results) > 0
         for r in results:
@@ -114,10 +119,7 @@ class TestCompassIndex:
     async def test_search_combined_filters(self, test_index):
         """Should apply both category and server filters."""
         results = await test_index.search(
-            "file operations",
-            top_k=10,
-            category_filter="file",
-            server_filter="test"
+            "file operations", top_k=10, category_filter="file", server_filter="test"
         )
 
         for r in results:
@@ -128,9 +130,7 @@ class TestCompassIndex:
     async def test_search_empty_results(self, test_index):
         """Should return empty list when no matches."""
         results = await test_index.search(
-            "file operations",
-            top_k=10,
-            category_filter="nonexistent_category"
+            "file operations", top_k=10, category_filter="nonexistent_category"
         )
 
         assert results == []

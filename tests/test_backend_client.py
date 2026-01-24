@@ -7,8 +7,7 @@ Tests MCP backend connections, tool discovery, and execution.
 import pytest
 import asyncio
 from pathlib import Path
-from unittest.mock import Mock, AsyncMock, patch, MagicMock
-from dataclasses import dataclass
+from unittest.mock import Mock, AsyncMock, patch
 import sys
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -19,8 +18,6 @@ from backend_client import (
     ToolInfo,
     get_backend_manager,
     init_backends,
-    CONNECTION_TIMEOUT,
-    TOOL_CALL_TIMEOUT,
 )
 from config import CompassConfig, StdioBackend
 
@@ -28,6 +25,7 @@ from config import CompassConfig, StdioBackend
 # =============================================================================
 # ToolInfo Tests
 # =============================================================================
+
 
 class TestToolInfo:
     """Test ToolInfo dataclass."""
@@ -84,6 +82,7 @@ class TestToolInfo:
 # BackendConnection Tests
 # =============================================================================
 
+
 class TestBackendConnection:
     """Test BackendConnection class."""
 
@@ -132,20 +131,32 @@ class TestBackendConnection:
         # Mock the stdio_client context manager
         mock_session = AsyncMock()
         mock_session.initialize = AsyncMock()
-        mock_session.list_tools = AsyncMock(return_value=Mock(tools=[
-            Mock(name="tool1", description="Tool 1", inputSchema={}),
-            Mock(name="tool2", description="Tool 2", inputSchema={"type": "object"}),
-        ]))
+        mock_session.list_tools = AsyncMock(
+            return_value=Mock(
+                tools=[
+                    Mock(name="tool1", description="Tool 1", inputSchema={}),
+                    Mock(
+                        name="tool2",
+                        description="Tool 2",
+                        inputSchema={"type": "object"},
+                    ),
+                ]
+            )
+        )
 
         with patch("backend_client.stdio_client") as mock_stdio:
-            mock_stdio.return_value.__aenter__ = AsyncMock(return_value=(Mock(), Mock()))
+            mock_stdio.return_value.__aenter__ = AsyncMock(
+                return_value=(Mock(), Mock())
+            )
             mock_stdio.return_value.__aexit__ = AsyncMock()
 
             with patch("backend_client.ClientSession") as mock_client_session:
-                mock_client_session.return_value.__aenter__ = AsyncMock(return_value=mock_session)
+                mock_client_session.return_value.__aenter__ = AsyncMock(
+                    return_value=mock_session
+                )
                 mock_client_session.return_value.__aexit__ = AsyncMock()
 
-                success = await conn.connect(timeout=5.0)
+                await conn.connect(timeout=5.0)
 
         # Note: This test verifies the structure, actual connection requires real MCP server
 
@@ -213,6 +224,7 @@ class TestBackendConnection:
 # BackendManager Tests
 # =============================================================================
 
+
 class TestBackendManager:
     """Test BackendManager class."""
 
@@ -243,7 +255,7 @@ class TestBackendManager:
         """Should use default config if not provided."""
         with patch("backend_client.load_config") as mock_load:
             mock_load.return_value = CompassConfig(backends={})
-            manager = BackendManager()
+            BackendManager()
             mock_load.assert_called_once()
 
     def test_get_all_tools_empty(self, empty_config):
@@ -374,7 +386,9 @@ class TestBackendManager:
         """Should try to connect on-demand if backend not connected."""
         manager = BackendManager(config=config_with_backends)
 
-        with patch.object(manager, "connect_backend", new_callable=AsyncMock) as mock_connect:
+        with patch.object(
+            manager, "connect_backend", new_callable=AsyncMock
+        ) as mock_connect:
             mock_connect.return_value = False
 
             result = await manager.execute_tool("backend1:tool", {})
@@ -450,6 +464,7 @@ class TestBackendManager:
 # Singleton Tests
 # =============================================================================
 
+
 class TestSingletonFunctions:
     """Test singleton accessor functions."""
 
@@ -471,7 +486,6 @@ class TestSingletonFunctions:
     @pytest.mark.asyncio
     async def test_get_backend_manager_returns_same_instance(self):
         """Should return same instance on subsequent calls."""
-        import backend_client
 
         with patch("backend_client.load_config") as mock_load:
             mock_load.return_value = CompassConfig(backends={})
@@ -485,6 +499,7 @@ class TestSingletonFunctions:
     async def test_init_backends_without_connect(self):
         """Should initialize without connecting."""
         import backend_client
+
         backend_client._manager = None
 
         with patch("backend_client.load_config") as mock_load:
@@ -498,15 +513,18 @@ class TestSingletonFunctions:
     async def test_init_backends_with_connect(self):
         """Should connect all backends when requested."""
         import backend_client
+
         backend_client._manager = None
 
         with patch("backend_client.load_config") as mock_load:
             mock_load.return_value = CompassConfig(backends={})
 
-            with patch.object(BackendManager, "connect_all", new_callable=AsyncMock) as mock_connect:
+            with patch.object(
+                BackendManager, "connect_all", new_callable=AsyncMock
+            ) as mock_connect:
                 mock_connect.return_value = {}
 
-                manager = await init_backends(connect=True)
+                await init_backends(connect=True)
 
                 mock_connect.assert_called_once()
 
@@ -514,6 +532,7 @@ class TestSingletonFunctions:
 # =============================================================================
 # Integration-style Tests (Mocked)
 # =============================================================================
+
 
 class TestBackendManagerIntegration:
     """Integration-style tests with mocked backends."""
@@ -573,8 +592,13 @@ class TestBackendManagerIntegration:
         """Should find tool schema by qualified name."""
         # Mock the tool lookup
         manager_with_mock_backends._backends["bridge"].get_tools.return_value = [
-            ToolInfo("read_file", "bridge:read_file", "Read file", "bridge",
-                    {"type": "object", "properties": {"path": {"type": "string"}}}),
+            ToolInfo(
+                "read_file",
+                "bridge:read_file",
+                "Read file",
+                "bridge",
+                {"type": "object", "properties": {"path": {"type": "string"}}},
+            ),
         ]
 
         schema = manager_with_mock_backends.get_tool_schema("bridge:read_file")
@@ -595,6 +619,7 @@ class TestBackendManagerIntegration:
 # =============================================================================
 # Additional Coverage Tests
 # =============================================================================
+
 
 class TestBackendConnectionEdgeCases:
     """Additional edge case tests for BackendConnection."""
@@ -710,7 +735,9 @@ class TestBackendManagerEdgeCases:
         """Should handle exception during connect_all."""
         manager = BackendManager(config=config_with_backends)
 
-        with patch.object(BackendConnection, "connect", new_callable=AsyncMock) as mock_conn:
+        with patch.object(
+            BackendConnection, "connect", new_callable=AsyncMock
+        ) as mock_conn:
             # Make one backend raise an exception
             mock_conn.side_effect = [True, Exception("Connection error")]
 
@@ -724,7 +751,9 @@ class TestBackendManagerEdgeCases:
         """Should handle mixed success/failure results."""
         manager = BackendManager(config=config_with_backends)
 
-        with patch.object(BackendConnection, "connect", new_callable=AsyncMock) as mock_conn:
+        with patch.object(
+            BackendConnection, "connect", new_callable=AsyncMock
+        ) as mock_conn:
             # First succeeds, second fails
             mock_conn.side_effect = [True, False]
 
@@ -744,7 +773,9 @@ class TestBackendManagerEdgeCases:
         """Should create new connection for configured backend."""
         manager = BackendManager(config=config_with_backends)
 
-        with patch.object(BackendConnection, "connect", new_callable=AsyncMock) as mock_conn:
+        with patch.object(
+            BackendConnection, "connect", new_callable=AsyncMock
+        ) as mock_conn:
             mock_conn.return_value = True
             with patch.object(BackendConnection, "get_tools") as mock_tools:
                 mock_tools.return_value = [
@@ -855,6 +886,7 @@ class TestBackendManagerEdgeCases:
         manager = BackendManager(config=config_with_backends)
 
         call_count = 0
+
         async def mock_connect(*args, **kwargs):
             nonlocal call_count
             call_count += 1

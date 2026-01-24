@@ -60,11 +60,11 @@ all = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/mikeyfrilot/tool-compass"
-Documentation = "https://github.com/mikeyfrilot/tool-compass#readme"
-Repository = "https://github.com/mikeyfrilot/tool-compass.git"
-Issues = "https://github.com/mikeyfrilot/tool-compass/issues"
-Changelog = "https://github.com/mikeyfrilot/tool-compass/blob/main/CHANGELOG.md"
+Homepage = "https://github.com/mcp-tool-shop/tool-compass"
+Documentation = "https://github.com/mcp-tool-shop/tool-compass#readme"
+Repository = "https://github.com/mcp-tool-shop/tool-compass.git"
+Issues = "https://github.com/mcp-tool-shop/tool-compass/issues"
+Changelog = "https://github.com/mcp-tool-shop/tool-compass/blob/main/CHANGELOG.md"
 
 [project.scripts]
 tool-compass = "tool_compass.gateway:main"

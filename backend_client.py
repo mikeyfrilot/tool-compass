@@ -19,12 +19,13 @@ logger = logging.getLogger(__name__)
 
 # Timeout constants (in seconds)
 CONNECTION_TIMEOUT = 30  # Max time to establish backend connection
-TOOL_CALL_TIMEOUT = 60   # Max time for a single tool execution
+TOOL_CALL_TIMEOUT = 60  # Max time for a single tool execution
 
 
 @dataclass
 class ToolInfo:
     """Normalized tool information from a backend."""
+
     name: str  # Original tool name
     qualified_name: str  # server:tool_name format
     description: str
@@ -139,16 +140,22 @@ class BackendConnection:
         """Get normalized tool info list."""
         tools = []
         for tool in self._tools:
-            tools.append(ToolInfo(
-                name=tool.name,
-                qualified_name=f"{self.name}:{tool.name}",
-                description=tool.description or "",
-                server=self.name,
-                input_schema=tool.inputSchema if hasattr(tool, 'inputSchema') else {},
-            ))
+            tools.append(
+                ToolInfo(
+                    name=tool.name,
+                    qualified_name=f"{self.name}:{tool.name}",
+                    description=tool.description or "",
+                    server=self.name,
+                    input_schema=tool.inputSchema
+                    if hasattr(tool, "inputSchema")
+                    else {},
+                )
+            )
         return tools
 
-    async def call_tool(self, tool_name: str, arguments: Dict[str, Any]) -> CallToolResult:
+    async def call_tool(
+        self, tool_name: str, arguments: Dict[str, Any]
+    ) -> CallToolResult:
         """Call a tool on this backend."""
         if not self.session or not self._connected:
             raise RuntimeError(f"Not connected to backend: {self.name}")
@@ -196,7 +203,9 @@ class BackendManager:
                 backend_names.append(name)
                 tasks.append(conn.connect(timeout=timeout))
             else:
-                logger.warning(f"Backend type not yet supported: {type(backend)} for {name}")
+                logger.warning(
+                    f"Backend type not yet supported: {type(backend)} for {name}"
+                )
                 results[name] = False
 
         # Run all connections concurrently
@@ -280,7 +289,10 @@ class BackendManager:
             return None
 
         for tool in conn.get_tools():
-            if tool.qualified_name == qualified_name or tool.name == qualified_name.split(":")[-1]:
+            if (
+                tool.qualified_name == qualified_name
+                or tool.name == qualified_name.split(":")[-1]
+            ):
                 return tool.to_dict()
 
         return None
@@ -289,7 +301,7 @@ class BackendManager:
         self,
         qualified_name: str,
         arguments: Dict[str, Any],
-        timeout: Optional[float] = None
+        timeout: Optional[float] = None,
     ) -> Dict[str, Any]:
         """
         Execute a tool by its qualified name (server:tool_name).
@@ -338,30 +350,33 @@ class BackendManager:
         # Execute with timeout protection
         try:
             result = await asyncio.wait_for(
-                conn.call_tool(tool_name, arguments),
-                timeout=timeout
+                conn.call_tool(tool_name, arguments), timeout=timeout
             )
 
             # Parse result
             if result.isError:
                 return {
                     "success": False,
-                    "error": str(result.content) if result.content else "Tool returned error",
+                    "error": str(result.content)
+                    if result.content
+                    else "Tool returned error",
                 }
 
             # Extract content
             content = []
             for item in result.content:
-                if hasattr(item, 'text'):
+                if hasattr(item, "text"):
                     content.append(item.text)
-                elif hasattr(item, 'data'):
+                elif hasattr(item, "data"):
                     content.append(f"[Binary data: {item.mimeType}]")
                 else:
                     content.append(str(item))
 
             return {
                 "success": True,
-                "result": "\n".join(content) if content else "Tool executed successfully",
+                "result": "\n".join(content)
+                if content
+                else "Tool executed successfully",
             }
 
         except asyncio.TimeoutError:
@@ -387,8 +402,7 @@ class BackendManager:
             "connected_backends": connected,
             "total_tools": tool_count,
             "tools_by_backend": {
-                name: len(conn.get_tools())
-                for name, conn in self._backends.items()
+                name: len(conn.get_tools()) for name, conn in self._backends.items()
             },
         }
 

@@ -5,14 +5,12 @@ Tests usage tracking, hot cache, and chain detection.
 """
 
 import pytest
-import asyncio
-from datetime import datetime, timedelta
 from pathlib import Path
 import sys
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from analytics import CompassAnalytics, HotToolEntry, SearchRecord, ToolCallRecord
+from analytics import HotToolEntry
 
 
 class TestAnalyticsRecording:
@@ -21,10 +19,12 @@ class TestAnalyticsRecording:
     @pytest.mark.asyncio
     async def test_record_search(self, test_analytics):
         """Should record search queries."""
+
         # Create mock results
         class MockResult:
             class MockTool:
                 name = "test:read_file"
+
             tool = MockTool()
 
         results = [MockResult()]
@@ -150,9 +150,15 @@ class TestChainDetection:
     async def test_chain_pattern_recording(self, test_analytics):
         """Should record tool sequences for pattern detection."""
         # Simulate a workflow: read -> modify -> write
-        await test_analytics.record_tool_call("test:read_file", success=True, latency_ms=10)
-        await test_analytics.record_tool_call("test:process", success=True, latency_ms=20)
-        await test_analytics.record_tool_call("test:write_file", success=True, latency_ms=15)
+        await test_analytics.record_tool_call(
+            "test:read_file", success=True, latency_ms=10
+        )
+        await test_analytics.record_tool_call(
+            "test:process", success=True, latency_ms=20
+        )
+        await test_analytics.record_tool_call(
+            "test:write_file", success=True, latency_ms=15
+        )
 
         # Patterns are saved when sequence reaches certain length
         # The internal _session_tool_sequence should have these
@@ -162,14 +168,18 @@ class TestChainDetection:
         """Should detect frequently occurring tool sequences."""
         # Create a pattern that occurs multiple times
         for _ in range(5):  # More than chain_min_occurrences
-            await test_analytics.record_tool_call("test:step_a", success=True, latency_ms=10)
-            await test_analytics.record_tool_call("test:step_b", success=True, latency_ms=10)
+            await test_analytics.record_tool_call(
+                "test:step_a", success=True, latency_ms=10
+            )
+            await test_analytics.record_tool_call(
+                "test:step_b", success=True, latency_ms=10
+            )
 
         # Force pattern save
         await test_analytics._save_chain_pattern()
 
         # Detect chains
-        detected = await test_analytics.detect_chains()
+        await test_analytics.detect_chains()
 
         # Should find the a->b pattern
         # Note: detection requires min_occurrences (default 3)

@@ -5,12 +5,10 @@ Tests tool chain/workflow indexing, searching, and management.
 """
 
 import pytest
-import asyncio
 import json
 import numpy as np
 from pathlib import Path
-from unittest.mock import Mock, AsyncMock, patch, MagicMock
-import tempfile
+from unittest.mock import Mock, AsyncMock, patch
 import sqlite3
 import sys
 
@@ -28,6 +26,7 @@ from chain_indexer import (
 # =============================================================================
 # Fixtures
 # =============================================================================
+
 
 @pytest.fixture
 def mock_embedder():
@@ -131,6 +130,7 @@ def sample_chains():
 # ToolChain Dataclass Tests
 # =============================================================================
 
+
 class TestToolChainDataclass:
     """Test ToolChain dataclass."""
 
@@ -176,8 +176,12 @@ class TestChainSearchResult:
     def test_search_result_creation(self):
         """Should create search result."""
         chain = ToolChain(
-            id=1, name="test", tools=["t1"], description="",
-            use_count=0, is_auto_detected=False
+            id=1,
+            name="test",
+            tools=["t1"],
+            description="",
+            use_count=0,
+            is_auto_detected=False,
         )
         result = ChainSearchResult(chain=chain, score=0.85)
 
@@ -188,6 +192,7 @@ class TestChainSearchResult:
 # =============================================================================
 # Embedding Text Generation Tests
 # =============================================================================
+
 
 class TestEmbeddingTextGeneration:
     """Test embedding text generation."""
@@ -203,7 +208,9 @@ class TestEmbeddingTextGeneration:
         assert "write file" in text.lower() or "write" in text.lower()
         assert chain.description in text
 
-    def test_create_chain_embedding_text_includes_tools(self, chain_indexer, sample_chains):
+    def test_create_chain_embedding_text_includes_tools(
+        self, chain_indexer, sample_chains
+    ):
         """Should include tool names in embedding text."""
         chain = sample_chains[1]  # git_commit
 
@@ -216,6 +223,7 @@ class TestEmbeddingTextGeneration:
 # =============================================================================
 # Database Loading Tests
 # =============================================================================
+
 
 class TestDatabaseLoading:
     """Test loading chains from database."""
@@ -232,10 +240,20 @@ class TestDatabaseLoading:
         """Should load chains from database."""
         # Insert test data
         db = chain_indexer._get_db()
-        db.execute("""
+        db.execute(
+            """
             INSERT INTO tool_chains (chain_name, chain_tools, description, use_count, is_auto_detected, embedding_text)
             VALUES (?, ?, ?, ?, ?, ?)
-        """, ("test_chain", '["tool1", "tool2"]', "Test description", 5, 0, "test embedding text"))
+        """,
+            (
+                "test_chain",
+                '["tool1", "tool2"]',
+                "Test description",
+                5,
+                0,
+                "test embedding text",
+            ),
+        )
         db.commit()
 
         chains = await chain_indexer.load_chains_from_db()
@@ -249,14 +267,17 @@ class TestDatabaseLoading:
     async def test_load_chains_sorted_by_use_count(self, chain_indexer):
         """Should return chains sorted by use count descending."""
         db = chain_indexer._get_db()
-        db.executemany("""
+        db.executemany(
+            """
             INSERT INTO tool_chains (chain_name, chain_tools, description, use_count, is_auto_detected)
             VALUES (?, ?, ?, ?, ?)
-        """, [
-            ("low_use", '["t1"]', "", 1, 0),
-            ("high_use", '["t2"]', "", 100, 0),
-            ("mid_use", '["t3"]', "", 50, 0),
-        ])
+        """,
+            [
+                ("low_use", '["t1"]', "", 1, 0),
+                ("high_use", '["t2"]', "", 100, 0),
+                ("mid_use", '["t3"]', "", 50, 0),
+            ],
+        )
         db.commit()
 
         chains = await chain_indexer.load_chains_from_db()
@@ -269,6 +290,7 @@ class TestDatabaseLoading:
 # =============================================================================
 # Index Building Tests
 # =============================================================================
+
 
 class TestIndexBuilding:
     """Test HNSW index building."""
@@ -289,12 +311,19 @@ class TestIndexBuilding:
         assert chain_indexer.index.get_current_count() == len(sample_chains)
 
     @pytest.mark.asyncio
-    async def test_build_chain_index_generates_embeddings(self, chain_indexer, mock_embedder):
+    async def test_build_chain_index_generates_embeddings(
+        self, chain_indexer, mock_embedder
+    ):
         """Should generate embeddings for chains without them."""
         chains = [
             ToolChain(
-                id=1, name="test", tools=["tool1"], description="Test",
-                use_count=0, is_auto_detected=False, embedding=None
+                id=1,
+                name="test",
+                tools=["tool1"],
+                description="Test",
+                use_count=0,
+                is_auto_detected=False,
+                embedding=None,
             )
         ]
 
@@ -304,15 +333,27 @@ class TestIndexBuilding:
         mock_embedder.embed.assert_called()
 
     @pytest.mark.asyncio
-    async def test_build_chain_index_refreshes_cache(self, chain_indexer, sample_chains):
+    async def test_build_chain_index_refreshes_cache(
+        self, chain_indexer, sample_chains
+    ):
         """Should refresh cache after building."""
         # Insert chains to DB first
         db = chain_indexer._get_db()
         for chain in sample_chains:
-            db.execute("""
+            db.execute(
+                """
                 INSERT INTO tool_chains (id, chain_name, chain_tools, description, use_count, is_auto_detected)
                 VALUES (?, ?, ?, ?, ?, ?)
-            """, (chain.id, chain.name, json.dumps(chain.tools), chain.description, chain.use_count, chain.is_auto_detected))
+            """,
+                (
+                    chain.id,
+                    chain.name,
+                    json.dumps(chain.tools),
+                    chain.description,
+                    chain.use_count,
+                    chain.is_auto_detected,
+                ),
+            )
         db.commit()
 
         await chain_indexer.build_chain_index(sample_chains)
@@ -324,6 +365,7 @@ class TestIndexBuilding:
 # =============================================================================
 # Index Loading Tests
 # =============================================================================
+
 
 class TestIndexLoading:
     """Test loading existing index."""
@@ -341,10 +383,20 @@ class TestIndexLoading:
         # First build an index
         db = chain_indexer._get_db()
         for chain in sample_chains:
-            db.execute("""
+            db.execute(
+                """
                 INSERT INTO tool_chains (id, chain_name, chain_tools, description, use_count, is_auto_detected)
                 VALUES (?, ?, ?, ?, ?, ?)
-            """, (chain.id, chain.name, json.dumps(chain.tools), chain.description, chain.use_count, chain.is_auto_detected))
+            """,
+                (
+                    chain.id,
+                    chain.name,
+                    json.dumps(chain.tools),
+                    chain.description,
+                    chain.use_count,
+                    chain.is_auto_detected,
+                ),
+            )
         db.commit()
 
         await chain_indexer.build_chain_index(sample_chains)
@@ -364,6 +416,7 @@ class TestIndexLoading:
 # Search Tests
 # =============================================================================
 
+
 class TestChainSearch:
     """Test chain search functionality."""
 
@@ -380,16 +433,28 @@ class TestChainSearch:
         # Build index first
         db = chain_indexer._get_db()
         for chain in sample_chains:
-            db.execute("""
+            db.execute(
+                """
                 INSERT INTO tool_chains (id, chain_name, chain_tools, description, use_count, is_auto_detected)
                 VALUES (?, ?, ?, ?, ?, ?)
-            """, (chain.id, chain.name, json.dumps(chain.tools), chain.description, chain.use_count, chain.is_auto_detected))
+            """,
+                (
+                    chain.id,
+                    chain.name,
+                    json.dumps(chain.tools),
+                    chain.description,
+                    chain.use_count,
+                    chain.is_auto_detected,
+                ),
+            )
         db.commit()
 
         await chain_indexer.build_chain_index(sample_chains)
 
         # Search with low confidence to ensure we get results
-        results = await chain_indexer.search_chains("file operations", top_k=3, min_confidence=0.0)
+        results = await chain_indexer.search_chains(
+            "file operations", top_k=3, min_confidence=0.0
+        )
 
         # Results may be empty with mock embeddings, just verify types
         assert isinstance(results, list)
@@ -400,10 +465,20 @@ class TestChainSearch:
         """Should limit results to top_k."""
         db = chain_indexer._get_db()
         for chain in sample_chains:
-            db.execute("""
+            db.execute(
+                """
                 INSERT INTO tool_chains (id, chain_name, chain_tools, description, use_count, is_auto_detected)
                 VALUES (?, ?, ?, ?, ?, ?)
-            """, (chain.id, chain.name, json.dumps(chain.tools), chain.description, chain.use_count, chain.is_auto_detected))
+            """,
+                (
+                    chain.id,
+                    chain.name,
+                    json.dumps(chain.tools),
+                    chain.description,
+                    chain.use_count,
+                    chain.is_auto_detected,
+                ),
+            )
         db.commit()
 
         await chain_indexer.build_chain_index(sample_chains)
@@ -413,14 +488,26 @@ class TestChainSearch:
         assert len(results) <= 1
 
     @pytest.mark.asyncio
-    async def test_search_chains_filters_by_confidence(self, chain_indexer, sample_chains):
+    async def test_search_chains_filters_by_confidence(
+        self, chain_indexer, sample_chains
+    ):
         """Should filter results below min_confidence."""
         db = chain_indexer._get_db()
         for chain in sample_chains:
-            db.execute("""
+            db.execute(
+                """
                 INSERT INTO tool_chains (id, chain_name, chain_tools, description, use_count, is_auto_detected)
                 VALUES (?, ?, ?, ?, ?, ?)
-            """, (chain.id, chain.name, json.dumps(chain.tools), chain.description, chain.use_count, chain.is_auto_detected))
+            """,
+                (
+                    chain.id,
+                    chain.name,
+                    json.dumps(chain.tools),
+                    chain.description,
+                    chain.use_count,
+                    chain.is_auto_detected,
+                ),
+            )
         db.commit()
 
         await chain_indexer.build_chain_index(sample_chains)
@@ -435,6 +522,7 @@ class TestChainSearch:
 # =============================================================================
 # Chain Management Tests
 # =============================================================================
+
 
 class TestChainManagement:
     """Test adding, retrieving, and managing chains."""
@@ -462,17 +550,29 @@ class TestChainManagement:
         )
 
         assert chain.description
-        assert "read" in chain.description.lower() or "write" in chain.description.lower()
+        assert (
+            "read" in chain.description.lower() or "write" in chain.description.lower()
+        )
 
     @pytest.mark.asyncio
     async def test_add_chain_to_existing_index(self, chain_indexer, sample_chains):
         """Should add chain to existing index."""
         db = chain_indexer._get_db()
         for chain in sample_chains:
-            db.execute("""
+            db.execute(
+                """
                 INSERT INTO tool_chains (id, chain_name, chain_tools, description, use_count, is_auto_detected)
                 VALUES (?, ?, ?, ?, ?, ?)
-            """, (chain.id, chain.name, json.dumps(chain.tools), chain.description, chain.use_count, chain.is_auto_detected))
+            """,
+                (
+                    chain.id,
+                    chain.name,
+                    json.dumps(chain.tools),
+                    chain.description,
+                    chain.use_count,
+                    chain.is_auto_detected,
+                ),
+            )
         db.commit()
 
         await chain_indexer.build_chain_index(sample_chains)
@@ -498,10 +598,13 @@ class TestChainManagement:
     async def test_get_chain_from_db(self, chain_indexer):
         """Should retrieve chain from database."""
         db = chain_indexer._get_db()
-        db.execute("""
+        db.execute(
+            """
             INSERT INTO tool_chains (chain_name, chain_tools, description, use_count, is_auto_detected)
             VALUES (?, ?, ?, ?, ?)
-        """, ("db_chain", '["tool1"]', "From DB", 5, 0))
+        """,
+            ("db_chain", '["tool1"]', "From DB", 5, 0),
+        )
         db.commit()
 
         result = await chain_indexer.get_chain("db_chain")
@@ -525,6 +628,7 @@ class TestChainManagement:
 # Usage Tracking Tests
 # =============================================================================
 
+
 class TestUsageTracking:
     """Test chain usage recording."""
 
@@ -532,18 +636,20 @@ class TestUsageTracking:
     async def test_record_chain_use(self, chain_indexer):
         """Should increment use count."""
         db = chain_indexer._get_db()
-        db.execute("""
+        db.execute(
+            """
             INSERT INTO tool_chains (chain_name, chain_tools, description, use_count, is_auto_detected)
             VALUES (?, ?, ?, ?, ?)
-        """, ("tracked_chain", '["tool1"]', "Test", 5, 0))
+        """,
+            ("tracked_chain", '["tool1"]', "Test", 5, 0),
+        )
         db.commit()
 
         await chain_indexer.record_chain_use("tracked_chain")
 
         # Check updated count
         row = db.execute(
-            "SELECT use_count FROM tool_chains WHERE chain_name = ?",
-            ("tracked_chain",)
+            "SELECT use_count FROM tool_chains WHERE chain_name = ?", ("tracked_chain",)
         ).fetchone()
         assert row[0] == 6
 
@@ -562,6 +668,7 @@ class TestUsageTracking:
 # Cache Tests
 # =============================================================================
 
+
 class TestChainCache:
     """Test chain caching functionality."""
 
@@ -570,10 +677,20 @@ class TestChainCache:
         """Should populate cache with top chains."""
         db = chain_indexer._get_db()
         for chain in sample_chains:
-            db.execute("""
+            db.execute(
+                """
                 INSERT INTO tool_chains (id, chain_name, chain_tools, description, use_count, is_auto_detected)
                 VALUES (?, ?, ?, ?, ?, ?)
-            """, (chain.id, chain.name, json.dumps(chain.tools), chain.description, chain.use_count, chain.is_auto_detected))
+            """,
+                (
+                    chain.id,
+                    chain.name,
+                    json.dumps(chain.tools),
+                    chain.description,
+                    chain.use_count,
+                    chain.is_auto_detected,
+                ),
+            )
         db.commit()
 
         await chain_indexer.refresh_chain_cache()
@@ -588,10 +705,13 @@ class TestChainCache:
         """Should limit cache to top_chains_cache_size."""
         db = chain_indexer._get_db()
         for i in range(10):
-            db.execute("""
+            db.execute(
+                """
                 INSERT INTO tool_chains (chain_name, chain_tools, description, use_count, is_auto_detected)
                 VALUES (?, ?, ?, ?, ?)
-            """, (f"chain_{i}", '["tool"]', f"Chain {i}", i, 0))
+            """,
+                (f"chain_{i}", '["tool"]', f"Chain {i}", i, 0),
+            )
         db.commit()
 
         await chain_indexer.refresh_chain_cache()
@@ -610,6 +730,7 @@ class TestChainCache:
 # =============================================================================
 # Default Chains Tests
 # =============================================================================
+
 
 class TestDefaultChains:
     """Test seeding default chains."""
@@ -646,6 +767,7 @@ class TestDefaultChains:
 # Cleanup Tests
 # =============================================================================
 
+
 class TestCleanup:
     """Test cleanup operations."""
 
@@ -663,12 +785,14 @@ class TestCleanup:
 # Singleton Tests
 # =============================================================================
 
+
 class TestSingleton:
     """Test singleton pattern."""
 
     def test_get_chain_indexer_creates_instance(self, mock_embedder, temp_chain_dir):
         """Should create instance on first call."""
         import chain_indexer as ci
+
         ci._chain_indexer_instance = None
 
         db_path = temp_chain_dir / "test.db"
@@ -690,7 +814,9 @@ class TestSingleton:
         db.close()
 
         with patch("chain_indexer.ANALYTICS_DB_PATH", db_path):
-            with patch("chain_indexer.CHAIN_INDEX_PATH", temp_chain_dir / "chains.hnsw"):
+            with patch(
+                "chain_indexer.CHAIN_INDEX_PATH", temp_chain_dir / "chains.hnsw"
+            ):
                 with patch("chain_indexer.DB_DIR", temp_chain_dir):
                     indexer = get_chain_indexer(mock_embedder, None)
 
@@ -699,9 +825,12 @@ class TestSingleton:
 
                     indexer.close()
 
-    def test_get_chain_indexer_returns_same_instance(self, mock_embedder, temp_chain_dir):
+    def test_get_chain_indexer_returns_same_instance(
+        self, mock_embedder, temp_chain_dir
+    ):
         """Should return same instance on subsequent calls."""
         import chain_indexer as ci
+
         ci._chain_indexer_instance = None
 
         db_path = temp_chain_dir / "test.db"
@@ -723,7 +852,9 @@ class TestSingleton:
         db.close()
 
         with patch("chain_indexer.ANALYTICS_DB_PATH", db_path):
-            with patch("chain_indexer.CHAIN_INDEX_PATH", temp_chain_dir / "chains.hnsw"):
+            with patch(
+                "chain_indexer.CHAIN_INDEX_PATH", temp_chain_dir / "chains.hnsw"
+            ):
                 with patch("chain_indexer.DB_DIR", temp_chain_dir):
                     indexer1 = get_chain_indexer(mock_embedder, None)
                     indexer2 = get_chain_indexer(mock_embedder, None)

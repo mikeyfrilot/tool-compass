@@ -21,6 +21,7 @@ import re
 @dataclass
 class StdioBackend:
     """Backend that spawns an MCP server as subprocess."""
+
     type: Literal["stdio"] = "stdio"
     command: str = ""
     args: List[str] = field(default_factory=list)
@@ -31,6 +32,7 @@ class StdioBackend:
 @dataclass
 class HttpBackend:
     """Backend that connects to an MCP server over HTTP/SSE."""
+
     type: Literal["http"] = "http"
     url: str = ""
     headers: Dict[str, str] = field(default_factory=dict)
@@ -40,6 +42,7 @@ class HttpBackend:
 @dataclass
 class ImportBackend:
     """Backend that imports an MCP server module directly (same process)."""
+
     type: Literal["import"] = "import"
     module: str = ""
     server_var: str = "mcp"  # Variable name of the FastMCP instance
@@ -51,6 +54,7 @@ BackendConfig = StdioBackend | HttpBackend | ImportBackend
 @dataclass
 class CompassConfig:
     """Full Tool Compass configuration."""
+
     # Backend server connections
     backends: Dict[str, BackendConfig] = field(default_factory=dict)
 
@@ -99,7 +103,7 @@ class CompassConfig:
         # Recursively substitute ${VAR} patterns
         def substitute(obj):
             if isinstance(obj, str):
-                return re.sub(r'\$\{(\w+)\}', resolve_var, obj)
+                return re.sub(r"\$\{(\w+)\}", resolve_var, obj)
             elif isinstance(obj, dict):
                 return {k: substitute(v) for k, v in obj.items()}
             elif isinstance(obj, list):
@@ -143,20 +147,34 @@ class CompassConfig:
         config.auto_sync = data.get("auto_sync", config.auto_sync)
         config.default_top_k = data.get("default_top_k", config.default_top_k)
         config.min_confidence = data.get("min_confidence", config.min_confidence)
-        config.progressive_disclosure = data.get("progressive_disclosure", config.progressive_disclosure)
+        config.progressive_disclosure = data.get(
+            "progressive_disclosure", config.progressive_disclosure
+        )
 
         # Sync settings
-        config.sync_check_on_startup = data.get("sync_check_on_startup", config.sync_check_on_startup)
-        config.sync_polling_interval = data.get("sync_polling_interval", config.sync_polling_interval)
+        config.sync_check_on_startup = data.get(
+            "sync_check_on_startup", config.sync_check_on_startup
+        )
+        config.sync_polling_interval = data.get(
+            "sync_polling_interval", config.sync_polling_interval
+        )
 
         # Analytics settings
-        config.analytics_enabled = data.get("analytics_enabled", config.analytics_enabled)
+        config.analytics_enabled = data.get(
+            "analytics_enabled", config.analytics_enabled
+        )
         config.hot_cache_size = data.get("hot_cache_size", config.hot_cache_size)
 
         # Chain settings
-        config.chain_indexing_enabled = data.get("chain_indexing_enabled", config.chain_indexing_enabled)
-        config.chain_detection_min_occurrences = data.get("chain_detection_min_occurrences", config.chain_detection_min_occurrences)
-        config.top_chains_cache_size = data.get("top_chains_cache_size", config.top_chains_cache_size)
+        config.chain_indexing_enabled = data.get(
+            "chain_indexing_enabled", config.chain_indexing_enabled
+        )
+        config.chain_detection_min_occurrences = data.get(
+            "chain_detection_min_occurrences", config.chain_detection_min_occurrences
+        )
+        config.top_chains_cache_size = data.get(
+            "top_chains_cache_size", config.top_chains_cache_size
+        )
 
         return config
 
@@ -287,7 +305,9 @@ def get_default_config() -> CompassConfig:
                 args=["-u", str(base_path / "app/mcp/comfy_mcp_server.py")],
                 env={
                     **base_env,
-                    "COMFYUI_URL": os.environ.get("COMFYUI_URL", "http://localhost:8188"),
+                    "COMFYUI_URL": os.environ.get(
+                        "COMFYUI_URL", "http://localhost:8188"
+                    ),
                 },
             ),
             "video": StdioBackend(

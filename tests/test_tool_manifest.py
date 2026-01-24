@@ -4,9 +4,7 @@ Tests for Tool Compass tool manifest module.
 Tests tool definitions, filtering, and export functionality.
 """
 
-import pytest
 import json
-import tempfile
 from pathlib import Path
 import sys
 
@@ -28,6 +26,7 @@ from tool_manifest import (
 # =============================================================================
 # ToolDefinition Tests
 # =============================================================================
+
 
 class TestToolDefinition:
     """Test ToolDefinition dataclass."""
@@ -167,6 +166,7 @@ class TestToolDefinition:
 # Serialization Tests
 # =============================================================================
 
+
 class TestToolSerialization:
     """Test ToolDefinition serialization."""
 
@@ -242,6 +242,7 @@ class TestToolSerialization:
 # TOOLS Constant Tests
 # =============================================================================
 
+
 class TestToolsConstant:
     """Test the TOOLS constant."""
 
@@ -252,7 +253,7 @@ class TestToolsConstant:
     def test_all_tools_have_required_fields(self):
         """All tools should have required fields."""
         for tool in TOOLS:
-            assert tool.name, f"Tool missing name"
+            assert tool.name, "Tool missing name"
             assert tool.description, f"Tool {tool.name} missing description"
             assert tool.category, f"Tool {tool.name} missing category"
             assert tool.server, f"Tool {tool.name} missing server"
@@ -275,12 +276,15 @@ class TestToolsConstant:
         """Server field should match name prefix."""
         for tool in TOOLS:
             prefix = tool.name.split(":")[0]
-            assert tool.server == prefix, f"Tool {tool.name} server mismatch: {tool.server} != {prefix}"
+            assert tool.server == prefix, (
+                f"Tool {tool.name} server mismatch: {tool.server} != {prefix}"
+            )
 
 
 # =============================================================================
 # Query Functions Tests
 # =============================================================================
+
 
 class TestGetAllTools:
     """Test get_all_tools function."""
@@ -424,6 +428,7 @@ class TestGetServers:
 # Export Tests
 # =============================================================================
 
+
 class TestExportManifest:
     """Test export_manifest function."""
 
@@ -520,13 +525,16 @@ class TestExportManifest:
 # Tool Integrity Tests
 # =============================================================================
 
+
 class TestToolIntegrity:
     """Test tool definitions for consistency and quality."""
 
     def test_descriptions_not_empty(self):
         """All descriptions should be non-empty."""
         for tool in TOOLS:
-            assert len(tool.description.strip()) > 10, f"Tool {tool.name} has very short description"
+            assert len(tool.description.strip()) > 10, (
+                f"Tool {tool.name} has very short description"
+            )
 
     def test_descriptions_not_duplicated(self):
         """Descriptions should be unique."""
@@ -535,34 +543,51 @@ class TestToolIntegrity:
 
         # Allow some duplication but warn if significant
         duplication_ratio = 1 - (len(unique_descriptions) / len(descriptions))
-        assert duplication_ratio < 0.1, f"Too many duplicated descriptions: {duplication_ratio:.0%}"
+        assert duplication_ratio < 0.1, (
+            f"Too many duplicated descriptions: {duplication_ratio:.0%}"
+        )
 
     def test_categories_consistent(self):
         """Categories should be from known set."""
         known_categories = {
-            "file", "git", "database", "search", "ai", "analysis",
-            "project", "content", "system", "meta"
+            "file",
+            "git",
+            "database",
+            "search",
+            "ai",
+            "analysis",
+            "project",
+            "content",
+            "system",
+            "meta",
         }
 
         for tool in TOOLS:
-            assert tool.category in known_categories, f"Tool {tool.name} has unknown category: {tool.category}"
+            assert tool.category in known_categories, (
+                f"Tool {tool.name} has unknown category: {tool.category}"
+            )
 
     def test_core_tools_have_examples(self):
         """Core tools should have examples."""
         for tool in TOOLS:
             if tool.is_core:
-                assert len(tool.examples) > 0, f"Core tool {tool.name} should have examples"
+                assert len(tool.examples) > 0, (
+                    f"Core tool {tool.name} should have examples"
+                )
 
     def test_embedding_text_reasonable_length(self):
         """Embedding text should be reasonable length."""
         for tool in TOOLS:
             text = tool.embedding_text()
-            assert 50 < len(text) < 1000, f"Tool {tool.name} embedding text length: {len(text)}"
+            assert 50 < len(text) < 1000, (
+                f"Tool {tool.name} embedding text length: {len(text)}"
+            )
 
 
 # =============================================================================
 # Edge Cases
 # =============================================================================
+
 
 class TestEdgeCases:
     """Test edge cases and special scenarios."""

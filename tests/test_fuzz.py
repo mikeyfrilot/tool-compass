@@ -5,9 +5,9 @@ Tests input validation, security, and edge cases using Hypothesis.
 """
 
 import pytest
-from hypothesis import given, settings, assume, HealthCheck, Phase
+from hypothesis import given, settings, assume, HealthCheck
 from hypothesis import strategies as st
-from unittest.mock import Mock, AsyncMock, patch
+from unittest.mock import patch
 import json
 import sys
 from pathlib import Path
@@ -19,6 +19,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 # =============================================================================
 # SECURITY FUZZING
 # =============================================================================
+
 
 class TestSecurityFuzzing:
     """Security-focused fuzz tests."""
@@ -86,7 +87,13 @@ class TestSecurityFuzzing:
 
         assert tool.category == payload
 
-    @given(st.text(min_size=0, max_size=500, alphabet=st.characters(blacklist_characters='\x00')))
+    @given(
+        st.text(
+            min_size=0,
+            max_size=500,
+            alphabet=st.characters(blacklist_characters="\x00"),
+        )
+    )
     @settings(max_examples=200)
     def test_config_path_validation(self, fuzz_path):
         """Config paths should be safely handled."""
@@ -106,6 +113,7 @@ class TestSecurityFuzzing:
 # =============================================================================
 # INPUT VALIDATION FUZZING
 # =============================================================================
+
 
 class TestInputValidationFuzzing:
     """Test input validation with edge cases."""
@@ -134,11 +142,13 @@ class TestInputValidationFuzzing:
         except (ValueError, TypeError):
             pass  # Edge cases may raise
 
-    @given(st.dictionaries(
-        keys=st.text(min_size=1, max_size=50),
-        values=st.text(min_size=0, max_size=200),
-        max_size=10
-    ))
+    @given(
+        st.dictionaries(
+            keys=st.text(min_size=1, max_size=50),
+            values=st.text(min_size=0, max_size=200),
+            max_size=10,
+        )
+    )
     def test_arbitrary_tool_params(self, params):
         """Tool parameters should handle arbitrary dictionaries."""
         from tool_manifest import ToolDefinition
@@ -171,16 +181,22 @@ class TestInputValidationFuzzing:
 # JSON SCHEMA FUZZING
 # =============================================================================
 
+
 class TestJSONSchemaFuzzing:
     """Fuzz JSON schema handling."""
 
-    @given(st.recursive(
-        st.none() | st.booleans() | st.integers() | st.floats(allow_nan=False) | st.text(),
-        lambda children: st.lists(children, max_size=5) | st.dictionaries(
-            st.text(min_size=1, max_size=20), children, max_size=5
-        ),
-        max_leaves=20
-    ))
+    @given(
+        st.recursive(
+            st.none()
+            | st.booleans()
+            | st.integers()
+            | st.floats(allow_nan=False)
+            | st.text(),
+            lambda children: st.lists(children, max_size=5)
+            | st.dictionaries(st.text(min_size=1, max_size=20), children, max_size=5),
+            max_leaves=20,
+        )
+    )
     @settings(max_examples=100, suppress_health_check=[HealthCheck.too_slow])
     def test_arbitrary_json_as_params(self, data):
         """Tool params should handle arbitrary JSON structures."""
@@ -207,8 +223,9 @@ class TestJSONSchemaFuzzing:
             parsed = json.loads(data)
             # If it parses, try using it
             from tool_manifest import ToolDefinition
+
             if isinstance(parsed, dict):
-                tool = ToolDefinition(
+                ToolDefinition(
                     name="test",
                     description="test",
                     server="test",
@@ -223,14 +240,17 @@ class TestJSONSchemaFuzzing:
 # CONFIG FUZZING
 # =============================================================================
 
+
 class TestConfigFuzzing:
     """Fuzz configuration handling."""
 
-    @given(st.dictionaries(
-        keys=st.text(min_size=1, max_size=30),
-        values=st.text(min_size=0, max_size=100),
-        max_size=5
-    ))
+    @given(
+        st.dictionaries(
+            keys=st.text(min_size=1, max_size=30),
+            values=st.text(min_size=0, max_size=100),
+            max_size=5,
+        )
+    )
     @settings(max_examples=50)
     def test_config_from_arbitrary_dict(self, data):
         """CompassConfig.from_dict should handle arbitrary dicts."""
@@ -256,6 +276,7 @@ class TestConfigFuzzing:
 # ANALYTICS FUZZING
 # =============================================================================
 
+
 class TestAnalyticsFuzzing:
     """Fuzz analytics recording - tests use sync wrappers to avoid event loop issues."""
 
@@ -273,7 +294,7 @@ class TestAnalyticsFuzzing:
                 db = analytics._get_db()
                 db.execute(
                     "INSERT INTO searches (query, results_count, latency_ms) VALUES (?, ?, ?)",
-                    (fuzz_query, 1, 10.0)
+                    (fuzz_query, 1, 10.0),
                 )
                 db.commit()
             except Exception:
@@ -295,7 +316,7 @@ class TestAnalyticsFuzzing:
                 db = analytics._get_db()
                 db.execute(
                     "INSERT INTO tool_calls (tool_name, success, latency_ms) VALUES (?, ?, ?)",
-                    (tool_name, True, latency)
+                    (tool_name, True, latency),
                 )
                 db.commit()
             except Exception:
@@ -308,12 +329,13 @@ class TestAnalyticsFuzzing:
 # SEARCH RESULT FUZZING
 # =============================================================================
 
+
 class TestSearchResultFuzzing:
     """Fuzz search result handling."""
 
     @given(
         st.floats(allow_nan=False, allow_infinity=False),
-        st.integers(min_value=1, max_value=1000)
+        st.integers(min_value=1, max_value=1000),
     )
     @settings(deadline=None)  # First run may be slow due to imports
     def test_search_result_arbitrary_score(self, score, rank):
@@ -338,6 +360,7 @@ class TestSearchResultFuzzing:
 # =============================================================================
 # STRESS TESTS
 # =============================================================================
+
 
 class TestStressFuzzing:
     """Stress tests with extreme inputs."""
@@ -400,13 +423,15 @@ class TestStressFuzzing:
 
         tools = []
         for i in range(1000):
-            tools.append(ToolDefinition(
-                name=f"tool_{i}",
-                description=f"Tool number {i}",
-                server="test",
-                category="test",
-                parameters={"index": i},
-            ))
+            tools.append(
+                ToolDefinition(
+                    name=f"tool_{i}",
+                    description=f"Tool number {i}",
+                    server="test",
+                    category="test",
+                    parameters={"index": i},
+                )
+            )
 
         # All should have valid embedding text
         for tool in tools:
@@ -414,7 +439,13 @@ class TestStressFuzzing:
             assert isinstance(text, str)
             assert tool.name in text
 
-    @given(st.text(alphabet=st.characters(blacklist_categories=('Cs',)), min_size=1, max_size=500))
+    @given(
+        st.text(
+            alphabet=st.characters(blacklist_categories=("Cs",)),
+            min_size=1,
+            max_size=500,
+        )
+    )
     @settings(max_examples=100)
     def test_unicode_tool_names(self, name):
         """Handle Unicode tool names."""
@@ -434,6 +465,7 @@ class TestStressFuzzing:
 # =============================================================================
 # BACKEND CONFIG FUZZING
 # =============================================================================
+
 
 class TestBackendConfigFuzzing:
     """Fuzz backend configuration."""
@@ -465,11 +497,13 @@ class TestBackendConfigFuzzing:
 
         assert backend.args == args
 
-    @given(st.dictionaries(
-        keys=st.text(min_size=1, max_size=30),
-        values=st.text(min_size=0, max_size=100),
-        max_size=10
-    ))
+    @given(
+        st.dictionaries(
+            keys=st.text(min_size=1, max_size=30),
+            values=st.text(min_size=0, max_size=100),
+            max_size=10,
+        )
+    )
     def test_stdio_backend_env(self, env):
         """StdioBackend should handle arbitrary env vars."""
         from config import StdioBackend

@@ -13,7 +13,7 @@ import json
 import logging
 import sys
 from pathlib import Path
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict
 import argparse
 
 import gradio as gr
@@ -23,7 +23,7 @@ logger = logging.getLogger(__name__)
 # Add parent to path for imports
 sys.path.insert(0, str(Path(__file__).parent))
 
-from indexer import CompassIndex, SearchResult
+from indexer import CompassIndex
 from analytics import CompassAnalytics, get_analytics
 from chain_indexer import ChainIndexer, get_chain_indexer
 from config import load_config
@@ -33,6 +33,7 @@ from config import load_config
 # ASYNC HELPERS
 # =============================================================================
 
+
 def run_async(coro):
     """Run async coroutine in sync context."""
     try:
@@ -40,6 +41,7 @@ def run_async(coro):
         if loop.is_running():
             # Create new loop for nested async
             import concurrent.futures
+
             with concurrent.futures.ThreadPoolExecutor() as pool:
                 future = pool.submit(asyncio.run, coro)
                 return future.result()
@@ -97,6 +99,7 @@ def get_chain_indexer_instance() -> Optional[ChainIndexer]:
 # HELPER FUNCTIONS
 # =============================================================================
 
+
 def sanitize_query(query: str) -> str:
     """Sanitize search query - remove potentially problematic characters."""
     if not query:
@@ -111,7 +114,7 @@ def truncate_text(text: str, max_length: int = 120) -> str:
     """Truncate text gracefully with ellipsis."""
     if not text or len(text) <= max_length:
         return text or ""
-    return text[:max_length - 3].rsplit(" ", 1)[0] + "..."
+    return text[: max_length - 3].rsplit(" ", 1)[0] + "..."
 
 
 def confidence_label(score: float) -> str:
@@ -131,7 +134,7 @@ def format_error(error: Exception, context: str = "") -> str:
     error_type = type(error).__name__
 
     if "Connection" in error_type or "refused" in str(error).lower():
-        return f"""
+        return """
         <div style="border: 1px solid #ef5350; border-radius: 8px; padding: 16px; margin: 8px 0; background: #2a1a1a;">
             <div style="color: #ef5350; font-weight: bold;">⚠️ Service Unavailable</div>
             <p style="color: #ccc; margin: 8px 0;">
@@ -141,7 +144,7 @@ def format_error(error: Exception, context: str = "") -> str:
         </div>
         """
     elif "index" in str(error).lower() or "not loaded" in str(error).lower():
-        return f"""
+        return """
         <div style="border: 1px solid #ffb74d; border-radius: 8px; padding: 16px; margin: 8px 0; background: #2a2a1a;">
             <div style="color: #ffb74d; font-weight: bold;">⚠️ Index Not Ready</div>
             <p style="color: #ccc; margin: 8px 0;">
@@ -154,7 +157,7 @@ def format_error(error: Exception, context: str = "") -> str:
         return f"""
         <div style="border: 1px solid #ef5350; border-radius: 8px; padding: 16px; margin: 8px 0; background: #2a1a1a;">
             <div style="color: #ef5350; font-weight: bold;">⚠️ Error</div>
-            <p style="color: #ccc; margin: 8px 0;">{context or 'An error occurred'}</p>
+            <p style="color: #ccc; margin: 8px 0;">{context or "An error occurred"}</p>
             <details style="color: #888; font-size: 0.85em;">
                 <summary>Technical details</summary>
                 <code>{error_type}: {str(error)[:200]}</code>
@@ -167,12 +170,13 @@ def format_error(error: Exception, context: str = "") -> str:
 # SEARCH FUNCTIONS
 # =============================================================================
 
+
 def search_tools(
     query: str,
     top_k: int = 5,
     category: str = "All",
     server: str = "All",
-    min_confidence: float = 0.3
+    min_confidence: float = 0.3,
 ) -> tuple:
     """
     Search for tools using semantic search.
@@ -180,13 +184,16 @@ def search_tools(
     """
     # Empty query
     if not query.strip():
-        return """
+        return (
+            """
         <div style="text-align: center; padding: 40px; color: #888;">
             <div style="font-size: 2em; margin-bottom: 12px;">🔍</div>
             <p>Enter a search query above to find tools.</p>
             <p style="font-size: 0.9em;">Try: "generate an image", "read a file", "search documents"</p>
         </div>
-        """, "{}"
+        """,
+            "{}",
+        )
 
     # Sanitize input
     query = sanitize_query(query)
@@ -204,12 +211,13 @@ def search_tools(
 
     # Run search with error handling
     try:
+
         async def do_search():
             return await index.search(
                 query=query,
                 top_k=int(top_k),
                 category_filter=cat_filter,
-                server_filter=srv_filter
+                server_filter=srv_filter,
             )
 
         results = run_async(do_search())
@@ -221,7 +229,8 @@ def search_tools(
 
     # No results
     if not results:
-        return f"""
+        return (
+            f"""
         <div style="text-align: center; padding: 40px; color: #888;">
             <div style="font-size: 2em; margin-bottom: 12px;">🔎</div>
             <p style="color: #ffb74d;">No tools found matching "{truncate_text(query, 50)}"</p>
@@ -232,19 +241,27 @@ def search_tools(
                 <li>Remove filters</li>
             </ul>
         </div>
-        """, "{}"
+        """,
+            "{}",
+        )
 
     # Build HTML output
-    html_parts = [f'<p style="color: #888; margin-bottom: 12px;">Found {len(results)} tool{"s" if len(results) != 1 else ""}</p>']
+    html_parts = [
+        f'<p style="color: #888; margin-bottom: 12px;">Found {len(results)} tool{"s" if len(results) != 1 else ""}</p>'
+    ]
     json_results = []
 
     for r in results:
         confidence_pct = int(r.score * 100)
         conf_label = confidence_label(r.score)
-        confidence_color = "#81c784" if r.score > 0.7 else "#ffb74d" if r.score > 0.5 else "#9e9e9e"
+        confidence_color = (
+            "#81c784" if r.score > 0.7 else "#ffb74d" if r.score > 0.5 else "#9e9e9e"
+        )
 
         # Stars based on confidence
-        stars = "★" * min(5, int(r.score * 5 + 0.5)) + "☆" * (5 - min(5, int(r.score * 5 + 0.5)))
+        stars = "★" * min(5, int(r.score * 5 + 0.5)) + "☆" * (
+            5 - min(5, int(r.score * 5 + 0.5))
+        )
 
         # Truncate long descriptions
         desc_display = truncate_text(r.tool.description, 150)
@@ -263,14 +280,16 @@ def search_tools(
         </div>
         """)
 
-        json_results.append({
-            "tool": r.tool.name,
-            "description": r.tool.description,
-            "server": r.tool.server,
-            "category": r.tool.category,
-            "confidence": round(r.score, 3),
-            "parameters": r.tool.parameters
-        })
+        json_results.append(
+            {
+                "tool": r.tool.name,
+                "description": r.tool.description,
+                "server": r.tool.server,
+                "category": r.tool.category,
+                "confidence": round(r.score, 3),
+                "parameters": r.tool.parameters,
+            }
+        )
 
     return "".join(html_parts), json.dumps(json_results, indent=2)
 
@@ -303,8 +322,11 @@ def search_chains(query: str, top_k: int = 5, min_confidence: float = 0.3) -> st
         """
 
     try:
+
         async def do_search():
-            return await chain_indexer.search_chains(query, top_k=int(top_k), min_confidence=min_confidence)
+            return await chain_indexer.search_chains(
+                query, top_k=int(top_k), min_confidence=min_confidence
+            )
 
         results = run_async(do_search())
     except Exception as e:
@@ -321,12 +343,16 @@ def search_chains(query: str, top_k: int = 5, min_confidence: float = 0.3) -> st
         </div>
         """
 
-    html_parts = [f'<p style="color: #888; margin-bottom: 12px;">Found {len(results)} workflow{"s" if len(results) != 1 else ""}</p>']
+    html_parts = [
+        f'<p style="color: #888; margin-bottom: 12px;">Found {len(results)} workflow{"s" if len(results) != 1 else ""}</p>'
+    ]
 
     for cr in results:
         confidence_pct = int(cr.score * 100)
         conf_label = confidence_label(cr.score)
-        confidence_color = "#81c784" if cr.score > 0.7 else "#ffb74d" if cr.score > 0.5 else "#9e9e9e"
+        confidence_color = (
+            "#81c784" if cr.score > 0.7 else "#ffb74d" if cr.score > 0.5 else "#9e9e9e"
+        )
         tool_flow = " → ".join([t.split(":")[-1] for t in cr.chain.tools])
 
         html_parts.append(f"""
@@ -350,6 +376,7 @@ def search_chains(query: str, top_k: int = 5, min_confidence: float = 0.3) -> st
 # BROWSER FUNCTIONS
 # =============================================================================
 
+
 def get_all_tools() -> List[Dict]:
     """Get all indexed tools."""
     try:
@@ -364,14 +391,18 @@ def get_all_tools() -> List[Dict]:
 
         tools = []
         for row in cursor.fetchall():
-            tools.append({
-                "name": row["name"],
-                "description": row["description"],
-                "category": row["category"],
-                "server": row["server"],
-                "parameters": json.loads(row["parameters"]) if row["parameters"] else {},
-                "examples": json.loads(row["examples"]) if row["examples"] else []
-            })
+            tools.append(
+                {
+                    "name": row["name"],
+                    "description": row["description"],
+                    "category": row["category"],
+                    "server": row["server"],
+                    "parameters": json.loads(row["parameters"])
+                    if row["parameters"]
+                    else {},
+                    "examples": json.loads(row["examples"]) if row["examples"] else [],
+                }
+            )
 
         return tools
     except Exception as e:
@@ -408,13 +439,16 @@ def filter_tools(server: str, category: str, search_text: str) -> str:
         tools = [t for t in tools if t["category"] == category]
     if search_text.strip():
         search_lower = search_text.lower()
-        tools = [t for t in tools if
-                 search_lower in t["name"].lower() or
-                 search_lower in t["description"].lower()]
+        tools = [
+            t
+            for t in tools
+            if search_lower in t["name"].lower()
+            or search_lower in t["description"].lower()
+        ]
 
     # No matches after filtering
     if not tools:
-        return f"""
+        return """
         <div style="text-align: center; padding: 40px; color: #888;">
             <div style="font-size: 2em; margin-bottom: 12px;">🔎</div>
             <p style="color: #ffb74d;">No tools match the current filters.</p>
@@ -427,7 +461,9 @@ def filter_tools(server: str, category: str, search_text: str) -> str:
     for t in tools:
         by_server.setdefault(t["server"], []).append(t)
 
-    html_parts = [f'<p style="color: #888; margin-bottom: 12px;">Showing {len(tools)} tool{"s" if len(tools) != 1 else ""}</p>']
+    html_parts = [
+        f'<p style="color: #888; margin-bottom: 12px;">Showing {len(tools)} tool{"s" if len(tools) != 1 else ""}</p>'
+    ]
 
     for server_name, server_tools in sorted(by_server.items()):
         html_parts.append(f"""
@@ -443,8 +479,8 @@ def filter_tools(server: str, category: str, search_text: str) -> str:
             desc_truncated = truncate_text(t["description"], 120)
             html_parts.append(f"""
             <div style="border-left: 3px solid #444; padding: 8px 12px; margin: 8px 0; background: #1a1a2e;">
-                <div style="font-weight: bold; color: #4fc3f7;" title="{t['name']}">{truncate_text(t["name"], 45)}</div>
-                <div style="color: #aaa; font-size: 0.9em; margin: 4px 0;" title="{t['description']}">{desc_truncated}</div>
+                <div style="font-weight: bold; color: #4fc3f7;" title="{t["name"]}">{truncate_text(t["name"], 45)}</div>
+                <div style="color: #aaa; font-size: 0.9em; margin: 4px 0;" title="{t["description"]}">{desc_truncated}</div>
                 <div style="color: #666; font-size: 0.85em;">
                     🏷️ {t["category"]} | 📝 {param_count} param{"s" if param_count != 1 else ""}
                 </div>
@@ -476,24 +512,32 @@ def get_tool_details(tool_name: str) -> str:
     try:
         index = get_index()
         if not index.db:
-            return format_error(RuntimeError("Index not loaded"), "Could not access tool index")
+            return format_error(
+                RuntimeError("Index not loaded"), "Could not access tool index"
+            )
     except Exception as e:
         return format_error(e, "Could not load tool index")
 
     try:
-        cursor = index.db.execute("""
+        cursor = index.db.execute(
+            """
             SELECT name, description, category, server, parameters, examples
             FROM tools WHERE name = ?
-        """, (tool_name,))
+        """,
+            (tool_name,),
+        )
 
         row = cursor.fetchone()
         if not row:
             # Try partial match
-            cursor = index.db.execute("""
+            cursor = index.db.execute(
+                """
                 SELECT name, description, category, server, parameters, examples
                 FROM tools WHERE name LIKE ?
                 LIMIT 1
-            """, (f"%{tool_name}%",))
+            """,
+                (f"%{tool_name}%",),
+            )
             row = cursor.fetchone()
     except Exception as e:
         return format_error(e, f"Could not search for tool: {tool_name}")
@@ -560,6 +604,7 @@ def get_tool_details(tool_name: str) -> str:
 # ANALYTICS FUNCTIONS
 # =============================================================================
 
+
 def get_analytics_dashboard(timeframe: str = "24h") -> str:
     """Get analytics summary as HTML and chart data."""
     try:
@@ -614,7 +659,7 @@ def get_analytics_dashboard(timeframe: str = "24h") -> str:
             <tr>
                 <td style="padding: 8px; border: 1px solid #444; color: #4fc3f7;">{t["tool"]}</td>
                 <td style="padding: 8px; border: 1px solid #444; text-align: right;">{t["calls"]}</td>
-                <td style="padding: 8px; border: 1px solid #444; text-align: right; color: {'#81c784' if t['success_rate'] > 90 else '#ffb74d'};">{t["success_rate"]}%</td>
+                <td style="padding: 8px; border: 1px solid #444; text-align: right; color: {"#81c784" if t["success_rate"] > 90 else "#ffb74d"};">{t["success_rate"]}%</td>
                 <td style="padding: 8px; border: 1px solid #444; text-align: right; color: #888;">{t["avg_latency_ms"]}ms</td>
             </tr>
             """
@@ -655,6 +700,7 @@ def get_analytics_dashboard(timeframe: str = "24h") -> str:
 # CHAIN VIEWER FUNCTIONS
 # =============================================================================
 
+
 def get_chains_view() -> str:
     """Display all tool chains."""
     chain_indexer = get_chain_indexer_instance()
@@ -668,6 +714,7 @@ def get_chains_view() -> str:
         """
 
     try:
+
         async def load_chains():
             return await chain_indexer.load_chains_from_db()
 
@@ -686,7 +733,9 @@ def get_chains_view() -> str:
         </div>
         """
 
-    html_parts = [f'<p style="color: #888; margin-bottom: 12px;">{len(chains)} workflow{"s" if len(chains) != 1 else ""} available</p>']
+    html_parts = [
+        f'<p style="color: #888; margin-bottom: 12px;">{len(chains)} workflow{"s" if len(chains) != 1 else ""} available</p>'
+    ]
 
     for chain in sorted(chains, key=lambda c: c.use_count, reverse=True):
         tool_flow = " → ".join([t.split(":")[-1] for t in chain.tools])
@@ -714,6 +763,7 @@ def get_chains_view() -> str:
 # =============================================================================
 # SYSTEM STATUS
 # =============================================================================
+
 
 def get_system_status() -> str:
     """Get system status overview."""
@@ -749,6 +799,7 @@ def get_system_status() -> str:
     ollama_status = "❓ Not checked"
     try:
         from embedder import Embedder
+
         embedder = Embedder()
         is_healthy = run_async(embedder.health_check())
         ollama_status = "✅ Connected" if is_healthy else "⚠️ Model not loaded"
@@ -835,6 +886,7 @@ def get_system_status() -> str:
 # BUILD UI
 # =============================================================================
 
+
 def get_filter_choices():
     """Get choices for filter dropdowns."""
     try:
@@ -863,9 +915,8 @@ def create_ui() -> gr.Blocks:
         css="""
         .gradio-container { max-width: 1400px !important; }
         .tool-result { border: 1px solid #444; border-radius: 8px; padding: 12px; margin: 8px 0; }
-        """
+        """,
     ) as demo:
-
         gr.Markdown("""
         # 🧭 Tool Compass
         **Semantic search across 44 MCP tools** | Progressive discovery: Search → Describe → Execute
@@ -876,14 +927,16 @@ def create_ui() -> gr.Blocks:
             # SEARCH TAB
             # =================================================================
             with gr.Tab("🔍 Search", id="search"):
-                gr.Markdown("Search tools using natural language. Describe what you want to do.")
+                gr.Markdown(
+                    "Search tools using natural language. Describe what you want to do."
+                )
 
                 with gr.Row():
                     with gr.Column(scale=4):
                         search_input = gr.Textbox(
                             label="What do you want to do?",
                             placeholder="e.g., 'generate an image with AI', 'read a file', 'search documents'",
-                            lines=1
+                            lines=1,
                         )
                     with gr.Column(scale=1):
                         search_btn = gr.Button("Search", variant="primary")
@@ -891,23 +944,15 @@ def create_ui() -> gr.Blocks:
                 with gr.Row():
                     with gr.Column(scale=1):
                         server_filter = gr.Dropdown(
-                            choices=servers,
-                            value="All",
-                            label="Server"
+                            choices=servers, value="All", label="Server"
                         )
                     with gr.Column(scale=1):
                         category_filter = gr.Dropdown(
-                            choices=categories,
-                            value="All",
-                            label="Category"
+                            choices=categories, value="All", label="Category"
                         )
                     with gr.Column(scale=1):
                         top_k = gr.Slider(
-                            minimum=1,
-                            maximum=10,
-                            value=5,
-                            step=1,
-                            label="Results"
+                            minimum=1, maximum=10, value=5, step=1, label="Results"
                         )
                     with gr.Column(scale=1):
                         min_conf = gr.Slider(
@@ -915,7 +960,7 @@ def create_ui() -> gr.Blocks:
                             maximum=1.0,
                             value=0.3,
                             step=0.1,
-                            label="Min Confidence"
+                            label="Min Confidence",
                         )
 
                 with gr.Row():
@@ -928,14 +973,10 @@ def create_ui() -> gr.Blocks:
                                 <p style="font-size: 0.9em;">Try: "generate an image", "read a file", "search documents"</p>
                             </div>
                             """,
-                            label="Results"
+                            label="Results",
                         )
                     with gr.Column(scale=1):
-                        results_json = gr.Code(
-                            label="JSON",
-                            language="json",
-                            lines=15
-                        )
+                        results_json = gr.Code(label="JSON", language="json", lines=15)
 
                 # Search for chains
                 gr.Markdown("---")
@@ -945,7 +986,7 @@ def create_ui() -> gr.Blocks:
                     chain_query = gr.Textbox(
                         label="Search workflows",
                         placeholder="e.g., 'modify a file', 'commit changes', 'generate and save image'",
-                        lines=1
+                        lines=1,
                     )
                     chain_btn = gr.Button("Search Workflows")
 
@@ -962,18 +1003,30 @@ def create_ui() -> gr.Blocks:
                 # Wire up search
                 search_btn.click(
                     fn=search_tools,
-                    inputs=[search_input, top_k, category_filter, server_filter, min_conf],
-                    outputs=[search_results, results_json]
+                    inputs=[
+                        search_input,
+                        top_k,
+                        category_filter,
+                        server_filter,
+                        min_conf,
+                    ],
+                    outputs=[search_results, results_json],
                 )
                 search_input.submit(
                     fn=search_tools,
-                    inputs=[search_input, top_k, category_filter, server_filter, min_conf],
-                    outputs=[search_results, results_json]
+                    inputs=[
+                        search_input,
+                        top_k,
+                        category_filter,
+                        server_filter,
+                        min_conf,
+                    ],
+                    outputs=[search_results, results_json],
                 )
                 chain_btn.click(
                     fn=search_chains,
                     inputs=[chain_query, top_k, min_conf],
-                    outputs=[chain_results]
+                    outputs=[chain_results],
                 )
 
             # =================================================================
@@ -985,20 +1038,16 @@ def create_ui() -> gr.Blocks:
                 with gr.Row():
                     with gr.Column(scale=1):
                         browser_server = gr.Dropdown(
-                            choices=servers,
-                            value="All",
-                            label="Filter by Server"
+                            choices=servers, value="All", label="Filter by Server"
                         )
                     with gr.Column(scale=1):
                         browser_category = gr.Dropdown(
-                            choices=categories,
-                            value="All",
-                            label="Filter by Category"
+                            choices=categories, value="All", label="Filter by Category"
                         )
                     with gr.Column(scale=2):
                         browser_search = gr.Textbox(
                             label="Search",
-                            placeholder="Filter by name or description..."
+                            placeholder="Filter by name or description...",
                         )
                     with gr.Column(scale=1):
                         browser_btn = gr.Button("Filter", variant="primary")
@@ -1011,7 +1060,7 @@ def create_ui() -> gr.Blocks:
                 with gr.Row():
                     tool_name_input = gr.Textbox(
                         label="Tool Name",
-                        placeholder="Enter tool name (e.g., bridge:read_file)"
+                        placeholder="Enter tool name (e.g., bridge:read_file)",
                     )
                     detail_btn = gr.Button("View Details")
 
@@ -1029,12 +1078,12 @@ def create_ui() -> gr.Blocks:
                 browser_btn.click(
                     fn=filter_tools,
                     inputs=[browser_server, browser_category, browser_search],
-                    outputs=[browser_results]
+                    outputs=[browser_results],
                 )
                 detail_btn.click(
                     fn=get_tool_details,
                     inputs=[tool_name_input],
-                    outputs=[tool_details]
+                    outputs=[tool_details],
                 )
 
             # =================================================================
@@ -1047,7 +1096,7 @@ def create_ui() -> gr.Blocks:
                     timeframe = gr.Dropdown(
                         choices=["1h", "24h", "7d", "30d"],
                         value="24h",
-                        label="Timeframe"
+                        label="Timeframe",
                     )
                     refresh_btn = gr.Button("Refresh", variant="primary")
 
@@ -1056,23 +1105,21 @@ def create_ui() -> gr.Blocks:
                 refresh_btn.click(
                     fn=get_analytics_dashboard,
                     inputs=[timeframe],
-                    outputs=[analytics_html]
+                    outputs=[analytics_html],
                 )
 
             # =================================================================
             # CHAINS TAB
             # =================================================================
             with gr.Tab("🔗 Workflows", id="chains"):
-                gr.Markdown("Tool chains are multi-step workflows that combine tools. Auto-detected from usage patterns.")
+                gr.Markdown(
+                    "Tool chains are multi-step workflows that combine tools. Auto-detected from usage patterns."
+                )
 
                 chains_btn = gr.Button("Refresh Workflows", variant="primary")
                 chains_html = gr.HTML(value=get_chains_view())
 
-                chains_btn.click(
-                    fn=get_chains_view,
-                    inputs=[],
-                    outputs=[chains_html]
-                )
+                chains_btn.click(fn=get_chains_view, inputs=[], outputs=[chains_html])
 
             # =================================================================
             # STATUS TAB
@@ -1083,11 +1130,7 @@ def create_ui() -> gr.Blocks:
                 status_btn = gr.Button("Refresh Status", variant="primary")
                 status_html = gr.HTML(value=get_system_status())
 
-                status_btn.click(
-                    fn=get_system_status,
-                    inputs=[],
-                    outputs=[status_html]
-                )
+                status_btn.click(fn=get_system_status, inputs=[], outputs=[status_html])
 
         gr.Markdown("""
         ---
@@ -1103,10 +1146,13 @@ def create_ui() -> gr.Blocks:
 # MAIN
 # =============================================================================
 
+
 def main():
     parser = argparse.ArgumentParser(description="Tool Compass Gradio UI")
     parser.add_argument("--port", type=int, default=7860, help="Port to run on")
-    parser.add_argument("--share", action="store_true", help="Create public Gradio link")
+    parser.add_argument(
+        "--share", action="store_true", help="Create public Gradio link"
+    )
     parser.add_argument("--host", default="127.0.0.1", help="Host to bind to")
     args = parser.parse_args()
 
@@ -1125,10 +1171,7 @@ def main():
 
     demo = create_ui()
     demo.launch(
-        server_name=args.host,
-        server_port=args.port,
-        share=args.share,
-        show_error=True
+        server_name=args.host, server_port=args.port, share=args.share, show_error=True
     )
 
 

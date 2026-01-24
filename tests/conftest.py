@@ -9,9 +9,7 @@ https://gofastmcp.com/patterns/testing
 import asyncio
 import pytest
 import sys
-import tempfile
 from pathlib import Path
-from typing import Generator, AsyncGenerator
 from unittest.mock import Mock, AsyncMock, patch
 import numpy as np
 
@@ -26,6 +24,7 @@ from tool_manifest import ToolDefinition
 # Async Support
 # =============================================================================
 
+
 @pytest.fixture(scope="session")
 def event_loop():
     """Create event loop for async tests."""
@@ -37,6 +36,7 @@ def event_loop():
 # =============================================================================
 # Configuration Fixtures
 # =============================================================================
+
 
 @pytest.fixture
 def test_config() -> CompassConfig:
@@ -75,6 +75,7 @@ def test_config_with_backends() -> CompassConfig:
 # =============================================================================
 # Tool Definition Fixtures
 # =============================================================================
+
 
 @pytest.fixture
 def sample_tools() -> list[ToolDefinition]:
@@ -132,6 +133,7 @@ def sample_tools() -> list[ToolDefinition]:
 # Mock Embedder
 # =============================================================================
 
+
 @pytest.fixture
 def mock_embedder():
     """Mock embedder that returns deterministic vectors."""
@@ -170,6 +172,7 @@ def mock_embedder():
 # Temporary Database Fixtures
 # =============================================================================
 
+
 @pytest.fixture
 def temp_db_dir(tmp_path: Path) -> Path:
     """Temporary directory for test databases."""
@@ -194,6 +197,7 @@ def temp_db_path(temp_db_dir: Path) -> Path:
 # Index Fixtures
 # =============================================================================
 
+
 @pytest.fixture
 async def test_index(temp_index_path, temp_db_path, mock_embedder, sample_tools):
     """Pre-built test index with sample tools."""
@@ -215,6 +219,7 @@ async def test_index(temp_index_path, temp_db_path, mock_embedder, sample_tools)
 # =============================================================================
 # Analytics Fixtures
 # =============================================================================
+
 
 @pytest.fixture
 def temp_analytics_db(temp_db_dir: Path) -> Path:
@@ -242,6 +247,7 @@ def test_analytics(temp_analytics_db):
 # Backend Client Fixtures
 # =============================================================================
 
+
 @pytest.fixture
 def mock_backend_manager():
     """Mock BackendManager for gateway tests."""
@@ -254,12 +260,14 @@ def mock_backend_manager():
     manager.get_backend_tools = Mock(return_value=[])
     manager.get_tool_schema = Mock(return_value=None)
     manager.execute_tool = AsyncMock(return_value={"success": True, "result": "ok"})
-    manager.get_stats = Mock(return_value={
-        "configured_backends": [],
-        "connected_backends": [],
-        "total_tools": 0,
-        "tools_by_backend": {},
-    })
+    manager.get_stats = Mock(
+        return_value={
+            "configured_backends": [],
+            "connected_backends": [],
+            "total_tools": 0,
+            "tools_by_backend": {},
+        }
+    )
 
     return manager
 
@@ -267,6 +275,7 @@ def mock_backend_manager():
 # =============================================================================
 # Chain Indexer Fixtures
 # =============================================================================
+
 
 @pytest.fixture
 def temp_chain_db(temp_db_dir: Path) -> Path:
@@ -319,6 +328,7 @@ def test_chain_indexer(mock_embedder, temp_chain_db, temp_db_dir):
 # Sync Manager Fixtures
 # =============================================================================
 
+
 @pytest.fixture
 def temp_sync_db(temp_db_dir: Path) -> Path:
     """Path for temporary sync state database."""
@@ -326,11 +336,18 @@ def temp_sync_db(temp_db_dir: Path) -> Path:
 
 
 @pytest.fixture
-def test_sync_manager(test_config, mock_backend_manager, temp_sync_db, temp_index_path, temp_db_path, mock_embedder, sample_tools):
+def test_sync_manager(
+    test_config,
+    mock_backend_manager,
+    temp_sync_db,
+    temp_index_path,
+    temp_db_path,
+    mock_embedder,
+    sample_tools,
+):
     """Test sync manager with mocks."""
     from sync_manager import SyncManager
     from indexer import CompassIndex
-    import asyncio
 
     # Create a real index for sync manager
     index = CompassIndex(
@@ -353,11 +370,10 @@ def test_sync_manager(test_config, mock_backend_manager, temp_sync_db, temp_inde
 # Integration Test Markers
 # =============================================================================
 
+
 def pytest_configure(config):
     """Register custom markers."""
     config.addinivalue_line(
         "markers", "integration: marks tests requiring external services (Ollama)"
     )
-    config.addinivalue_line(
-        "markers", "slow: marks tests that take a long time to run"
-    )
+    config.addinivalue_line("markers", "slow: marks tests that take a long time to run")

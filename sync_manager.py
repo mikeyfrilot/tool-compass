@@ -34,10 +34,7 @@ class SyncManager:
     """
 
     def __init__(
-        self,
-        config: "CompassConfig",
-        index: "CompassIndex",
-        backends: "BackendManager"
+        self, config: "CompassConfig", index: "CompassIndex", backends: "BackendManager"
     ):
         self.config = config
         self.index = index
@@ -91,7 +88,7 @@ class SyncManager:
         db = self._get_db()
         row = db.execute(
             "SELECT tool_hash FROM backend_sync_state WHERE backend_name = ?",
-            (backend_name,)
+            (backend_name,),
         ).fetchone()
         return row["tool_hash"] if row else None
 
@@ -101,10 +98,15 @@ class SyncManager:
         Returns True if changes detected.
         """
         # Connect to backend if needed
-        if backend_name not in self.backends._backends or not self.backends._backends[backend_name].is_connected:
+        if (
+            backend_name not in self.backends._backends
+            or not self.backends._backends[backend_name].is_connected
+        ):
             success = await self.backends.connect_backend(backend_name)
             if not success:
-                logger.warning(f"Could not connect to backend {backend_name} for sync check")
+                logger.warning(
+                    f"Could not connect to backend {backend_name} for sync check"
+                )
                 return False
 
         # Get current tools
@@ -117,7 +119,9 @@ class SyncManager:
 
         changed = current_hash != stored_hash
         if changed:
-            logger.info(f"Backend {backend_name} has changed: {stored_hash} -> {current_hash}")
+            logger.info(
+                f"Backend {backend_name} has changed: {stored_hash} -> {current_hash}"
+            )
 
         self._last_check[backend_name] = datetime.now()
         return changed
@@ -146,7 +150,9 @@ class SyncManager:
 
             # If any backends changed, rebuild affected portions
             if changed_backends:
-                logger.info(f"Rebuilding index for changed backends: {changed_backends}")
+                logger.info(
+                    f"Rebuilding index for changed backends: {changed_backends}"
+                )
                 try:
                     await self._rebuild_for_backends(changed_backends)
                     for name in changed_backends:
@@ -178,30 +184,34 @@ class SyncManager:
                     server, name = tool.qualified_name.split(":", 1)
                 else:
                     server = tool.server
-                    name = tool.name
 
                 # Extract parameters from schema
                 params = {}
                 if tool.input_schema and "properties" in tool.input_schema:
-                    for param_name, param_info in tool.input_schema["properties"].items():
+                    for param_name, param_info in tool.input_schema[
+                        "properties"
+                    ].items():
                         param_type = param_info.get("type", "any")
                         if isinstance(param_type, list):
                             param_type = "/".join(param_type)
                         params[param_name] = param_type
 
-                all_tools.append(ToolDefinition(
-                    name=tool.qualified_name,
-                    description=tool.description,
-                    category=self._categorize_tool(tool.name, tool.description),
-                    server=server,
-                    parameters=params,
-                    examples=[],
-                    is_core=False,
-                ))
+                all_tools.append(
+                    ToolDefinition(
+                        name=tool.qualified_name,
+                        description=tool.description,
+                        category=self._categorize_tool(tool.name, tool.description),
+                        server=server,
+                        parameters=params,
+                        examples=[],
+                        is_core=False,
+                    )
+                )
 
             # Update sync state
             tool_hash = self._compute_tool_hash(tools)
-            db.execute("""
+            db.execute(
+                """
                 INSERT INTO backend_sync_state (backend_name, tool_count, tool_hash, last_sync_at, sync_status)
                 VALUES (?, ?, ?, CURRENT_TIMESTAMP, 'synced')
                 ON CONFLICT(backend_name) DO UPDATE SET
@@ -209,7 +219,9 @@ class SyncManager:
                     tool_hash = excluded.tool_hash,
                     last_sync_at = CURRENT_TIMESTAMP,
                     sync_status = 'synced'
-            """, (backend_name, len(tools), tool_hash))
+            """,
+                (backend_name, len(tools), tool_hash),
+            )
 
         db.commit()
 
@@ -258,6 +270,7 @@ class SyncManager:
 
             # Collect all tools
             from tool_manifest import ToolDefinition
+
             all_tools = []
             db = self._get_db()
 
@@ -276,29 +289,33 @@ class SyncManager:
                         server, name = tool.qualified_name.split(":", 1)
                     else:
                         server = tool.server
-                        name = tool.name
 
                     params = {}
                     if tool.input_schema and "properties" in tool.input_schema:
-                        for param_name, param_info in tool.input_schema["properties"].items():
+                        for param_name, param_info in tool.input_schema[
+                            "properties"
+                        ].items():
                             param_type = param_info.get("type", "any")
                             if isinstance(param_type, list):
                                 param_type = "/".join(param_type)
                             params[param_name] = param_type
 
-                    all_tools.append(ToolDefinition(
-                        name=tool.qualified_name,
-                        description=tool.description,
-                        category=self._categorize_tool(tool.name, tool.description),
-                        server=server,
-                        parameters=params,
-                        examples=[],
-                        is_core=False,
-                    ))
+                    all_tools.append(
+                        ToolDefinition(
+                            name=tool.qualified_name,
+                            description=tool.description,
+                            category=self._categorize_tool(tool.name, tool.description),
+                            server=server,
+                            parameters=params,
+                            examples=[],
+                            is_core=False,
+                        )
+                    )
 
                 # Update sync state
                 tool_hash = self._compute_tool_hash(tools)
-                db.execute("""
+                db.execute(
+                    """
                     INSERT INTO backend_sync_state (backend_name, tool_count, tool_hash, last_sync_at, sync_status)
                     VALUES (?, ?, ?, CURRENT_TIMESTAMP, 'synced')
                     ON CONFLICT(backend_name) DO UPDATE SET
@@ -306,7 +323,9 @@ class SyncManager:
                         tool_hash = excluded.tool_hash,
                         last_sync_at = CURRENT_TIMESTAMP,
                         sync_status = 'synced'
-                """, (backend_name, len(tools), tool_hash))
+                """,
+                    (backend_name, len(tools), tool_hash),
+                )
 
             db.commit()
 
@@ -318,14 +337,10 @@ class SyncManager:
                     "status": "complete",
                     "tools_indexed": len(all_tools),
                     "backends_synced": list(connect_results.keys()),
-                    "build_result": result
+                    "build_result": result,
                 }
             else:
-                return {
-                    "status": "no_tools",
-                    "tools_indexed": 0,
-                    "backends_synced": []
-                }
+                return {"status": "no_tools", "tools_indexed": 0, "backends_synced": []}
 
     async def get_sync_status(self) -> Dict[str, Any]:
         """Get current sync status for all backends."""
@@ -342,7 +357,7 @@ class SyncManager:
                 "tool_count": row["tool_count"],
                 "tool_hash": row["tool_hash"][:8] + "..." if row["tool_hash"] else None,
                 "last_sync_at": row["last_sync_at"],
-                "status": row["sync_status"]
+                "status": row["sync_status"],
             }
 
         # Add any backends not yet synced
@@ -352,12 +367,13 @@ class SyncManager:
                     "tool_count": None,
                     "tool_hash": None,
                     "last_sync_at": None,
-                    "status": "never_synced"
+                    "status": "never_synced",
                 }
 
         return {
             "backends": backends,
-            "polling_active": self._polling_task is not None and not self._polling_task.done()
+            "polling_active": self._polling_task is not None
+            and not self._polling_task.done(),
         }
 
     async def start_background_polling(self, interval_seconds: int = 300):
@@ -403,9 +419,7 @@ _sync_manager_instance: Optional[SyncManager] = None
 
 
 def get_sync_manager(
-    config: "CompassConfig",
-    index: "CompassIndex",
-    backends: "BackendManager"
+    config: "CompassConfig", index: "CompassIndex", backends: "BackendManager"
 ) -> SyncManager:
     """Get or create the sync manager singleton."""
     global _sync_manager_instance

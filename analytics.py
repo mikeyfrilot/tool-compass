@@ -6,12 +6,11 @@ Tracks usage patterns, manages hot tool cache, and detects tool chains.
 import sqlite3
 import json
 import hashlib
-import asyncio
 import numpy as np
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Optional, List, Dict, Any, Tuple
-from dataclasses import dataclass, asdict
+from typing import Optional, List, Dict, Any
+from dataclasses import dataclass
 import logging
 
 logger = logging.getLogger(__name__)
@@ -23,6 +22,7 @@ ANALYTICS_DB_PATH = Path(__file__).parent / "db" / "compass_analytics.db"
 @dataclass
 class HotToolEntry:
     """Cached data for frequently used tools."""
+
     tool_name: str
     rank: int
     call_count: int
@@ -35,6 +35,7 @@ class HotToolEntry:
 @dataclass
 class SearchRecord:
     """Record of a search query."""
+
     query: str
     top_result: Optional[str]
     result_count: int
@@ -46,6 +47,7 @@ class SearchRecord:
 @dataclass
 class ToolCallRecord:
     """Record of a tool execution."""
+
     tool_name: str
     server: str
     success: bool
@@ -68,7 +70,7 @@ class CompassAnalytics:
         self,
         db_path: Path = ANALYTICS_DB_PATH,
         hot_cache_size: int = 10,
-        chain_min_occurrences: int = 3
+        chain_min_occurrences: int = 3,
     ):
         self.db_path = db_path
         self.hot_cache_size = hot_cache_size
@@ -198,7 +200,7 @@ class CompassAnalytics:
         results: List[Any],  # List of SearchResult
         latency_ms: float,
         category_filter: Optional[str] = None,
-        server_filter: Optional[str] = None
+        server_filter: Optional[str] = None,
     ):
         """Record a search query for analytics."""
         db = self._get_db()
@@ -207,14 +209,27 @@ class CompassAnalytics:
         top_result = results[0].tool.name if results else None
         result_count = len(results)
 
-        db.execute("""
+        db.execute(
+            """
             INSERT INTO search_queries
             (query, query_hash, top_result, result_count, latency_ms, category_filter, server_filter)
             VALUES (?, ?, ?, ?, ?, ?, ?)
-        """, (query, query_hash, top_result, result_count, latency_ms, category_filter, server_filter))
+        """,
+            (
+                query,
+                query_hash,
+                top_result,
+                result_count,
+                latency_ms,
+                category_filter,
+                server_filter,
+            ),
+        )
         db.commit()
 
-        logger.debug(f"Recorded search: '{query[:50]}...' -> {top_result} ({latency_ms:.1f}ms)")
+        logger.debug(
+            f"Recorded search: '{query[:50]}...' -> {top_result} ({latency_ms:.1f}ms)"
+        )
 
     async def record_tool_call(
         self,
@@ -222,7 +237,7 @@ class CompassAnalytics:
         success: bool,
         latency_ms: float,
         error_message: Optional[str] = None,
-        arguments: Optional[Dict] = None
+        arguments: Optional[Dict] = None,
     ):
         """
         Record a tool execution.
@@ -241,14 +256,25 @@ class CompassAnalytics:
             ).hexdigest()[:16]
 
         # Insert call record
-        db.execute("""
+        db.execute(
+            """
             INSERT INTO tool_calls
             (tool_name, server, success, error_message, latency_ms, arguments_hash)
             VALUES (?, ?, ?, ?, ?, ?)
-        """, (tool_name, server, 1 if success else 0, error_message, latency_ms, args_hash))
+        """,
+            (
+                tool_name,
+                server,
+                1 if success else 0,
+                error_message,
+                latency_ms,
+                args_hash,
+            ),
+        )
 
         # Update aggregated stats
-        db.execute("""
+        db.execute(
+            """
             INSERT INTO tool_usage_stats (tool_name, call_count, success_count, failure_count, avg_latency_ms, last_called_at, last_success_at)
             VALUES (?, 1, ?, ?, ?, CURRENT_TIMESTAMP, ?)
             ON CONFLICT(tool_name) DO UPDATE SET
@@ -259,13 +285,15 @@ class CompassAnalytics:
                 last_called_at = CURRENT_TIMESTAMP,
                 last_success_at = CASE WHEN excluded.success_count > 0 THEN CURRENT_TIMESTAMP ELSE last_success_at END,
                 updated_at = CURRENT_TIMESTAMP
-        """, (
-            tool_name,
-            1 if success else 0,
-            0 if success else 1,
-            latency_ms,
-            "CURRENT_TIMESTAMP" if success else None
-        ))
+        """,
+            (
+                tool_name,
+                1 if success else 0,
+                0 if success else 1,
+                latency_ms,
+                "CURRENT_TIMESTAMP" if success else None,
+            ),
+        )
 
         db.commit()
 
@@ -282,7 +310,9 @@ class CompassAnalytics:
             await self.refresh_hot_cache()
             self._call_count_since_refresh = 0
 
-        logger.debug(f"Recorded tool call: {tool_name} ({'OK' if success else 'FAIL'}) {latency_ms:.1f}ms")
+        logger.debug(
+            f"Recorded tool call: {tool_name} ({'OK' if success else 'FAIL'}) {latency_ms:.1f}ms"
+        )
 
     async def _save_chain_pattern(self):
         """Save current tool sequence as a pattern for chain detection."""
@@ -294,18 +324,21 @@ class CompassAnalytics:
         # Find subsequences of length 2-5
         for length in range(2, min(6, len(self._session_tool_sequence) + 1)):
             for i in range(len(self._session_tool_sequence) - length + 1):
-                subseq = self._session_tool_sequence[i:i + length]
+                subseq = self._session_tool_sequence[i : i + length]
                 seq_json = json.dumps(subseq)
                 seq_hash = hashlib.sha256(seq_json.encode()).hexdigest()[:32]
 
                 # Upsert pattern
-                db.execute("""
+                db.execute(
+                    """
                     INSERT INTO chain_patterns (session_id, tool_sequence, sequence_hash, occurrence_count)
                     VALUES (?, ?, ?, 1)
                     ON CONFLICT(sequence_hash) DO UPDATE SET
                         occurrence_count = occurrence_count + 1,
                         last_seen_at = CURRENT_TIMESTAMP
-                """, (self._session_id, seq_json, seq_hash))
+                """,
+                    (self._session_id, seq_json, seq_hash),
+                )
 
         db.commit()
 
@@ -317,12 +350,15 @@ class CompassAnalytics:
         db = self._get_db()
 
         # Get top tools by call count
-        cursor = db.execute("""
+        cursor = db.execute(
+            """
             SELECT tool_name, call_count, last_called_at
             FROM tool_usage_stats
             ORDER BY call_count DESC
             LIMIT ?
-        """, (self.hot_cache_size,))
+        """,
+            (self.hot_cache_size,),
+        )
 
         top_tools = cursor.fetchall()
 
@@ -333,7 +369,7 @@ class CompassAnalytics:
             # Try to get existing embedding from hot_tools table
             existing = db.execute(
                 "SELECT embedding, schema_json, description FROM hot_tools WHERE tool_name = ?",
-                (tool_name,)
+                (tool_name,),
             ).fetchone()
 
             embedding = None
@@ -354,7 +390,7 @@ class CompassAnalytics:
                 embedding=embedding,
                 schema=schema,
                 description=description,
-                last_called_at=row["last_called_at"]
+                last_called_at=row["last_called_at"],
             )
             new_cache[tool_name] = entry
 
@@ -362,7 +398,8 @@ class CompassAnalytics:
             embedding_blob = embedding.tobytes() if embedding is not None else None
             schema_json = json.dumps(schema) if schema else None
 
-            db.execute("""
+            db.execute(
+                """
                 INSERT INTO hot_tools (tool_name, rank, call_count, embedding, schema_json, description)
                 VALUES (?, ?, ?, ?, ?, ?)
                 ON CONFLICT(tool_name) DO UPDATE SET
@@ -371,7 +408,16 @@ class CompassAnalytics:
                     embedding = COALESCE(excluded.embedding, embedding),
                     schema_json = COALESCE(excluded.schema_json, schema_json),
                     updated_at = CURRENT_TIMESTAMP
-            """, (tool_name, rank, row["call_count"], embedding_blob, schema_json, description))
+            """,
+                (
+                    tool_name,
+                    rank,
+                    row["call_count"],
+                    embedding_blob,
+                    schema_json,
+                    description,
+                ),
+            )
 
         db.commit()
         self._hot_cache = new_cache
@@ -395,20 +441,23 @@ class CompassAnalytics:
         db = self._get_db()
 
         # Find patterns with enough occurrences
-        cursor = db.execute("""
+        cursor = db.execute(
+            """
             SELECT tool_sequence, sequence_hash, occurrence_count
             FROM chain_patterns
             WHERE occurrence_count >= ?
             ORDER BY occurrence_count DESC
             LIMIT 20
-        """, (self.chain_min_occurrences,))
+        """,
+            (self.chain_min_occurrences,),
+        )
 
         patterns = cursor.fetchall()
         detected_chains = []
 
         for row in patterns:
             tools = json.loads(row["tool_sequence"])
-            seq_hash = row["sequence_hash"]
+            row["sequence_hash"]
 
             # Generate chain name from tools
             chain_name = "_to_".join([t.split(":")[-1] for t in tools])[:50]
@@ -419,25 +468,35 @@ class CompassAnalytics:
 
             # Check if already exists
             existing = db.execute(
-                "SELECT id FROM tool_chains WHERE chain_name = ?",
-                (chain_name,)
+                "SELECT id FROM tool_chains WHERE chain_name = ?", (chain_name,)
             ).fetchone()
 
             if not existing:
                 # Create embedding text for semantic search
                 embedding_text = f"Workflow: {chain_name} | Steps: {', '.join(tool_names)} | Tools: {', '.join(tools)}"
 
-                db.execute("""
+                db.execute(
+                    """
                     INSERT INTO tool_chains (chain_name, chain_tools, description, embedding_text, use_count, is_auto_detected)
                     VALUES (?, ?, ?, ?, ?, 1)
-                """, (chain_name, json.dumps(tools), description, embedding_text, row["occurrence_count"]))
+                """,
+                    (
+                        chain_name,
+                        json.dumps(tools),
+                        description,
+                        embedding_text,
+                        row["occurrence_count"],
+                    ),
+                )
 
-                detected_chains.append({
-                    "name": chain_name,
-                    "tools": tools,
-                    "description": description,
-                    "occurrences": row["occurrence_count"]
-                })
+                detected_chains.append(
+                    {
+                        "name": chain_name,
+                        "tools": tools,
+                        "description": description,
+                        "occurrences": row["occurrence_count"],
+                    }
+                )
 
         db.commit()
 
@@ -450,23 +509,28 @@ class CompassAnalytics:
         """Get all stored tool chains."""
         db = self._get_db()
 
-        cursor = db.execute("""
+        cursor = db.execute(
+            """
             SELECT chain_name, chain_tools, description, use_count, is_auto_detected, last_used_at
             FROM tool_chains
             ORDER BY use_count DESC
             LIMIT ?
-        """, (limit,))
+        """,
+            (limit,),
+        )
 
         chains = []
         for row in cursor.fetchall():
-            chains.append({
-                "name": row["chain_name"],
-                "tools": json.loads(row["chain_tools"]),
-                "description": row["description"],
-                "use_count": row["use_count"],
-                "is_auto_detected": bool(row["is_auto_detected"]),
-                "last_used_at": row["last_used_at"]
-            })
+            chains.append(
+                {
+                    "name": row["chain_name"],
+                    "tools": json.loads(row["chain_tools"]),
+                    "description": row["description"],
+                    "use_count": row["use_count"],
+                    "is_auto_detected": bool(row["is_auto_detected"]),
+                    "last_used_at": row["last_used_at"],
+                }
+            )
 
         return chains
 
@@ -482,37 +546,47 @@ class CompassAnalytics:
         # Parse timeframe
         hours = {"1h": 1, "24h": 24, "7d": 168, "30d": 720}.get(timeframe, 24)
         since = datetime.now() - timedelta(hours=hours)
-        since_str = since.isoformat()
+        # Use SQLite-compatible format (YYYY-MM-DD HH:MM:SS) for timestamp comparison
+        since_str = since.strftime("%Y-%m-%d %H:%M:%S")
 
         # Search stats
-        search_stats = db.execute("""
+        search_stats = db.execute(
+            """
             SELECT
                 COUNT(*) as total_searches,
                 AVG(latency_ms) as avg_latency,
                 AVG(result_count) as avg_results
             FROM search_queries
             WHERE created_at >= ?
-        """, (since_str,)).fetchone()
+        """,
+            (since_str,),
+        ).fetchone()
 
         # Top searched queries
-        top_queries = db.execute("""
+        top_queries = db.execute(
+            """
             SELECT query, COUNT(*) as count
             FROM search_queries
             WHERE created_at >= ?
             GROUP BY query_hash
             ORDER BY count DESC
             LIMIT 10
-        """, (since_str,)).fetchall()
+        """,
+            (since_str,),
+        ).fetchall()
 
         # Tool call stats
-        call_stats = db.execute("""
+        call_stats = db.execute(
+            """
             SELECT
                 COUNT(*) as total_calls,
                 SUM(success) as successes,
                 AVG(latency_ms) as avg_latency
             FROM tool_calls
             WHERE created_at >= ?
-        """, (since_str,)).fetchone()
+        """,
+            (since_str,),
+        ).fetchone()
 
         # Top tools by usage
         top_tools = db.execute("""
@@ -523,14 +597,17 @@ class CompassAnalytics:
         """).fetchall()
 
         # Failed tool calls
-        failures = db.execute("""
+        failures = db.execute(
+            """
             SELECT tool_name, error_message, COUNT(*) as count
             FROM tool_calls
             WHERE success = 0 AND created_at >= ?
             GROUP BY tool_name, error_message
             ORDER BY count DESC
             LIMIT 10
-        """, (since_str,)).fetchall()
+        """,
+            (since_str,),
+        ).fetchall()
 
         # Chain stats
         chain_count = db.execute("SELECT COUNT(*) FROM tool_chains").fetchone()[0]
@@ -542,40 +619,48 @@ class CompassAnalytics:
                 "avg_latency_ms": round(search_stats["avg_latency"] or 0, 1),
                 "avg_results": round(search_stats["avg_results"] or 0, 1),
                 "top_queries": [
-                    {"query": r["query"][:50], "count": r["count"]}
-                    for r in top_queries
-                ]
+                    {"query": r["query"][:50], "count": r["count"]} for r in top_queries
+                ],
             },
             "tool_calls": {
                 "total": call_stats["total_calls"] or 0,
                 "success_rate": round(
-                    (call_stats["successes"] or 0) / max(call_stats["total_calls"] or 1, 1) * 100, 1
+                    (call_stats["successes"] or 0)
+                    / max(call_stats["total_calls"] or 1, 1)
+                    * 100,
+                    1,
                 ),
                 "avg_latency_ms": round(call_stats["avg_latency"] or 0, 1),
                 "top_tools": [
                     {
                         "tool": r["tool_name"],
                         "calls": r["call_count"],
-                        "success_rate": round(r["success_count"] / max(r["call_count"], 1) * 100, 1),
-                        "avg_latency_ms": round(r["avg_latency_ms"] or 0, 1)
+                        "success_rate": round(
+                            r["success_count"] / max(r["call_count"], 1) * 100, 1
+                        ),
+                        "avg_latency_ms": round(r["avg_latency_ms"] or 0, 1),
                     }
                     for r in top_tools
-                ]
+                ],
             },
             "failures": [
-                {"tool": r["tool_name"], "error": r["error_message"][:100] if r["error_message"] else None, "count": r["count"]}
+                {
+                    "tool": r["tool_name"],
+                    "error": r["error_message"][:100] if r["error_message"] else None,
+                    "count": r["count"],
+                }
                 for r in failures
             ],
             "chains": {
                 "total": chain_count,
                 "detected_auto": db.execute(
                     "SELECT COUNT(*) FROM tool_chains WHERE is_auto_detected = 1"
-                ).fetchone()[0]
+                ).fetchone()[0],
             },
             "hot_cache": {
                 "size": len(self._hot_cache),
-                "tools": list(self._hot_cache.keys())
-            }
+                "tools": list(self._hot_cache.keys()),
+            },
         }
 
     async def load_hot_cache_from_db(self):
@@ -604,7 +689,7 @@ class CompassAnalytics:
                 embedding=embedding,
                 schema=schema,
                 description=row["description"] or "",
-                last_called_at=None
+                last_called_at=None,
             )
 
         logger.info(f"Loaded {len(self._hot_cache)} tools into hot cache from DB")

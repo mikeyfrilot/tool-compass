@@ -1,0 +1,102 @@
+# Tool Compass
+
+> Semantic MCP Tool Discovery - Find the right tool by intent, not memory
+
+## Overview
+
+Tool Compass is an orchestration layer for 115+ MCP tools across 6 backend servers. Instead of memorizing tool names, describe what you want to accomplish and Tool Compass finds the right tools using semantic search.
+
+## Quick Start
+
+```bash
+pip install tool-compass
+```
+
+```json
+{
+  "mcpServers": {
+    "tool-compass": {
+      "command": "python",
+      "args": ["-m", "tool_compass.gateway"]
+    }
+  }
+}
+```
+
+## Core Tools
+
+### compass(intent, top_k=5)
+Find tools by describing what you want to do.
+- `intent`: Natural language description (e.g., "read a file", "generate an image")
+- `top_k`: Maximum results (1-10, default 5)
+- Returns: Tool matches with names, descriptions, confidence scores
+
+### describe(tool_name)
+Get full schema for a specific tool.
+- `tool_name`: Tool name from compass results (e.g., "bridge:read_file")
+- Returns: Complete parameter schema with types and descriptions
+
+### execute(tool_name, arguments)
+Run a tool on its backend server.
+- `tool_name`: The tool to execute
+- `arguments`: Tool arguments as dictionary
+- Returns: Tool response or error
+
+### compass_categories()
+List available tool categories and servers.
+
+### compass_analytics(timeframe="24h")
+Get usage statistics and tool health metrics.
+
+### compass_chains(action="list")
+Manage tool workflows (sequences of tools that work together).
+
+### compass_sync(force=False)
+Rebuild the tool index from backends.
+
+### compass_audit(include_tools=False)
+Comprehensive system health report.
+
+## Architecture
+
+```
+User Intent → compass() → HNSW Vector Search → Ranked Tools
+           → describe() → Full Schema
+           → execute() → Backend Proxy → Tool Result
+```
+
+## Backends Supported
+
+- bridge: File operations, git, shell commands
+- doc: Documentation search and analysis
+- comfy: Image/video generation (ComfyUI)
+- video: Video processing
+- chat: Conversation management
+- voice: Speech synthesis
+
+## Key Features
+
+- HNSW indexing for O(log n) semantic search
+- Ollama embeddings (nomic-embed-text, 768 dimensions)
+- Tool chain detection from usage patterns
+- Hot cache for frequently used tools
+- Analytics and health monitoring
+- Gradio web UI for interactive browsing
+
+## Configuration
+
+Environment variables:
+- `OLLAMA_HOST`: Ollama server URL (default: http://localhost:11434)
+- `COMPASS_INDEX_PATH`: Where to store the HNSW index
+- `COMPASS_LOG_LEVEL`: Logging verbosity (DEBUG, INFO, WARN, ERROR)
+
+## Links
+
+- Repository: https://github.com/mcp-tool-shop/tool-compass
+- PyPI: https://pypi.org/project/tool-compass/
+- Documentation: https://github.com/mcp-tool-shop/tool-compass#readme
+- Issues: https://github.com/mcp-tool-shop/tool-compass/issues
+
+## License
+
+MIT License

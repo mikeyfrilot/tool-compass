@@ -21,8 +21,6 @@ import logging
 import json
 import time
 from typing import Optional, List, Dict, Any
-from pathlib import Path
-from dataclasses import dataclass, asdict
 
 # MCP imports
 try:
@@ -32,17 +30,16 @@ except ImportError:
     raise
 
 from indexer import CompassIndex, SearchResult
-from tool_manifest import ToolDefinition, get_all_tools
+from tool_manifest import ToolDefinition
 from config import load_config, CompassConfig, CONFIG_PATH
-from backend_client import BackendManager, get_backend_manager, ToolInfo
+from backend_client import BackendManager
 from analytics import CompassAnalytics, get_analytics
 from sync_manager import SyncManager, get_sync_manager
 from chain_indexer import ChainIndexer, get_chain_indexer
 
 # Configure logging
 logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 )
 logger = logging.getLogger(__name__)
 
@@ -262,6 +259,7 @@ async def maybe_startup_sync():
 # MCP TOOLS - The Gateway Interface
 # =============================================================================
 
+
 @mcp.tool()
 async def compass(
     intent: str,
@@ -269,7 +267,7 @@ async def compass(
     category: Optional[str] = None,
     server: Optional[str] = None,
     min_confidence: float = 0.3,
-    include_chains: bool = True
+    include_chains: bool = True,
 ) -> Dict[str, Any]:
     """
     Find tools by describing what you want to accomplish.
@@ -309,10 +307,7 @@ async def compass(
 
     # Search tools
     results: List[SearchResult] = await index.search(
-        query=intent,
-        top_k=top_k,
-        category_filter=category,
-        server_filter=server
+        query=intent, top_k=top_k, category_filter=category, server_filter=server
     )
 
     # Filter by confidence
@@ -323,15 +318,19 @@ async def compass(
     if include_chains and config.chain_indexing_enabled:
         chain_indexer = await get_chain_indexer_instance()
         if chain_indexer:
-            chain_results = await chain_indexer.search_chains(intent, top_k=3, min_confidence=min_confidence)
+            chain_results = await chain_indexer.search_chains(
+                intent, top_k=3, min_confidence=min_confidence
+            )
             for cr in chain_results:
-                chain_matches.append({
-                    "name": cr.chain.name,
-                    "tools": cr.chain.tools,
-                    "description": cr.chain.description,
-                    "confidence": round(cr.score, 3),
-                    "use_count": cr.chain.use_count,
-                })
+                chain_matches.append(
+                    {
+                        "name": cr.chain.name,
+                        "tools": cr.chain.tools,
+                        "description": cr.chain.description,
+                        "confidence": round(cr.score, 3),
+                        "use_count": cr.chain.use_count,
+                    }
+                )
 
     # Build response - progressive disclosure means we only return summaries
     matches = []
@@ -366,7 +365,9 @@ async def compass(
     # Hint for next steps
     if not matches and not chain_matches:
         hint = f"No tools found for '{intent}'. Try broader terms or use compass_categories() to see available categories."
-    elif chain_matches and chain_matches[0]["confidence"] > (matches[0]["confidence"] if matches else 0):
+    elif chain_matches and chain_matches[0]["confidence"] > (
+        matches[0]["confidence"] if matches else 0
+    ):
         # Chain is the best match
         chain_name = chain_matches[0]["name"]
         hint = f"Found workflow '{chain_name}' ({chain_matches[0]['confidence']:.0%}). Tools: {' → '.join(chain_matches[0]['tools'])}"
@@ -388,7 +389,9 @@ async def compass(
         "total_indexed": total_tools,
         "tokens_saved": (total_tools - len(matches)) * 500,
         "hint": hint,
-        "workflow": "compass() -> describe() -> execute()" if config.progressive_disclosure else "compass() -> execute()",
+        "workflow": "compass() -> describe() -> execute()"
+        if config.progressive_disclosure
+        else "compass() -> execute()",
     }
 
     # Include chains if any found
@@ -418,7 +421,7 @@ async def describe(tool_name: str) -> Dict[str, Any]:
     if index.db:
         cursor = index.db.execute(
             "SELECT name, description, category, server, parameters, examples FROM tools WHERE name = ?",
-            (tool_name,)
+            (tool_name,),
         )
         row = cursor.fetchone()
 
@@ -453,8 +456,7 @@ async def describe(tool_name: str) -> Dict[str, Any]:
 
 @mcp.tool()
 async def execute(
-    tool_name: str,
-    arguments: Optional[Dict[str, Any]] = None
+    tool_name: str, arguments: Optional[Dict[str, Any]] = None
 ) -> Dict[str, Any]:
     """
     Execute a tool on its backend server.
@@ -486,7 +488,9 @@ async def execute(
     # Connect to backend if needed
     if ":" in tool_name:
         server_name = tool_name.split(":")[0]
-        if server_name not in [name for name, conn in manager._backends.items() if conn.is_connected]:
+        if server_name not in [
+            name for name, conn in manager._backends.items() if conn.is_connected
+        ]:
             logger.info(f"Connecting to backend: {server_name}")
             success = await manager.connect_backend(server_name)
             if not success:
@@ -494,8 +498,10 @@ async def execute(
                 latency_ms = (time.time() - start_time) * 1000
                 if analytics:
                     await analytics.record_tool_call(
-                        tool_name, success=False, latency_ms=latency_ms,
-                        error_message=f"Failed to connect to backend: {server_name}"
+                        tool_name,
+                        success=False,
+                        latency_ms=latency_ms,
+                        error_message=f"Failed to connect to backend: {server_name}",
                     )
                 return {
                     "success": False,
@@ -509,12 +515,17 @@ async def execute(
     # Record analytics
     latency_ms = (time.time() - start_time) * 1000
     success = result.get("success", True) if isinstance(result, dict) else True
-    error_msg = result.get("error") if isinstance(result, dict) and not success else None
+    error_msg = (
+        result.get("error") if isinstance(result, dict) and not success else None
+    )
 
     if analytics:
         await analytics.record_tool_call(
-            tool_name, success=success, latency_ms=latency_ms,
-            error_message=error_msg, arguments=arguments
+            tool_name,
+            success=success,
+            latency_ms=latency_ms,
+            error_message=error_msg,
+            arguments=arguments,
         )
 
     return result
@@ -575,7 +586,7 @@ async def compass_status() -> Dict[str, Any]:
         if analytics:
             response["hot_cache"] = {
                 "size": len(analytics._hot_cache),
-                "tools": list(analytics._hot_cache.keys())
+                "tools": list(analytics._hot_cache.keys()),
             }
 
     # Add sync status if enabled
@@ -591,7 +602,7 @@ async def compass_status() -> Dict[str, Any]:
             chains = await chain_indexer.load_chains_from_db()
             response["chains"] = {
                 "total": len(chains),
-                "cached": len(chain_indexer._chain_cache)
+                "cached": len(chain_indexer._chain_cache),
             }
 
     return response
@@ -599,8 +610,7 @@ async def compass_status() -> Dict[str, Any]:
 
 @mcp.tool()
 async def compass_analytics(
-    timeframe: str = "24h",
-    include_failures: bool = True
+    timeframe: str = "24h", include_failures: bool = True
 ) -> Dict[str, Any]:
     """
     Get detailed usage analytics and tool health metrics.
@@ -620,7 +630,7 @@ async def compass_analytics(
     if not config.analytics_enabled:
         return {
             "error": "Analytics is disabled",
-            "hint": "Enable analytics_enabled in config to track usage"
+            "hint": "Enable analytics_enabled in config to track usage",
         }
 
     analytics = await get_analytics_instance()
@@ -640,7 +650,7 @@ async def compass_chains(
     action: str = "list",
     chain_name: Optional[str] = None,
     tools: Optional[List[str]] = None,
-    description: Optional[str] = None
+    description: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     List and manage tool chains (workflows).
@@ -662,7 +672,7 @@ async def compass_chains(
     if not config.chain_indexing_enabled:
         return {
             "error": "Chain indexing is disabled",
-            "hint": "Enable chain_indexing_enabled in config"
+            "hint": "Enable chain_indexing_enabled in config",
         }
 
     chain_indexer = await get_chain_indexer_instance()
@@ -678,35 +688,35 @@ async def compass_chains(
                     "tools": c.tools,
                     "description": c.description,
                     "use_count": c.use_count,
-                    "is_auto_detected": c.is_auto_detected
+                    "is_auto_detected": c.is_auto_detected,
                 }
                 for c in chains
             ],
             "total": len(chains),
-            "cached": len(chain_indexer._chain_cache)
+            "cached": len(chain_indexer._chain_cache),
         }
 
     elif action == "create":
         if not chain_name or not tools:
             return {
                 "error": "chain_name and tools are required for create",
-                "hint": "compass_chains(action='create', chain_name='my_workflow', tools=['tool1', 'tool2'])"
+                "hint": "compass_chains(action='create', chain_name='my_workflow', tools=['tool1', 'tool2'])",
             }
 
         chain = await chain_indexer.add_chain(
             name=chain_name,
             tools=tools,
             description=description,
-            is_auto_detected=False
+            is_auto_detected=False,
         )
 
         return {
             "created": {
                 "name": chain.name,
                 "tools": chain.tools,
-                "description": chain.description
+                "description": chain.description,
             },
-            "hint": f"Chain '{chain_name}' created. It will now appear in compass() search results."
+            "hint": f"Chain '{chain_name}' created. It will now appear in compass() search results.",
         }
 
     elif action == "detect":
@@ -716,21 +726,19 @@ async def compass_chains(
             return {
                 "detected": detected,
                 "count": len(detected),
-                "hint": "Detected chains are now indexed and searchable"
+                "hint": "Detected chains are now indexed and searchable",
             }
         return {"error": "Analytics required for chain detection"}
 
     else:
         return {
             "error": f"Unknown action: {action}",
-            "valid_actions": ["list", "create", "detect"]
+            "valid_actions": ["list", "create", "detect"],
         }
 
 
 @mcp.tool()
-async def compass_sync(
-    force: bool = False
-) -> Dict[str, Any]:
+async def compass_sync(force: bool = False) -> Dict[str, Any]:
     """
     Check for backend changes and sync the index.
 
@@ -748,7 +756,7 @@ async def compass_sync(
     if not config.auto_sync:
         return {
             "error": "Auto-sync is disabled",
-            "hint": "Enable auto_sync in config for automatic synchronization"
+            "hint": "Enable auto_sync in config for automatic synchronization",
         }
 
     sync_manager = await get_sync_manager_instance()
@@ -757,23 +765,19 @@ async def compass_sync(
 
     if force:
         result = await sync_manager.full_sync()
-        return {
-            "action": "full_sync",
-            "result": result
-        }
+        return {"action": "full_sync", "result": result}
     else:
         results = await sync_manager.sync_if_needed()
         return {
             "action": "sync_if_needed",
             "backends": results,
-            "hint": "Use force=True to rebuild the entire index"
+            "hint": "Use force=True to rebuild the entire index",
         }
 
 
 @mcp.tool()
 async def compass_audit(
-    include_tools: bool = False,
-    timeframe: str = "24h"
+    include_tools: bool = False, timeframe: str = "24h"
 ) -> Dict[str, Any]:
     """
     Comprehensive audit of the Tool Compass system.
@@ -828,7 +832,7 @@ async def compass_audit(
             audit["hot_cache"] = {
                 "size": len(hot_tools),
                 "tools": hot_tools,
-                "status": "active" if hot_tools else "empty (populates with usage)"
+                "status": "active" if hot_tools else "empty (populates with usage)",
             }
 
             # Analytics summary
@@ -839,8 +843,12 @@ async def compass_audit(
                 "avg_search_latency_ms": summary["searches"]["avg_latency_ms"],
                 "total_tool_calls": summary["tool_calls"]["total"],
                 "success_rate": summary["tool_calls"]["success_rate"],
-                "top_tools": [t["tool"] for t in summary["tool_calls"]["top_tools"][:5]],
-                "top_queries": [q["query"] for q in summary["searches"]["top_queries"][:5]],
+                "top_tools": [
+                    t["tool"] for t in summary["tool_calls"]["top_tools"][:5]
+                ],
+                "top_queries": [
+                    q["query"] for q in summary["searches"]["top_queries"][:5]
+                ],
             }
 
     # Chains
@@ -856,10 +864,10 @@ async def compass_audit(
                         "name": c.name,
                         "tools": [t.split(":")[-1] for t in c.tools],
                         "use_count": c.use_count,
-                        "auto_detected": c.is_auto_detected
+                        "auto_detected": c.is_auto_detected,
                     }
                     for c in chains
-                ]
+                ],
             }
 
     # Sync status
@@ -877,9 +885,11 @@ async def compass_audit(
         audit["tools"] = [
             {
                 "name": row["name"],
-                "description": row["description"][:80] + "..." if len(row["description"]) > 80 else row["description"],
+                "description": row["description"][:80] + "..."
+                if len(row["description"]) > 80
+                else row["description"],
                 "category": row["category"],
-                "server": row["server"]
+                "server": row["server"],
             }
             for row in cursor.fetchall()
         ]
@@ -895,7 +905,7 @@ async def compass_audit(
 
     audit["health"] = {
         "status": "healthy" if not issues else "needs_attention",
-        "issues": issues if issues else ["All systems operational"]
+        "issues": issues if issues else ["All systems operational"],
     }
 
     return audit
@@ -904,6 +914,7 @@ async def compass_audit(
 # =============================================================================
 # CLI COMMANDS
 # =============================================================================
+
 
 async def sync_from_backends():
     """Sync tool definitions from live backend servers and rebuild index."""
@@ -943,15 +954,17 @@ async def sync_from_backends():
                     param_type = "/".join(param_type)
                 params[param_name] = param_type
 
-        tool_defs.append(ToolDefinition(
-            name=tool.qualified_name,
-            description=tool.description,
-            category=categorize_tool(tool.name, tool.description),
-            server=server,
-            parameters=params,
-            examples=[],
-            is_core=False,
-        ))
+        tool_defs.append(
+            ToolDefinition(
+                name=tool.qualified_name,
+                description=tool.description,
+                category=categorize_tool(tool.name, tool.description),
+                server=server,
+                parameters=params,
+                examples=[],
+                is_core=False,
+            )
+        )
 
     # Build index
     print("\nBuilding search index...")
@@ -963,7 +976,9 @@ async def sync_from_backends():
         return
 
     result = await index.build_index(tool_defs)
-    print(f"Index built: {result['tools_indexed']} tools in {result['total_time']:.2f}s")
+    print(
+        f"Index built: {result['tools_indexed']} tools in {result['total_time']:.2f}s"
+    )
 
     # Cleanup
     await index.close()
@@ -975,7 +990,7 @@ async def sync_from_backends():
 def categorize_tool(name: str, description: str) -> str:
     """Infer category from tool name and description."""
     name_lower = name.lower()
-    desc_lower = description.lower()
+    description.lower()
 
     if any(x in name_lower for x in ["file", "read", "write", "directory", "path"]):
         return "file"
@@ -1041,7 +1056,9 @@ async def run_tests():
         score = f"{top_match.score:.3f}" if top_match else "N/A"
         print(f"[{status}] '{query}' -> {actual} ({score})")
 
-    print(f"\nResults: {passed}/{len(test_cases)} passed ({100 * passed / len(test_cases):.0f}%)")
+    print(
+        f"\nResults: {passed}/{len(test_cases)} passed ({100 * passed / len(test_cases):.0f}%)"
+    )
 
     # Latency test
     print("\n" + "-" * 60)
@@ -1049,6 +1066,7 @@ async def run_tests():
     print("-" * 60)
 
     import time
+
     times = []
     for query, _ in test_cases:
         start = time.time()
@@ -1084,9 +1102,13 @@ def show_config():
     for name, backend in config.backends.items():
         print(f"\n{name}:")
         print(f"  Type: {backend.type}")
-        if hasattr(backend, 'command'):
+        if hasattr(backend, "command"):
             print(f"  Command: {backend.command}")
-            print(f"  Args: {backend.args[:2]}..." if len(backend.args) > 2 else f"  Args: {backend.args}")
+            print(
+                f"  Args: {backend.args[:2]}..."
+                if len(backend.args) > 2
+                else f"  Args: {backend.args}"
+            )
 
 
 async def async_main(args):
@@ -1107,9 +1129,11 @@ Examples:
   python gateway.py --sync       Sync tools from backends and rebuild index
   python gateway.py --test       Run test queries
   python gateway.py --config     Show current configuration
-        """
+        """,
     )
-    parser.add_argument("--sync", action="store_true", help="Sync tools from backend servers")
+    parser.add_argument(
+        "--sync", action="store_true", help="Sync tools from backend servers"
+    )
     parser.add_argument("--test", action="store_true", help="Run test queries")
     parser.add_argument("--config", action="store_true", help="Show configuration")
 
@@ -1123,10 +1147,20 @@ Examples:
         # NOTE: Never print() to stdout in MCP mode - it corrupts JSON-RPC!
         # Use stderr for diagnostics if needed
         import sys
+
         print("Starting Tool Compass Gateway v2.0...", file=sys.stderr)
-        print("Tools: compass, describe, execute, compass_categories, compass_status", file=sys.stderr)
-        print("       compass_analytics, compass_chains, compass_sync, compass_audit", file=sys.stderr)
-        print("Features: auto-sync, hot cache, usage analytics, tool chains", file=sys.stderr)
+        print(
+            "Tools: compass, describe, execute, compass_categories, compass_status",
+            file=sys.stderr,
+        )
+        print(
+            "       compass_analytics, compass_chains, compass_sync, compass_audit",
+            file=sys.stderr,
+        )
+        print(
+            "Features: auto-sync, hot cache, usage analytics, tool chains",
+            file=sys.stderr,
+        )
         print("Workflow: compass() -> describe() -> execute()", file=sys.stderr)
         mcp.run()
 

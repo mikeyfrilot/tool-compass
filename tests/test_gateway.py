@@ -7,7 +7,7 @@ Based on FastMCP testing patterns: https://gofastmcp.com/patterns/testing
 
 import pytest
 from pathlib import Path
-from unittest.mock import Mock, AsyncMock, patch, MagicMock
+from unittest.mock import Mock, AsyncMock, patch
 import sys
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -20,7 +20,7 @@ class TestCompassTool:
     async def test_compass_basic_search(self, test_index, test_config):
         """Should return search results for a query."""
         # Import after fixtures set up mocks
-        from gateway import compass, get_config, _compass_index
+        from gateway import compass
         import gateway
 
         # Inject test fixtures
@@ -39,6 +39,7 @@ class TestCompassTool:
     async def test_compass_with_filters(self, test_index, test_config):
         """Should apply category and server filters."""
         import gateway
+
         gateway._compass_index = test_index
         gateway._config = test_config
         gateway._startup_sync_done = True
@@ -61,6 +62,7 @@ class TestCompassTool:
     async def test_compass_min_confidence(self, test_index, test_config):
         """Should filter results below min_confidence."""
         import gateway
+
         gateway._compass_index = test_index
         gateway._config = test_config
         gateway._startup_sync_done = True
@@ -81,6 +83,7 @@ class TestCompassTool:
     async def test_compass_tokens_saved(self, test_index, test_config):
         """Should calculate token savings."""
         import gateway
+
         gateway._compass_index = test_index
         gateway._config = test_config
         gateway._startup_sync_done = True
@@ -96,6 +99,7 @@ class TestCompassTool:
     async def test_compass_no_results(self, test_index, test_config):
         """Should handle no matching results gracefully."""
         import gateway
+
         gateway._compass_index = test_index
         gateway._config = test_config
         gateway._startup_sync_done = True
@@ -118,6 +122,7 @@ class TestDescribeTool:
     async def test_describe_existing_tool(self, test_index, test_config):
         """Should return full schema for existing tool."""
         import gateway
+
         gateway._compass_index = test_index
         gateway._config = test_config
         gateway._backend_manager = Mock()
@@ -136,6 +141,7 @@ class TestDescribeTool:
     async def test_describe_nonexistent_tool(self, test_index, test_config):
         """Should return error for nonexistent tool."""
         import gateway
+
         gateway._compass_index = test_index
         gateway._config = test_config
         gateway._backend_manager = Mock()
@@ -161,7 +167,9 @@ class TestExecuteTool:
         mock_manager = Mock()
         mock_manager._backends = {"test": Mock(is_connected=True)}
         mock_manager.connect_backend = AsyncMock(return_value=True)
-        mock_manager.execute_tool = AsyncMock(return_value={"success": True, "data": "result"})
+        mock_manager.execute_tool = AsyncMock(
+            return_value={"success": True, "data": "result"}
+        )
 
         gateway._backend_manager = mock_manager
         gateway._config = test_config
@@ -198,7 +206,9 @@ class TestExecuteTool:
         assert "error" in result
 
     @pytest.mark.asyncio
-    async def test_execute_with_analytics(self, test_config_with_backends, test_analytics):
+    async def test_execute_with_analytics(
+        self, test_config_with_backends, test_analytics
+    ):
         """Should record tool execution in analytics."""
         import gateway
 
@@ -207,7 +217,9 @@ class TestExecuteTool:
         mock_manager.execute_tool = AsyncMock(return_value={"success": True})
 
         gateway._backend_manager = mock_manager
-        gateway._config = test_config_with_backends  # Use config with analytics_enabled=True
+        gateway._config = (
+            test_config_with_backends  # Use config with analytics_enabled=True
+        )
         gateway._analytics = test_analytics
 
         from gateway import execute
@@ -226,6 +238,7 @@ class TestCategoriesAndStatus:
     async def test_compass_categories(self, test_index, test_config):
         """Should return category and server breakdown."""
         import gateway
+
         gateway._compass_index = test_index
         gateway._config = test_config
 
@@ -242,6 +255,7 @@ class TestCategoriesAndStatus:
     async def test_compass_status(self, test_index, test_config):
         """Should return comprehensive status."""
         import gateway
+
         gateway._compass_index = test_index
         gateway._config = test_config
         gateway._backend_manager = Mock()
@@ -260,7 +274,9 @@ class TestSingletonInitialization:
     """Test async singleton initialization patterns."""
 
     @pytest.mark.asyncio
-    async def test_get_index_creates_once(self, temp_index_path, temp_db_path, mock_embedder, sample_tools):
+    async def test_get_index_creates_once(
+        self, temp_index_path, temp_db_path, mock_embedder, sample_tools
+    ):
         """get_index() should only create index once."""
         import gateway
 
@@ -269,6 +285,7 @@ class TestSingletonInitialization:
 
         # Create a pre-built index
         from indexer import CompassIndex
+
         index = CompassIndex(
             index_path=temp_index_path,
             db_path=temp_db_path,
@@ -281,6 +298,7 @@ class TestSingletonInitialization:
 
         # Multiple calls should return same instance
         from gateway import get_index
+
         idx1 = await get_index()
         idx2 = await get_index()
 
@@ -289,13 +307,16 @@ class TestSingletonInitialization:
         await index.close()
 
     @pytest.mark.asyncio
-    async def test_concurrent_initialization_safety(self, temp_index_path, temp_db_path, mock_embedder, sample_tools):
+    async def test_concurrent_initialization_safety(
+        self, temp_index_path, temp_db_path, mock_embedder, sample_tools
+    ):
         """Concurrent get_index() calls should not create duplicates."""
         import asyncio
         import gateway
 
         # Build index first
         from indexer import CompassIndex
+
         index = CompassIndex(
             index_path=temp_index_path,
             db_path=temp_db_path,
@@ -323,6 +344,7 @@ class TestSingletonInitialization:
 # Analytics Tool Tests
 # =============================================================================
 
+
 class TestCompassAnalyticsTool:
     """Test compass_analytics() MCP tool."""
 
@@ -330,6 +352,7 @@ class TestCompassAnalyticsTool:
     async def test_analytics_disabled(self, test_config):
         """Should return error when analytics disabled."""
         import gateway
+
         gateway._config = test_config  # analytics_enabled=False
 
         from gateway import compass_analytics
@@ -340,9 +363,12 @@ class TestCompassAnalyticsTool:
         assert "disabled" in result["error"].lower()
 
     @pytest.mark.asyncio
-    async def test_analytics_returns_summary(self, test_config_with_backends, test_analytics):
+    async def test_analytics_returns_summary(
+        self, test_config_with_backends, test_analytics
+    ):
         """Should return analytics summary when enabled."""
         import gateway
+
         gateway._config = test_config_with_backends
         gateway._analytics = test_analytics
 
@@ -358,9 +384,12 @@ class TestCompassAnalyticsTool:
         assert "tool_calls" in result
 
     @pytest.mark.asyncio
-    async def test_analytics_exclude_failures(self, test_config_with_backends, test_analytics):
+    async def test_analytics_exclude_failures(
+        self, test_config_with_backends, test_analytics
+    ):
         """Should exclude failures when requested."""
         import gateway
+
         gateway._config = test_config_with_backends
         gateway._analytics = test_analytics
 
@@ -375,6 +404,7 @@ class TestCompassAnalyticsTool:
 # Chains Tool Tests
 # =============================================================================
 
+
 class TestCompassChainsTool:
     """Test compass_chains() MCP tool."""
 
@@ -382,6 +412,7 @@ class TestCompassChainsTool:
     async def test_chains_disabled(self, test_config):
         """Should return error when chain indexing disabled."""
         import gateway
+
         gateway._config = test_config  # chain_indexing_enabled=False
 
         from gateway import compass_chains
@@ -395,14 +426,13 @@ class TestCompassChainsTool:
     async def test_chains_list(self, test_config_with_backends, test_chain_indexer):
         """Should list chains when enabled."""
         import gateway
+
         gateway._config = test_config_with_backends
         gateway._chain_indexer = test_chain_indexer
 
         # Add a test chain
         await test_chain_indexer.add_chain(
-            name="test_workflow",
-            tools=["tool1", "tool2"],
-            description="Test workflow"
+            name="test_workflow", tools=["tool1", "tool2"], description="Test workflow"
         )
 
         from gateway import compass_chains
@@ -416,6 +446,7 @@ class TestCompassChainsTool:
     async def test_chains_create(self, test_config_with_backends, test_chain_indexer):
         """Should create new chains."""
         import gateway
+
         gateway._config = test_config_with_backends
         gateway._chain_indexer = test_chain_indexer
 
@@ -425,16 +456,19 @@ class TestCompassChainsTool:
             action="create",
             chain_name="new_workflow",
             tools=["step1", "step2", "step3"],
-            description="New workflow description"
+            description="New workflow description",
         )
 
         assert "created" in result
         assert result["created"]["name"] == "new_workflow"
 
     @pytest.mark.asyncio
-    async def test_chains_create_missing_params(self, test_config_with_backends, test_chain_indexer):
+    async def test_chains_create_missing_params(
+        self, test_config_with_backends, test_chain_indexer
+    ):
         """Should error when missing required params for create."""
         import gateway
+
         gateway._config = test_config_with_backends
         gateway._chain_indexer = test_chain_indexer
 
@@ -446,9 +480,12 @@ class TestCompassChainsTool:
         assert "required" in result["error"].lower()
 
     @pytest.mark.asyncio
-    async def test_chains_detect(self, test_config_with_backends, test_analytics, test_chain_indexer):
+    async def test_chains_detect(
+        self, test_config_with_backends, test_analytics, test_chain_indexer
+    ):
         """Should detect chains from usage patterns."""
         import gateway
+
         gateway._config = test_config_with_backends
         gateway._analytics = test_analytics
         gateway._chain_indexer = test_chain_indexer
@@ -460,9 +497,12 @@ class TestCompassChainsTool:
         assert "detected" in result or "error" in result
 
     @pytest.mark.asyncio
-    async def test_chains_unknown_action(self, test_config_with_backends, test_chain_indexer):
+    async def test_chains_unknown_action(
+        self, test_config_with_backends, test_chain_indexer
+    ):
         """Should error on unknown action."""
         import gateway
+
         gateway._config = test_config_with_backends
         gateway._chain_indexer = test_chain_indexer
 
@@ -478,6 +518,7 @@ class TestCompassChainsTool:
 # Sync Tool Tests
 # =============================================================================
 
+
 class TestCompassSyncTool:
     """Test compass_sync() MCP tool."""
 
@@ -485,6 +526,7 @@ class TestCompassSyncTool:
     async def test_sync_disabled(self, test_config):
         """Should return error when auto_sync disabled."""
         import gateway
+
         gateway._config = test_config  # auto_sync=False
 
         from gateway import compass_sync
@@ -495,7 +537,9 @@ class TestCompassSyncTool:
         assert "disabled" in result["error"].lower()
 
     @pytest.mark.asyncio
-    async def test_sync_if_needed(self, test_config_with_backends, test_index, mock_backend_manager):
+    async def test_sync_if_needed(
+        self, test_config_with_backends, test_index, mock_backend_manager
+    ):
         """Should run sync_if_needed."""
         import gateway
         from sync_manager import SyncManager
@@ -523,7 +567,9 @@ class TestCompassSyncTool:
         from sync_manager import SyncManager
 
         mock_sync = Mock(spec=SyncManager)
-        mock_sync.full_sync = AsyncMock(return_value={"status": "complete", "tools_indexed": 10})
+        mock_sync.full_sync = AsyncMock(
+            return_value={"status": "complete", "tools_indexed": 10}
+        )
 
         gateway._config = test_config_with_backends
         gateway._config.auto_sync = True
@@ -541,6 +587,7 @@ class TestCompassSyncTool:
 # Audit Tool Tests
 # =============================================================================
 
+
 class TestCompassAuditTool:
     """Test compass_audit() MCP tool."""
 
@@ -548,15 +595,18 @@ class TestCompassAuditTool:
     async def test_audit_basic(self, test_index, test_config):
         """Should return comprehensive audit."""
         import gateway
+
         gateway._compass_index = test_index
         gateway._config = test_config
         gateway._backend_manager = Mock()
-        gateway._backend_manager.get_stats = Mock(return_value={
-            "configured_backends": ["test"],
-            "connected_backends": [],
-            "total_tools": 0,
-            "tools_by_backend": {}
-        })
+        gateway._backend_manager.get_stats = Mock(
+            return_value={
+                "configured_backends": ["test"],
+                "connected_backends": [],
+                "total_tools": 0,
+                "tools_by_backend": {},
+            }
+        )
 
         from gateway import compass_audit
 
@@ -570,26 +620,35 @@ class TestCompassAuditTool:
         assert "health" in result
 
     @pytest.mark.asyncio
-    async def test_audit_with_analytics(self, test_index, test_config_with_backends, test_analytics):
+    async def test_audit_with_analytics(
+        self, test_index, test_config_with_backends, test_analytics
+    ):
         """Should include analytics in audit."""
         import gateway
+
         gateway._compass_index = test_index
         gateway._config = test_config_with_backends
         gateway._analytics = test_analytics
         gateway._backend_manager = Mock()
-        gateway._backend_manager.get_stats = Mock(return_value={
-            "configured_backends": [],
-            "connected_backends": [],
-            "total_tools": 0,
-            "tools_by_backend": {}
-        })
+        gateway._backend_manager.get_stats = Mock(
+            return_value={
+                "configured_backends": [],
+                "connected_backends": [],
+                "total_tools": 0,
+                "tools_by_backend": {},
+            }
+        )
 
         # Record some data
         await test_analytics.record_search("query", [], 5.0)
 
         from gateway import compass_audit
 
-        result = await compass_audit(timeframe="1h")
+        # Patch get_analytics_instance and get_chain_indexer_instance to avoid
+        # issues with singletons creating new instances with default paths
+        with patch.object(gateway, "get_analytics_instance", AsyncMock(return_value=test_analytics)):
+            with patch.object(gateway, "get_chain_indexer_instance", AsyncMock(return_value=None)):
+                result = await compass_audit(timeframe="1h")
 
         assert "hot_cache" in result
         assert "analytics" in result
@@ -598,15 +657,18 @@ class TestCompassAuditTool:
     async def test_audit_include_tools(self, test_index, test_config):
         """Should include tool list when requested."""
         import gateway
+
         gateway._compass_index = test_index
         gateway._config = test_config
         gateway._backend_manager = Mock()
-        gateway._backend_manager.get_stats = Mock(return_value={
-            "configured_backends": [],
-            "connected_backends": [],
-            "total_tools": 0,
-            "tools_by_backend": {}
-        })
+        gateway._backend_manager.get_stats = Mock(
+            return_value={
+                "configured_backends": [],
+                "connected_backends": [],
+                "total_tools": 0,
+                "tools_by_backend": {},
+            }
+        )
 
         from gateway import compass_audit
 
@@ -623,11 +685,9 @@ class TestCompassAuditTool:
 
         # Create empty index
         mock_index = Mock(spec=CompassIndex)
-        mock_index.get_stats = Mock(return_value={
-            "total_tools": 0,
-            "by_category": {},
-            "by_server": {}
-        })
+        mock_index.get_stats = Mock(
+            return_value={"total_tools": 0, "by_category": {}, "by_server": {}}
+        )
         mock_index.db = Mock()
         mock_index.index_path = Path("/tmp/test.hnsw")
         mock_index.db_path = Path("/tmp/test.db")
@@ -636,17 +696,21 @@ class TestCompassAuditTool:
         gateway._config = test_config
         gateway._analytics = Mock()
         gateway._analytics._hot_cache = {}
-        gateway._analytics.get_analytics_summary = AsyncMock(return_value={
-            "searches": {"total": 0, "avg_latency_ms": 0, "top_queries": []},
-            "tool_calls": {"total": 0, "success_rate": 0, "top_tools": []}
-        })
+        gateway._analytics.get_analytics_summary = AsyncMock(
+            return_value={
+                "searches": {"total": 0, "avg_latency_ms": 0, "top_queries": []},
+                "tool_calls": {"total": 0, "success_rate": 0, "top_tools": []},
+            }
+        )
         gateway._backend_manager = Mock()
-        gateway._backend_manager.get_stats = Mock(return_value={
-            "configured_backends": [],
-            "connected_backends": [],
-            "total_tools": 0,
-            "tools_by_backend": {}
-        })
+        gateway._backend_manager.get_stats = Mock(
+            return_value={
+                "configured_backends": [],
+                "connected_backends": [],
+                "total_tools": 0,
+                "tools_by_backend": {},
+            }
+        )
 
         # Enable analytics for test
         gateway._config.analytics_enabled = True
@@ -663,6 +727,7 @@ class TestCompassAuditTool:
 # Startup Sync Tests
 # =============================================================================
 
+
 class TestStartupSync:
     """Test maybe_startup_sync() function."""
 
@@ -670,6 +735,7 @@ class TestStartupSync:
     async def test_startup_sync_disabled(self, test_config):
         """Should skip sync when sync_check_on_startup=False."""
         import gateway
+
         gateway._config = test_config
         gateway._config.sync_check_on_startup = False
         gateway._startup_sync_done = False
@@ -684,6 +750,7 @@ class TestStartupSync:
     async def test_startup_sync_only_once(self, test_config):
         """Should only run sync once."""
         import gateway
+
         gateway._config = test_config
         gateway._config.sync_check_on_startup = True
         gateway._startup_sync_done = True
@@ -698,6 +765,7 @@ class TestStartupSync:
 # =============================================================================
 # Categorize Tool Tests
 # =============================================================================
+
 
 class TestCategorizeTool:
     """Test the categorize_tool() helper function."""
@@ -758,7 +826,9 @@ class TestCategorizeTool:
         from gateway import categorize_tool
 
         assert categorize_tool("service_status", "Service status") == "system"
-        assert categorize_tool("health_check", "Check health") == "analysis"  # matches analysis first
+        assert (
+            categorize_tool("health_check", "Check health") == "analysis"
+        )  # matches analysis first
 
     def test_other_category(self):
         """Should default to other for unknown tools."""
@@ -771,12 +841,14 @@ class TestCategorizeTool:
 # Get Config Tests
 # =============================================================================
 
+
 class TestGetConfig:
     """Test get_config() function."""
 
     def test_get_config_caches(self):
         """Should cache config after first load."""
         import gateway
+
         gateway._config = None
 
         with patch("gateway.load_config") as mock_load:
@@ -796,6 +868,7 @@ class TestGetConfig:
 # Get Backends Tests
 # =============================================================================
 
+
 class TestGetBackends:
     """Test get_backends() function."""
 
@@ -803,6 +876,7 @@ class TestGetBackends:
     async def test_get_backends_creates_once(self, test_config):
         """Should create backend manager once."""
         import gateway
+
         gateway._backend_manager = None
         gateway._config = test_config
 
@@ -818,6 +892,7 @@ class TestGetBackends:
 # Get Analytics Instance Tests
 # =============================================================================
 
+
 class TestGetAnalyticsInstance:
     """Test get_analytics_instance() function."""
 
@@ -825,6 +900,7 @@ class TestGetAnalyticsInstance:
     async def test_analytics_disabled_returns_none(self, test_config):
         """Should return None when analytics disabled."""
         import gateway
+
         gateway._config = test_config  # analytics_enabled=False
         gateway._analytics = None
 
@@ -838,6 +914,7 @@ class TestGetAnalyticsInstance:
     async def test_analytics_enabled_returns_instance(self, test_config_with_backends):
         """Should return analytics instance when enabled."""
         import gateway
+
         gateway._config = test_config_with_backends
         gateway._analytics = Mock()
         gateway._analytics.load_hot_cache_from_db = AsyncMock()
@@ -853,13 +930,17 @@ class TestGetAnalyticsInstance:
 # Compass Tool with Chains
 # =============================================================================
 
+
 class TestCompassWithChains:
     """Test compass() tool with chain searching."""
 
     @pytest.mark.asyncio
-    async def test_compass_includes_chains(self, test_index, test_config_with_backends, test_chain_indexer):
+    async def test_compass_includes_chains(
+        self, test_index, test_config_with_backends, test_chain_indexer
+    ):
         """Should include chain results when chain_indexing enabled."""
         import gateway
+
         gateway._compass_index = test_index
         gateway._config = test_config_with_backends
         gateway._chain_indexer = test_chain_indexer
@@ -870,7 +951,7 @@ class TestCompassWithChains:
         await test_chain_indexer.add_chain(
             name="file_workflow",
             tools=["test:read_file", "test:write_file"],
-            description="Read and write files"
+            description="Read and write files",
         )
         await test_chain_indexer.build_chain_index()
 
@@ -882,9 +963,12 @@ class TestCompassWithChains:
         # Chains may or may not be found depending on embedding similarity
 
     @pytest.mark.asyncio
-    async def test_compass_without_chains(self, test_index, test_config, test_chain_indexer):
+    async def test_compass_without_chains(
+        self, test_index, test_config, test_chain_indexer
+    ):
         """Should exclude chains when include_chains=False."""
         import gateway
+
         gateway._compass_index = test_index
         gateway._config = test_config
         gateway._startup_sync_done = True
@@ -900,6 +984,7 @@ class TestCompassWithChains:
 # Progressive Disclosure Tests
 # =============================================================================
 
+
 class TestProgressiveDisclosure:
     """Test progressive disclosure behavior."""
 
@@ -907,6 +992,7 @@ class TestProgressiveDisclosure:
     async def test_progressive_disclosure_enabled(self, test_index, test_config):
         """Should not include full schemas when progressive disclosure enabled."""
         import gateway
+
         gateway._compass_index = test_index
         gateway._config = test_config
         gateway._config.progressive_disclosure = True
@@ -925,6 +1011,7 @@ class TestProgressiveDisclosure:
     async def test_progressive_disclosure_disabled(self, test_index, test_config):
         """Should include full schemas when progressive disclosure disabled."""
         import gateway
+
         gateway._compass_index = test_index
         gateway._config = test_config
         gateway._config.progressive_disclosure = False
@@ -944,6 +1031,7 @@ class TestProgressiveDisclosure:
 # Describe Tool Backend Fallback Tests
 # =============================================================================
 
+
 class TestDescribeBackendFallback:
     """Test describe() tool backend fallback."""
 
@@ -951,16 +1039,19 @@ class TestDescribeBackendFallback:
     async def test_describe_falls_back_to_backend(self, test_index, test_config):
         """Should try backend when tool not in index."""
         import gateway
+
         gateway._compass_index = test_index
         gateway._config = test_config
 
         # Mock backend with tool schema
         mock_manager = Mock()
-        mock_manager.get_tool_schema = Mock(return_value={
-            "name": "backend:tool",
-            "description": "From backend",
-            "parameters": {"arg": "str"}
-        })
+        mock_manager.get_tool_schema = Mock(
+            return_value={
+                "name": "backend:tool",
+                "description": "From backend",
+                "parameters": {"arg": "str"},
+            }
+        )
         gateway._backend_manager = mock_manager
 
         from gateway import describe
@@ -974,6 +1065,7 @@ class TestDescribeBackendFallback:
 # =============================================================================
 # Execute Tool Edge Cases
 # =============================================================================
+
 
 class TestExecuteEdgeCases:
     """Test execute() edge cases."""
@@ -993,13 +1085,15 @@ class TestExecuteEdgeCases:
 
         from gateway import execute
 
-        result = await execute(tool_name="test:tool", arguments=None)
+        await execute(tool_name="test:tool", arguments=None)
 
         # Should pass empty dict
         mock_manager.execute_tool.assert_called_with("test:tool", {})
 
     @pytest.mark.asyncio
-    async def test_execute_records_analytics_on_success(self, test_config_with_backends, test_analytics):
+    async def test_execute_records_analytics_on_success(
+        self, test_config_with_backends, test_analytics
+    ):
         """Should record analytics on successful execution."""
         import gateway
 
@@ -1020,13 +1114,17 @@ class TestExecuteEdgeCases:
         assert summary["tool_calls"]["total"] >= 1
 
     @pytest.mark.asyncio
-    async def test_execute_records_analytics_on_failure(self, test_config_with_backends, test_analytics):
+    async def test_execute_records_analytics_on_failure(
+        self, test_config_with_backends, test_analytics
+    ):
         """Should record analytics on failed execution."""
         import gateway
 
         mock_manager = Mock()
         mock_manager._backends = {"test": Mock(is_connected=True)}
-        mock_manager.execute_tool = AsyncMock(return_value={"success": False, "error": "Test error"})
+        mock_manager.execute_tool = AsyncMock(
+            return_value={"success": False, "error": "Test error"}
+        )
 
         gateway._backend_manager = mock_manager
         gateway._config = test_config_with_backends
@@ -1043,6 +1141,7 @@ class TestExecuteEdgeCases:
 # Sync Manager Instance Tests
 # =============================================================================
 
+
 class TestGetSyncManagerInstance:
     """Test get_sync_manager_instance() function."""
 
@@ -1050,6 +1149,7 @@ class TestGetSyncManagerInstance:
     async def test_returns_none_when_disabled(self, test_config):
         """Should return None when auto_sync disabled."""
         import gateway
+
         gateway._config = test_config  # auto_sync=False
         gateway._sync_manager = None
 
@@ -1081,6 +1181,7 @@ class TestGetSyncManagerInstance:
 # Chain Indexer Instance Tests
 # =============================================================================
 
+
 class TestGetChainIndexerInstance:
     """Test get_chain_indexer_instance() function."""
 
@@ -1088,6 +1189,7 @@ class TestGetChainIndexerInstance:
     async def test_returns_none_when_disabled(self, test_config):
         """Should return None when chain_indexing disabled."""
         import gateway
+
         gateway._config = test_config  # chain_indexing_enabled=False
         gateway._chain_indexer = None
 
@@ -1118,6 +1220,7 @@ class TestGetChainIndexerInstance:
 # Execute Tool Additional Tests
 # =============================================================================
 
+
 class TestExecuteToolAdditional:
     """Additional execute() edge case tests."""
 
@@ -1129,7 +1232,9 @@ class TestExecuteToolAdditional:
         mock_manager = Mock()
         mock_manager._backends = {}
         mock_manager.connect_backend = AsyncMock(return_value=False)
-        mock_manager.execute_tool = AsyncMock(return_value={"success": False, "error": "No backend"})
+        mock_manager.execute_tool = AsyncMock(
+            return_value={"success": False, "error": "No backend"}
+        )
 
         gateway._backend_manager = mock_manager
         gateway._config = test_config
@@ -1149,7 +1254,9 @@ class TestExecuteToolAdditional:
         mock_manager = Mock()
         mock_manager._backends = {"test": Mock(is_connected=True)}
         # Return failure instead of raising - the gateway wraps exceptions
-        mock_manager.execute_tool = AsyncMock(return_value={"success": False, "error": "Execution failed"})
+        mock_manager.execute_tool = AsyncMock(
+            return_value={"success": False, "error": "Execution failed"}
+        )
 
         gateway._backend_manager = mock_manager
         gateway._config = test_config
@@ -1167,21 +1274,24 @@ class TestExecuteToolAdditional:
 # Compass Status Additional Tests
 # =============================================================================
 
+
 class TestCompassStatusAdditional:
     """Additional compass_status() tests."""
 
     @pytest.mark.asyncio
-    async def test_status_with_chain_indexer(self, test_index, test_config_with_backends, test_chain_indexer):
+    async def test_status_with_chain_indexer(
+        self, test_index, test_config_with_backends, test_chain_indexer
+    ):
         """Should include chain indexer stats when available."""
         import gateway
+
         gateway._compass_index = test_index
         gateway._config = test_config_with_backends
         gateway._chain_indexer = test_chain_indexer
         gateway._backend_manager = Mock()
-        gateway._backend_manager.get_stats = Mock(return_value={
-            "connected": 1,
-            "total_tools": 5
-        })
+        gateway._backend_manager.get_stats = Mock(
+            return_value={"connected": 1, "total_tools": 5}
+        )
 
         from gateway import compass_status
 
@@ -1190,7 +1300,9 @@ class TestCompassStatusAdditional:
         assert "chains" in result
 
     @pytest.mark.asyncio
-    async def test_status_with_sync_manager(self, test_index, test_config_with_backends):
+    async def test_status_with_sync_manager(
+        self, test_index, test_config_with_backends
+    ):
         """Should include sync status when sync manager available."""
         import gateway
         from sync_manager import SyncManager
@@ -1216,6 +1328,7 @@ class TestCompassStatusAdditional:
 # =============================================================================
 # Startup Sync Edge Cases
 # =============================================================================
+
 
 class TestStartupSyncEdgeCases:
     """Edge cases for maybe_startup_sync()."""
@@ -1268,23 +1381,29 @@ class TestStartupSyncEdgeCases:
 # Compass Audit Edge Cases
 # =============================================================================
 
+
 class TestCompassAuditEdgeCases:
     """Edge cases for compass_audit()."""
 
     @pytest.mark.asyncio
-    async def test_audit_with_chains_enabled(self, test_index, test_config_with_backends, test_chain_indexer):
+    async def test_audit_with_chains_enabled(
+        self, test_index, test_config_with_backends, test_chain_indexer
+    ):
         """Should include chain info when enabled."""
         import gateway
+
         gateway._compass_index = test_index
         gateway._config = test_config_with_backends
         gateway._chain_indexer = test_chain_indexer
         gateway._backend_manager = Mock()
-        gateway._backend_manager.get_stats = Mock(return_value={
-            "configured_backends": [],
-            "connected_backends": [],
-            "total_tools": 0,
-            "tools_by_backend": {}
-        })
+        gateway._backend_manager.get_stats = Mock(
+            return_value={
+                "configured_backends": [],
+                "connected_backends": [],
+                "total_tools": 0,
+                "tools_by_backend": {},
+            }
+        )
 
         from gateway import compass_audit
 
@@ -1306,12 +1425,14 @@ class TestCompassAuditEdgeCases:
         gateway._config.auto_sync = True  # Enable sync in config
         gateway._sync_manager = mock_sync
         gateway._backend_manager = Mock()
-        gateway._backend_manager.get_stats = Mock(return_value={
-            "configured_backends": [],
-            "connected_backends": [],
-            "total_tools": 0,
-            "tools_by_backend": {}
-        })
+        gateway._backend_manager.get_stats = Mock(
+            return_value={
+                "configured_backends": [],
+                "connected_backends": [],
+                "total_tools": 0,
+                "tools_by_backend": {},
+            }
+        )
 
         from gateway import compass_audit
 
@@ -1326,6 +1447,7 @@ class TestCompassAuditEdgeCases:
 # Describe Tool Edge Cases
 # =============================================================================
 
+
 class TestDescribeEdgeCases:
     """Edge cases for describe() tool."""
 
@@ -1333,6 +1455,7 @@ class TestDescribeEdgeCases:
     async def test_describe_with_full_schema_from_index(self, test_index, test_config):
         """Should return full schema from index."""
         import gateway
+
         gateway._compass_index = test_index
         gateway._config = test_config
         gateway._backend_manager = Mock()
@@ -1346,9 +1469,12 @@ class TestDescribeEdgeCases:
         assert "tool" in result
 
     @pytest.mark.asyncio
-    async def test_describe_analytics_recorded(self, test_index, test_config_with_backends, test_analytics):
+    async def test_describe_analytics_recorded(
+        self, test_index, test_config_with_backends, test_analytics
+    ):
         """Should record describe call in analytics."""
         import gateway
+
         gateway._compass_index = test_index
         gateway._config = test_config_with_backends
         gateway._analytics = test_analytics
@@ -1368,13 +1494,17 @@ class TestDescribeEdgeCases:
 # Compass with Analytics Recording
 # =============================================================================
 
+
 class TestCompassAnalyticsRecording:
     """Test that compass() records analytics."""
 
     @pytest.mark.asyncio
-    async def test_compass_records_search(self, test_index, test_config_with_backends, test_analytics):
+    async def test_compass_records_search(
+        self, test_index, test_config_with_backends, test_analytics
+    ):
         """Should record search in analytics."""
         import gateway
+
         gateway._compass_index = test_index
         gateway._config = test_config_with_backends
         gateway._analytics = test_analytics
@@ -1393,6 +1523,7 @@ class TestCompassAnalyticsRecording:
 # Compass Categories Edge Cases
 # =============================================================================
 
+
 class TestCompassCategoriesEdgeCases:
     """Edge cases for compass_categories()."""
 
@@ -1400,6 +1531,7 @@ class TestCompassCategoriesEdgeCases:
     async def test_categories_with_usage_hint(self, test_index, test_config):
         """Should include usage hint."""
         import gateway
+
         gateway._compass_index = test_index
         gateway._config = test_config
 
@@ -1414,13 +1546,17 @@ class TestCompassCategoriesEdgeCases:
 # Chain Operations Edge Cases
 # =============================================================================
 
+
 class TestChainsEdgeCases:
     """Additional edge cases for compass_chains()."""
 
     @pytest.mark.asyncio
-    async def test_chains_detect_no_analytics(self, test_config_with_backends, test_chain_indexer):
+    async def test_chains_detect_no_analytics(
+        self, test_config_with_backends, test_chain_indexer
+    ):
         """Should handle detect with no analytics."""
         import gateway
+
         gateway._config = test_config_with_backends
         gateway._chain_indexer = test_chain_indexer
         gateway._analytics = None
@@ -1437,6 +1573,7 @@ class TestChainsEdgeCases:
 # Categorize Tool Edge Cases
 # =============================================================================
 
+
 class TestCategorizeToolEdgeCases:
     """Additional categorize_tool() tests."""
 
@@ -1445,7 +1582,9 @@ class TestCategorizeToolEdgeCases:
         from gateway import categorize_tool
 
         # The function only checks name, so generic names return "other"
-        assert categorize_tool("generic_tool", "Execute a SQL database query") == "other"
+        assert (
+            categorize_tool("generic_tool", "Execute a SQL database query") == "other"
+        )
         # But names with keywords work
         assert categorize_tool("db_query", "Execute a SQL database query") == "database"
 
@@ -1469,6 +1608,7 @@ class TestCategorizeToolEdgeCases:
 # Execute with Backend Auto-Connection
 # =============================================================================
 
+
 class TestExecuteBackendConnection:
     """Test execute() backend connection logic."""
 
@@ -1487,6 +1627,7 @@ class TestExecuteBackendConnection:
         def update_connected(*args):
             mock_backend.is_connected = True
             return True
+
         mock_manager.connect_backend.side_effect = update_connected
 
         gateway._backend_manager = mock_manager
@@ -1495,7 +1636,7 @@ class TestExecuteBackendConnection:
 
         from gateway import execute
 
-        result = await execute(tool_name="test:tool", arguments={})
+        await execute(tool_name="test:tool", arguments={})
 
         mock_manager.connect_backend.assert_called()
 
@@ -1514,7 +1655,7 @@ class TestExecuteBackendConnection:
 
         from gateway import execute
 
-        result = await execute(tool_name="test:tool", arguments={})
+        await execute(tool_name="test:tool", arguments={})
 
         # connect_backend should not have been called since already connected
         assert not mock_manager.connect_backend.called

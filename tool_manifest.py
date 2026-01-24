@@ -11,13 +11,14 @@ Each tool has:
 """
 
 from dataclasses import dataclass, field
-from typing import List, Dict, Optional
+from typing import List, Dict
 import json
 
 
 @dataclass
 class ToolDefinition:
     """A tool that can be discovered via compass."""
+
     name: str
     description: str
     category: str
@@ -25,7 +26,7 @@ class ToolDefinition:
     parameters: Dict = field(default_factory=dict)
     examples: List[str] = field(default_factory=list)
     is_core: bool = False
-    
+
     def embedding_text(self) -> str:
         """
         Generate rich text for embedding.
@@ -36,16 +37,16 @@ class ToolDefinition:
             f"Category: {self.category}",
             f"Description: {self.description}",
         ]
-        
+
         if self.examples:
             parts.append(f"Use cases: {'; '.join(self.examples)}")
-        
+
         if self.parameters:
             param_str = ", ".join(self.parameters.keys())
             parts.append(f"Parameters: {param_str}")
-        
+
         return " | ".join(parts)
-    
+
     def to_dict(self) -> Dict:
         """Convert to dictionary for JSON serialization."""
         return {
@@ -57,7 +58,7 @@ class ToolDefinition:
             "examples": self.examples,
             "is_core": self.is_core,
         }
-    
+
     @classmethod
     def from_dict(cls, data: Dict) -> "ToolDefinition":
         """Create from dictionary."""
@@ -104,7 +105,12 @@ TOOLS: List[ToolDefinition] = [
         description="Add new content to a Bridge session for storage",
         category="content",
         server="bridge",
-        parameters={"content": "str", "session_id": "str", "title": "str?", "content_type": "str?"},
+        parameters={
+            "content": "str",
+            "session_id": "str",
+            "title": "str?",
+            "content_type": "str?",
+        },
         examples=["save this note", "store document", "add to session"],
         is_core=True,
     ),
@@ -220,7 +226,6 @@ TOOLS: List[ToolDefinition] = [
         parameters={"content": "str"},
         examples=["auto-title", "generate name"],
     ),
-    
     # =========================================================================
     # BRIDGE SERVER - System
     # =========================================================================
@@ -241,7 +246,6 @@ TOOLS: List[ToolDefinition] = [
         parameters={},
         examples=["system info", "resource usage", "memory check"],
     ),
-    
     # =========================================================================
     # BRIDGE SERVER - File Operations
     # =========================================================================
@@ -303,7 +307,6 @@ TOOLS: List[ToolDefinition] = [
         parameters={"path": "str"},
         examples=["make folder", "create directory", "mkdir"],
     ),
-    
     # =========================================================================
     # BRIDGE SERVER - Git Operations
     # =========================================================================
@@ -364,7 +367,6 @@ TOOLS: List[ToolDefinition] = [
         parameters={"path": "str"},
         examples=["init repo", "start git", "new repository"],
     ),
-    
     # =========================================================================
     # BRIDGE SERVER - Database Operations
     # =========================================================================
@@ -456,7 +458,6 @@ TOOLS: List[ToolDefinition] = [
         parameters={"database": "str?"},
         examples=["update statistics", "analyze tables"],
     ),
-    
     # =========================================================================
     # BRIDGE SERVER - Meta Tools
     # =========================================================================
@@ -478,7 +479,6 @@ TOOLS: List[ToolDefinition] = [
         examples=["list tools", "available commands", "tool catalog"],
         is_core=True,
     ),
-    
     # =========================================================================
     # DOC SERVER - Code Analysis
     # =========================================================================
@@ -535,7 +535,12 @@ TOOLS: List[ToolDefinition] = [
         description="Add new detection pattern to scanner library",
         category="analysis",
         server="doc",
-        parameters={"pattern_id": "str", "name": "str", "description": "str", "detection_patterns": "str"},
+        parameters={
+            "pattern_id": "str",
+            "name": "str",
+            "description": "str",
+            "detection_patterns": "str",
+        },
         examples=["create pattern", "add detection rule"],
     ),
     ToolDefinition(
@@ -546,7 +551,6 @@ TOOLS: List[ToolDefinition] = [
         parameters={},
         examples=["pattern categories", "issue types"],
     ),
-    
     # =========================================================================
     # COMFY SERVER - Image Generation
     # =========================================================================
@@ -579,7 +583,13 @@ TOOLS: List[ToolDefinition] = [
         description="Generate image from text prompt using AI",
         category="ai",
         server="comfy",
-        parameters={"prompt": "str", "negative": "str?", "preset": "str?", "width": "int?", "height": "int?"},
+        parameters={
+            "prompt": "str",
+            "negative": "str?",
+            "preset": "str?",
+            "width": "int?",
+            "height": "int?",
+        },
         examples=["generate image", "create artwork", "text to image", "AI art"],
     ),
     ToolDefinition(
@@ -622,7 +632,6 @@ TOOLS: List[ToolDefinition] = [
         parameters={},
         examples=["cancel generation", "stop image"],
     ),
-    
     # =========================================================================
     # VIDEO SERVER - Video Generation
     # =========================================================================
@@ -655,7 +664,12 @@ TOOLS: List[ToolDefinition] = [
         description="Generate video from text prompt using AI",
         category="ai",
         server="video",
-        parameters={"prompt": "str", "negative": "str?", "model": "str?", "preset": "str?"},
+        parameters={
+            "prompt": "str",
+            "negative": "str?",
+            "model": "str?",
+            "preset": "str?",
+        },
         examples=["generate video", "create animation", "text to video", "AI video"],
     ),
     ToolDefinition(
@@ -682,7 +696,6 @@ TOOLS: List[ToolDefinition] = [
         parameters={},
         examples=["cancel video", "stop generation"],
     ),
-    
     # =========================================================================
     # CHAT SERVER - AI Orchestration
     # =========================================================================
@@ -699,7 +712,11 @@ TOOLS: List[ToolDefinition] = [
         description="Send message with intelligent AI orchestration",
         category="ai",
         server="chat",
-        parameters={"conversation_id": "str", "message": "str", "use_orchestration": "bool?"},
+        parameters={
+            "conversation_id": "str",
+            "message": "str",
+            "use_orchestration": "bool?",
+        },
         examples=["send message", "chat with AI"],
     ),
     ToolDefinition(
@@ -782,7 +799,7 @@ def export_manifest(filepath: str):
         "tool_count": len(TOOLS),
         "categories": get_categories(),
         "servers": get_servers(),
-        "tools": [t.to_dict() for t in TOOLS]
+        "tools": [t.to_dict() for t in TOOLS],
     }
     with open(filepath, "w") as f:
         json.dump(data, f, indent=2)
@@ -793,7 +810,7 @@ if __name__ == "__main__":
     print(f"Categories: {get_categories()}")
     print(f"Servers: {get_servers()}")
     print(f"Core tools: {len(get_core_tools())}")
-    
+
     print("\nSample embedding texts:")
     for tool in TOOLS[:3]:
         print(f"\n{tool.name}:")

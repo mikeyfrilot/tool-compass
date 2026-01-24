@@ -8,7 +8,7 @@ import sqlite3
 import numpy as np
 import logging
 from pathlib import Path
-from typing import Optional, List, Dict, Any, TYPE_CHECKING
+from typing import Optional, List, Dict, TYPE_CHECKING
 from dataclasses import dataclass
 
 if TYPE_CHECKING:
@@ -37,6 +37,7 @@ EMBEDDING_DIM = 768
 @dataclass
 class ToolChain:
     """A sequence of tools that form a workflow."""
+
     id: int
     name: str
     tools: List[str]  # ["bridge:read_file", "bridge:write_file"]
@@ -50,6 +51,7 @@ class ToolChain:
 @dataclass
 class ChainSearchResult:
     """Result from chain search."""
+
     chain: ToolChain
     score: float  # Similarity score 0-1
 
@@ -68,7 +70,7 @@ class ChainIndexer:
         self,
         embedder: "Embedder",
         analytics: Optional["CompassAnalytics"] = None,
-        top_chains_cache_size: int = 5
+        top_chains_cache_size: int = 5,
     ):
         self.embedder = embedder
         self.analytics = analytics
@@ -102,7 +104,7 @@ class ChainIndexer:
             f"Steps: {', '.join(tool_names)}",
             f"Description: {chain.description}",
             f"Tools: {', '.join(chain.tools)}",
-            f"Use cases: {' then '.join(tool_names)}"
+            f"Use cases: {' then '.join(tool_names)}",
         ]
 
         return " | ".join(parts)
@@ -126,7 +128,7 @@ class ChainIndexer:
                 description=row["description"] or "",
                 use_count=row["use_count"],
                 is_auto_detected=bool(row["is_auto_detected"]),
-                embedding_text=row["embedding_text"]
+                embedding_text=row["embedding_text"],
             )
             chains.append(chain)
 
@@ -153,7 +155,9 @@ class ChainIndexer:
         # Generate embeddings for chains without them
         for chain in chains:
             if chain.embedding is None:
-                embedding_text = chain.embedding_text or self.create_chain_embedding_text(chain)
+                embedding_text = (
+                    chain.embedding_text or self.create_chain_embedding_text(chain)
+                )
                 embedding = await self.embedder.embed(embedding_text)
                 chain.embedding = embedding
                 chain.embedding_text = embedding_text
@@ -163,7 +167,7 @@ class ChainIndexer:
         self.index.init_index(
             max_elements=max(len(chains) * 2, 100),
             M=CHAIN_HNSW_M,
-            ef_construction=CHAIN_HNSW_EF_CONSTRUCTION
+            ef_construction=CHAIN_HNSW_EF_CONSTRUCTION,
         )
         self.index.set_ef(CHAIN_HNSW_EF_SEARCH)
 
@@ -216,10 +220,7 @@ class ChainIndexer:
             return False
 
     async def search_chains(
-        self,
-        query: str,
-        top_k: int = 3,
-        min_confidence: float = 0.3
+        self, query: str, top_k: int = 3, min_confidence: float = 0.3
     ) -> List[ChainSearchResult]:
         """
         Search for relevant tool chains.
@@ -240,7 +241,9 @@ class ChainIndexer:
 
         # Search HNSW
         search_k = min(top_k * 2, self.index.get_current_count())
-        labels, distances = self.index.knn_query(query_embedding.reshape(1, -1), k=search_k)
+        labels, distances = self.index.knn_query(
+            query_embedding.reshape(1, -1), k=search_k
+        )
 
         # Convert to results
         results = []
@@ -253,10 +256,7 @@ class ChainIndexer:
 
             chain = self._id_to_chain.get(label)
             if chain:
-                results.append(ChainSearchResult(
-                    chain=chain,
-                    score=similarity
-                ))
+                results.append(ChainSearchResult(chain=chain, score=similarity))
 
         # Sort by score and limit
         results.sort(key=lambda x: x.score, reverse=True)
@@ -268,7 +268,7 @@ class ChainIndexer:
 
         # Sort by use count and take top N
         chains.sort(key=lambda c: c.use_count, reverse=True)
-        self._chain_cache = chains[:self.top_chains_cache_size]
+        self._chain_cache = chains[: self.top_chains_cache_size]
 
         logger.debug(f"Refreshed chain cache with {len(self._chain_cache)} chains")
 
@@ -277,7 +277,7 @@ class ChainIndexer:
         name: str,
         tools: List[str],
         description: Optional[str] = None,
-        is_auto_detected: bool = False
+        is_auto_detected: bool = False,
     ) -> ToolChain:
         """
         Add a new chain to the index.
@@ -305,14 +305,23 @@ class ChainIndexer:
         embedding = await self.embedder.embed(embedding_text)
 
         # Insert into DB
-        cursor = db.execute("""
+        cursor = db.execute(
+            """
             INSERT INTO tool_chains (chain_name, chain_tools, description, embedding_text, is_auto_detected)
             VALUES (?, ?, ?, ?, ?)
             ON CONFLICT(chain_name) DO UPDATE SET
                 chain_tools = excluded.chain_tools,
                 description = excluded.description,
                 embedding_text = excluded.embedding_text
-        """, (name, json.dumps(tools), description, embedding_text, 1 if is_auto_detected else 0))
+        """,
+            (
+                name,
+                json.dumps(tools),
+                description,
+                embedding_text,
+                1 if is_auto_detected else 0,
+            ),
+        )
 
         chain_id = cursor.lastrowid
         db.commit()
@@ -325,13 +334,15 @@ class ChainIndexer:
             use_count=0,
             is_auto_detected=is_auto_detected,
             embedding=embedding,
-            embedding_text=embedding_text
+            embedding_text=embedding_text,
         )
 
         # Add to index if it exists
         if self.index:
             self._id_to_chain[chain_id] = chain
-            self.index.add_items(embedding.reshape(1, -1).astype(np.float32), [chain_id])
+            self.index.add_items(
+                embedding.reshape(1, -1).astype(np.float32), [chain_id]
+            )
             self.index.save_index(str(CHAIN_INDEX_PATH))
 
         logger.info(f"Added chain: {name} with {len(tools)} tools")
@@ -340,11 +351,14 @@ class ChainIndexer:
     async def record_chain_use(self, chain_name: str):
         """Record that a chain was used (for ranking)."""
         db = self._get_db()
-        db.execute("""
+        db.execute(
+            """
             UPDATE tool_chains
             SET use_count = use_count + 1, last_used_at = CURRENT_TIMESTAMP
             WHERE chain_name = ?
-        """, (chain_name,))
+        """,
+            (chain_name,),
+        )
         db.commit()
 
         # Update cache if this chain is in it
@@ -362,11 +376,14 @@ class ChainIndexer:
 
         # Check DB
         db = self._get_db()
-        row = db.execute("""
+        row = db.execute(
+            """
             SELECT id, chain_name, chain_tools, description, use_count, is_auto_detected, embedding_text
             FROM tool_chains
             WHERE chain_name = ?
-        """, (chain_name,)).fetchone()
+        """,
+            (chain_name,),
+        ).fetchone()
 
         if row:
             return ToolChain(
@@ -376,7 +393,7 @@ class ChainIndexer:
                 description=row["description"] or "",
                 use_count=row["use_count"],
                 is_auto_detected=bool(row["is_auto_detected"]),
-                embedding_text=row["embedding_text"]
+                embedding_text=row["embedding_text"],
             )
 
         return None
@@ -387,28 +404,36 @@ class ChainIndexer:
             {
                 "name": "file_modify",
                 "tools": ["bridge:read_file", "bridge:write_file"],
-                "description": "Read a file, modify its contents, and write it back"
+                "description": "Read a file, modify its contents, and write it back",
             },
             {
                 "name": "git_commit",
                 "tools": ["bridge:git_status", "bridge:git_add", "bridge:git_commit"],
-                "description": "Check status, stage changes, and commit to git"
+                "description": "Check status, stage changes, and commit to git",
             },
             {
                 "name": "code_analysis",
                 "tools": ["doc:scan_codebase", "doc:generate_report"],
-                "description": "Analyze codebase and generate a health report"
+                "description": "Analyze codebase and generate a health report",
             },
             {
                 "name": "image_generation",
-                "tools": ["comfy:comfy_status", "comfy:comfy_generate", "comfy:comfy_history"],
-                "description": "Check ComfyUI status, generate an image, and view history"
+                "tools": [
+                    "comfy:comfy_status",
+                    "comfy:comfy_generate",
+                    "comfy:comfy_history",
+                ],
+                "description": "Check ComfyUI status, generate an image, and view history",
             },
             {
                 "name": "database_query",
-                "tools": ["bridge:db_list_tables", "bridge:db_inspect_table", "bridge:db_execute"],
-                "description": "List tables, inspect schema, and run queries"
-            }
+                "tools": [
+                    "bridge:db_list_tables",
+                    "bridge:db_inspect_table",
+                    "bridge:db_execute",
+                ],
+                "description": "List tables, inspect schema, and run queries",
+            },
         ]
 
         for chain_def in default_chains:
@@ -418,7 +443,7 @@ class ChainIndexer:
                     name=chain_def["name"],
                     tools=chain_def["tools"],
                     description=chain_def["description"],
-                    is_auto_detected=False
+                    is_auto_detected=False,
                 )
 
         logger.info(f"Seeded {len(default_chains)} default chains")
@@ -438,7 +463,9 @@ class ChainIndexer:
 _chain_indexer_instance: Optional[ChainIndexer] = None
 
 
-def get_chain_indexer(embedder: "Embedder", analytics: Optional["CompassAnalytics"] = None) -> ChainIndexer:
+def get_chain_indexer(
+    embedder: "Embedder", analytics: Optional["CompassAnalytics"] = None
+) -> ChainIndexer:
     """Get or create the chain indexer singleton."""
     global _chain_indexer_instance
     if _chain_indexer_instance is None:

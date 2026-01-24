@@ -8,6 +8,7 @@ import subprocess
 import sys
 import os
 
+
 def run(cmd, check=True):
     """Run a command and print output."""
     print(f"$ {cmd}")
@@ -20,19 +21,20 @@ def run(cmd, check=True):
         sys.exit(result.returncode)
     return result
 
+
 def main():
-    print("="*60)
+    print("=" * 60)
     print("TOOL COMPASS SETUP")
-    print("="*60)
-    
+    print("=" * 60)
+
     # Check Python version
     print(f"\n✓ Python {sys.version_info.major}.{sys.version_info.minor}")
-    
+
     # Install dependencies
     print("\n[1/4] Installing dependencies...")
     run("pip install hnswlib numpy httpx --break-system-packages -q")
     print("✓ Dependencies installed")
-    
+
     # Check Ollama
     print("\n[2/4] Checking Ollama...")
     result = run("curl -s http://localhost:11434/api/tags", check=False)
@@ -42,24 +44,24 @@ def main():
         print("  Then re-run this script")
         sys.exit(1)
     print("✓ Ollama ready with nomic-embed-text")
-    
+
     # Build index
     print("\n[3/4] Building Tool Compass index...")
     os.chdir(os.path.dirname(os.path.abspath(__file__)))
     run("python indexer.py")
     print("✓ Index built")
-    
+
     # Run tests
     print("\n[4/4] Running tests...")
     run("python gateway.py --test")
-    
-    print("\n" + "="*60)
+
+    print("\n" + "=" * 60)
     print("SETUP COMPLETE!")
-    print("="*60)
+    print("=" * 60)
     print("\nTo start the server:")
     print("  python gateway.py")
     print("\nTo use with Claude Desktop, add to config:")
-    print('''
+    print("""
 {
   "mcpServers": {
     "tool-compass": {
@@ -68,7 +70,8 @@ def main():
     }
   }
 }
-''')
+""")
+
 
 if __name__ == "__main__":
     main()

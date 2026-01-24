@@ -5,14 +5,8 @@ Tests backend change detection, hash computation, and sync operations.
 """
 
 import pytest
-import asyncio
-import json
-import hashlib
 from pathlib import Path
-from unittest.mock import Mock, AsyncMock, patch, MagicMock
-from datetime import datetime
-import tempfile
-import sqlite3
+from unittest.mock import Mock, AsyncMock, patch
 import sys
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -25,6 +19,7 @@ from backend_client import ToolInfo
 # =============================================================================
 # Fixtures
 # =============================================================================
+
 
 @pytest.fixture
 def temp_sync_db(tmp_path):
@@ -80,10 +75,13 @@ def sync_manager(mock_config, mock_index, mock_backends, temp_sync_db):
 # Initialization Tests
 # =============================================================================
 
+
 class TestSyncManagerInit:
     """Test SyncManager initialization."""
 
-    def test_init_with_dependencies(self, mock_config, mock_index, mock_backends, temp_sync_db):
+    def test_init_with_dependencies(
+        self, mock_config, mock_index, mock_backends, temp_sync_db
+    ):
         """Should initialize with all dependencies."""
         with patch("sync_manager.ANALYTICS_DB_PATH", temp_sync_db):
             manager = SyncManager(mock_config, mock_index, mock_backends)
@@ -96,14 +94,16 @@ class TestSyncManagerInit:
 
             manager.close()
 
-    def test_db_directory_created(self, mock_config, mock_index, mock_backends, tmp_path):
+    def test_db_directory_created(
+        self, mock_config, mock_index, mock_backends, tmp_path
+    ):
         """Should create db directory if not exists."""
         db_path = tmp_path / "subdir" / "test.db"
 
         with patch("sync_manager.ANALYTICS_DB_PATH", db_path):
             manager = SyncManager(mock_config, mock_index, mock_backends)
             # Access db to trigger creation
-            db = manager._get_db()
+            manager._get_db()
             assert db_path.parent.exists()
             manager.close()
 
@@ -111,6 +111,7 @@ class TestSyncManagerInit:
 # =============================================================================
 # Database Tests
 # =============================================================================
+
 
 class TestSyncManagerDatabase:
     """Test database operations."""
@@ -142,7 +143,13 @@ class TestSyncManagerDatabase:
         cursor = db.execute("PRAGMA table_info(backend_sync_state)")
         columns = {row[1] for row in cursor.fetchall()}
 
-        expected = {"backend_name", "tool_count", "tool_hash", "last_sync_at", "sync_status"}
+        expected = {
+            "backend_name",
+            "tool_count",
+            "tool_hash",
+            "last_sync_at",
+            "sync_status",
+        }
         assert expected.issubset(columns)
 
     def test_close_releases_connection(self, sync_manager):
@@ -158,6 +165,7 @@ class TestSyncManagerDatabase:
 # =============================================================================
 # Hash Computation Tests
 # =============================================================================
+
 
 class TestHashComputation:
     """Test tool hash computation."""
@@ -223,6 +231,7 @@ class TestHashComputation:
 # Stored Hash Tests
 # =============================================================================
 
+
 class TestStoredHash:
     """Test stored hash operations."""
 
@@ -238,10 +247,13 @@ class TestStoredHash:
         """Should return stored hash."""
         # Insert test data
         db = sync_manager._get_db()
-        db.execute("""
+        db.execute(
+            """
             INSERT INTO backend_sync_state (backend_name, tool_count, tool_hash, last_sync_at, sync_status)
             VALUES (?, ?, ?, CURRENT_TIMESTAMP, 'synced')
-        """, ("test_backend", 5, "abc123hash"))
+        """,
+            ("test_backend", 5, "abc123hash"),
+        )
         db.commit()
 
         result = await sync_manager.get_stored_hash("test_backend")
@@ -252,6 +264,7 @@ class TestStoredHash:
 # =============================================================================
 # Change Detection Tests
 # =============================================================================
+
 
 class TestChangeDetection:
     """Test backend change detection."""
@@ -280,9 +293,11 @@ class TestChangeDetection:
     async def test_check_backend_changes_first_sync(self, sync_manager):
         """Should detect changes on first sync (no stored hash)."""
         sync_manager.backends._backends = {"backend1": Mock(is_connected=True)}
-        sync_manager.backends.get_backend_tools = Mock(return_value=[
-            ToolInfo("tool1", "backend1:tool1", "Tool 1", "backend1", {}),
-        ])
+        sync_manager.backends.get_backend_tools = Mock(
+            return_value=[
+                ToolInfo("tool1", "backend1:tool1", "Tool 1", "backend1", {}),
+            ]
+        )
 
         result = await sync_manager.check_backend_changes("backend1")
 
@@ -296,10 +311,13 @@ class TestChangeDetection:
 
         # Store the hash
         db = sync_manager._get_db()
-        db.execute("""
+        db.execute(
+            """
             INSERT INTO backend_sync_state (backend_name, tool_count, tool_hash, last_sync_at, sync_status)
             VALUES (?, ?, ?, CURRENT_TIMESTAMP, 'synced')
-        """, ("backend1", 1, stored_hash))
+        """,
+            ("backend1", 1, stored_hash),
+        )
         db.commit()
 
         sync_manager.backends._backends = {"backend1": Mock(is_connected=True)}
@@ -320,10 +338,13 @@ class TestChangeDetection:
         stored_hash = sync_manager._compute_tool_hash(old_tools)
 
         db = sync_manager._get_db()
-        db.execute("""
+        db.execute(
+            """
             INSERT INTO backend_sync_state (backend_name, tool_count, tool_hash, last_sync_at, sync_status)
             VALUES (?, ?, ?, CURRENT_TIMESTAMP, 'synced')
-        """, ("backend1", 1, stored_hash))
+        """,
+            ("backend1", 1, stored_hash),
+        )
         db.commit()
 
         sync_manager.backends._backends = {"backend1": Mock(is_connected=True)}
@@ -337,6 +358,7 @@ class TestChangeDetection:
 # =============================================================================
 # Tool Categorization Tests
 # =============================================================================
+
 
 class TestToolCategorization:
     """Test automatic tool categorization."""
@@ -392,13 +414,16 @@ class TestToolCategorization:
 # Sync If Needed Tests
 # =============================================================================
 
+
 class TestSyncIfNeeded:
     """Test sync_if_needed method."""
 
     @pytest.mark.asyncio
     async def test_sync_if_needed_no_changes(self, sync_manager):
         """Should report unchanged when no changes detected."""
-        with patch.object(sync_manager, "check_backend_changes", new_callable=AsyncMock) as mock_check:
+        with patch.object(
+            sync_manager, "check_backend_changes", new_callable=AsyncMock
+        ) as mock_check:
             mock_check.return_value = False
 
             results = await sync_manager.sync_if_needed()
@@ -409,10 +434,17 @@ class TestSyncIfNeeded:
     @pytest.mark.asyncio
     async def test_sync_if_needed_with_changes(self, sync_manager):
         """Should sync changed backends."""
-        with patch.object(sync_manager, "check_backend_changes", new_callable=AsyncMock) as mock_check:
-            mock_check.side_effect = [True, False]  # backend1 changed, backend2 unchanged
+        with patch.object(
+            sync_manager, "check_backend_changes", new_callable=AsyncMock
+        ) as mock_check:
+            mock_check.side_effect = [
+                True,
+                False,
+            ]  # backend1 changed, backend2 unchanged
 
-            with patch.object(sync_manager, "_rebuild_for_backends", new_callable=AsyncMock) as mock_rebuild:
+            with patch.object(
+                sync_manager, "_rebuild_for_backends", new_callable=AsyncMock
+            ) as mock_rebuild:
                 results = await sync_manager.sync_if_needed()
 
                 mock_rebuild.assert_called_once_with(["backend1"])
@@ -422,7 +454,9 @@ class TestSyncIfNeeded:
     @pytest.mark.asyncio
     async def test_sync_if_needed_handles_errors(self, sync_manager):
         """Should report errors gracefully."""
-        with patch.object(sync_manager, "check_backend_changes", new_callable=AsyncMock) as mock_check:
+        with patch.object(
+            sync_manager, "check_backend_changes", new_callable=AsyncMock
+        ) as mock_check:
             mock_check.side_effect = Exception("Connection failed")
 
             results = await sync_manager.sync_if_needed()
@@ -434,6 +468,7 @@ class TestSyncIfNeeded:
 # =============================================================================
 # Full Sync Tests
 # =============================================================================
+
 
 class TestFullSync:
     """Test full_sync method."""
@@ -452,11 +487,18 @@ class TestFullSync:
     async def test_full_sync_with_tools(self, sync_manager):
         """Should sync all tools from connected backends."""
         sync_manager.backends.connect_all = AsyncMock(return_value={"backend1": True})
-        sync_manager.backends.get_backend_tools = Mock(return_value=[
-            ToolInfo("tool1", "backend1:tool1", "Tool 1", "backend1",
-                    {"type": "object", "properties": {"arg": {"type": "string"}}}),
-            ToolInfo("tool2", "backend1:tool2", "Tool 2", "backend1", {}),
-        ])
+        sync_manager.backends.get_backend_tools = Mock(
+            return_value=[
+                ToolInfo(
+                    "tool1",
+                    "backend1:tool1",
+                    "Tool 1",
+                    "backend1",
+                    {"type": "object", "properties": {"arg": {"type": "string"}}},
+                ),
+                ToolInfo("tool2", "backend1:tool2", "Tool 2", "backend1", {}),
+            ]
+        )
 
         result = await sync_manager.full_sync()
 
@@ -468,6 +510,7 @@ class TestFullSync:
 # =============================================================================
 # Sync Status Tests
 # =============================================================================
+
 
 class TestSyncStatus:
     """Test get_sync_status method."""
@@ -485,10 +528,13 @@ class TestSyncStatus:
     async def test_get_sync_status_with_data(self, sync_manager):
         """Should show sync status from database."""
         db = sync_manager._get_db()
-        db.execute("""
+        db.execute(
+            """
             INSERT INTO backend_sync_state (backend_name, tool_count, tool_hash, last_sync_at, sync_status)
             VALUES (?, ?, ?, CURRENT_TIMESTAMP, 'synced')
-        """, ("backend1", 5, "abc123def456"))
+        """,
+            ("backend1", 5, "abc123def456"),
+        )
         db.commit()
 
         result = await sync_manager.get_sync_status()
@@ -508,6 +554,7 @@ class TestSyncStatus:
 # =============================================================================
 # Background Polling Tests
 # =============================================================================
+
 
 class TestBackgroundPolling:
     """Test background polling functionality."""
@@ -556,12 +603,16 @@ class TestBackgroundPolling:
 # Singleton Tests
 # =============================================================================
 
+
 class TestSingleton:
     """Test singleton pattern."""
 
-    def test_get_sync_manager_creates_instance(self, mock_config, mock_index, mock_backends, temp_sync_db):
+    def test_get_sync_manager_creates_instance(
+        self, mock_config, mock_index, mock_backends, temp_sync_db
+    ):
         """Should create instance on first call."""
         import sync_manager as sm
+
         sm._sync_manager_instance = None
 
         with patch("sync_manager.ANALYTICS_DB_PATH", temp_sync_db):
@@ -572,9 +623,12 @@ class TestSingleton:
 
             manager.close()
 
-    def test_get_sync_manager_returns_same_instance(self, mock_config, mock_index, mock_backends, temp_sync_db):
+    def test_get_sync_manager_returns_same_instance(
+        self, mock_config, mock_index, mock_backends, temp_sync_db
+    ):
         """Should return same instance on subsequent calls."""
         import sync_manager as sm
+
         sm._sync_manager_instance = None
 
         with patch("sync_manager.ANALYTICS_DB_PATH", temp_sync_db):
@@ -590,6 +644,7 @@ class TestSingleton:
 # Additional Coverage Tests
 # =============================================================================
 
+
 class TestRebuildForBackends:
     """Test _rebuild_for_backends method."""
 
@@ -597,8 +652,13 @@ class TestRebuildForBackends:
     async def test_rebuild_with_tools(self, sync_manager):
         """Should rebuild index with tools from backends."""
         tools = [
-            ToolInfo("tool1", "backend1:tool1", "Tool 1", "backend1",
-                    {"type": "object", "properties": {"path": {"type": "string"}}}),
+            ToolInfo(
+                "tool1",
+                "backend1:tool1",
+                "Tool 1",
+                "backend1",
+                {"type": "object", "properties": {"path": {"type": "string"}}},
+            ),
             ToolInfo("tool2", "backend1:tool2", "Tool 2", "backend1", {}),
         ]
         sync_manager.backends._backends = {"backend1": Mock(is_connected=True)}
@@ -612,7 +672,9 @@ class TestRebuildForBackends:
 
         # Should have updated database
         db = sync_manager._get_db()
-        cursor = db.execute("SELECT * FROM backend_sync_state WHERE backend_name = ?", ("backend1",))
+        cursor = db.execute(
+            "SELECT * FROM backend_sync_state WHERE backend_name = ?", ("backend1",)
+        )
         row = cursor.fetchone()
         assert row is not None
         assert row[1] == 2  # tool_count
@@ -633,8 +695,16 @@ class TestRebuildForBackends:
     async def test_rebuild_with_list_param_type(self, sync_manager):
         """Should handle list parameter types (e.g., [string, null])."""
         tools = [
-            ToolInfo("tool1", "backend1:tool1", "Tool 1", "backend1",
-                    {"type": "object", "properties": {"optional_arg": {"type": ["string", "null"]}}}),
+            ToolInfo(
+                "tool1",
+                "backend1:tool1",
+                "Tool 1",
+                "backend1",
+                {
+                    "type": "object",
+                    "properties": {"optional_arg": {"type": ["string", "null"]}},
+                },
+            ),
         ]
         sync_manager.backends._backends = {"backend1": Mock(is_connected=True)}
         sync_manager.backends.get_backend_tools = Mock(return_value=tools)
@@ -666,10 +736,14 @@ class TestSyncIfNeededErrors:
     @pytest.mark.asyncio
     async def test_sync_if_needed_rebuild_error(self, sync_manager):
         """Should handle rebuild errors gracefully."""
-        with patch.object(sync_manager, "check_backend_changes", new_callable=AsyncMock) as mock_check:
+        with patch.object(
+            sync_manager, "check_backend_changes", new_callable=AsyncMock
+        ) as mock_check:
             mock_check.return_value = True  # Backend changed
 
-            with patch.object(sync_manager, "_rebuild_for_backends", new_callable=AsyncMock) as mock_rebuild:
+            with patch.object(
+                sync_manager, "_rebuild_for_backends", new_callable=AsyncMock
+            ) as mock_rebuild:
                 mock_rebuild.side_effect = Exception("Rebuild failed")
 
                 results = await sync_manager.sync_if_needed()
@@ -706,10 +780,13 @@ class TestGetSyncStatusAdditional:
     async def test_get_sync_status_multiple_backends(self, sync_manager):
         """Should return status for all backends."""
         db = sync_manager._get_db()
-        db.execute("""
+        db.execute(
+            """
             INSERT INTO backend_sync_state (backend_name, tool_count, tool_hash, last_sync_at, sync_status)
             VALUES (?, ?, ?, CURRENT_TIMESTAMP, 'synced')
-        """, ("backend1", 5, "hash1"))
+        """,
+            ("backend1", 5, "hash1"),
+        )
         db.commit()
 
         result = await sync_manager.get_sync_status()
@@ -747,13 +824,17 @@ class TestFullSyncEdgeCases:
     @pytest.mark.asyncio
     async def test_full_sync_partial_connection(self, sync_manager):
         """Should handle partial backend connections."""
-        sync_manager.backends.connect_all = AsyncMock(return_value={
-            "backend1": True,
-            "backend2": False  # Failed to connect
-        })
-        sync_manager.backends.get_backend_tools = Mock(return_value=[
-            ToolInfo("tool1", "backend1:tool1", "Tool 1", "backend1", {}),
-        ])
+        sync_manager.backends.connect_all = AsyncMock(
+            return_value={
+                "backend1": True,
+                "backend2": False,  # Failed to connect
+            }
+        )
+        sync_manager.backends.get_backend_tools = Mock(
+            return_value=[
+                ToolInfo("tool1", "backend1:tool1", "Tool 1", "backend1", {}),
+            ]
+        )
 
         result = await sync_manager.full_sync()
 
@@ -765,9 +846,11 @@ class TestFullSyncEdgeCases:
     async def test_full_sync_clears_old_data(self, sync_manager):
         """Should clear old index data before full sync."""
         sync_manager.backends.connect_all = AsyncMock(return_value={"backend1": True})
-        sync_manager.backends.get_backend_tools = Mock(return_value=[
-            ToolInfo("tool1", "backend1:tool1", "Tool 1", "backend1", {}),
-        ])
+        sync_manager.backends.get_backend_tools = Mock(
+            return_value=[
+                ToolInfo("tool1", "backend1:tool1", "Tool 1", "backend1", {}),
+            ]
+        )
 
         await sync_manager.full_sync()
 

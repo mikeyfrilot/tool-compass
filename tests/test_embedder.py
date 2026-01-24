@@ -8,18 +8,25 @@ import pytest
 import asyncio
 import numpy as np
 from pathlib import Path
-from unittest.mock import Mock, AsyncMock, patch, MagicMock
+from unittest.mock import Mock, AsyncMock, patch
 import httpx
 import sys
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from embedder import Embedder, SyncEmbedder, EMBEDDING_DIM, EMBEDDING_MODEL, OLLAMA_BASE_URL
+from embedder import (
+    Embedder,
+    SyncEmbedder,
+    EMBEDDING_DIM,
+    EMBEDDING_MODEL,
+    OLLAMA_BASE_URL,
+)
 
 
 # =============================================================================
 # Embedder Initialization Tests
 # =============================================================================
+
 
 class TestEmbedderInit:
     """Test Embedder initialization."""
@@ -49,6 +56,7 @@ class TestEmbedderInit:
 # =============================================================================
 # HTTP Client Tests
 # =============================================================================
+
 
 class TestHTTPClient:
     """Test HTTP client management."""
@@ -96,7 +104,7 @@ class TestHTTPClient:
         """Should close HTTP client."""
         embedder = Embedder()
 
-        client = await embedder._get_client()
+        await embedder._get_client()
         await embedder.close()
 
         assert embedder._client is None
@@ -105,6 +113,7 @@ class TestHTTPClient:
 # =============================================================================
 # Health Check Tests
 # =============================================================================
+
 
 class TestHealthCheck:
     """Test Ollama health check."""
@@ -139,9 +148,7 @@ class TestHealthCheck:
 
         mock_response = Mock()
         mock_response.status_code = 200
-        mock_response.json.return_value = {
-            "models": [{"name": "llama2"}]
-        }
+        mock_response.json.return_value = {"models": [{"name": "llama2"}]}
 
         with patch.object(embedder, "_get_client") as mock_get_client:
             mock_client = AsyncMock()
@@ -159,7 +166,9 @@ class TestHealthCheck:
 
         with patch.object(embedder, "_get_client") as mock_get_client:
             mock_client = AsyncMock()
-            mock_client.get = AsyncMock(side_effect=httpx.ConnectError("Connection refused"))
+            mock_client.get = AsyncMock(
+                side_effect=httpx.ConnectError("Connection refused")
+            )
             mock_get_client.return_value = mock_client
 
             result = await embedder.health_check()
@@ -187,6 +196,7 @@ class TestHealthCheck:
 # =============================================================================
 # Model Pull Tests
 # =============================================================================
+
 
 class TestPullModel:
     """Test model pulling."""
@@ -245,6 +255,7 @@ class TestPullModel:
 # Embed Tests
 # =============================================================================
 
+
 class TestEmbed:
     """Test single text embedding."""
 
@@ -281,7 +292,9 @@ class TestEmbed:
 
         mock_response = Mock()
         mock_response.status_code = 200
-        mock_response.json.return_value = {"embeddings": [np.random.randn(EMBEDDING_DIM).tolist()]}
+        mock_response.json.return_value = {
+            "embeddings": [np.random.randn(EMBEDDING_DIM).tolist()]
+        }
 
         with patch.object(embedder, "_get_client") as mock_get_client:
             mock_client = AsyncMock()
@@ -316,6 +329,7 @@ class TestEmbed:
 # Embed Query Tests
 # =============================================================================
 
+
 class TestEmbedQuery:
     """Test query embedding."""
 
@@ -347,7 +361,9 @@ class TestEmbedQuery:
 
         mock_response = Mock()
         mock_response.status_code = 200
-        mock_response.json.return_value = {"embeddings": [np.random.randn(EMBEDDING_DIM).tolist()]}
+        mock_response.json.return_value = {
+            "embeddings": [np.random.randn(EMBEDDING_DIM).tolist()]
+        }
 
         with patch.object(embedder, "_get_client") as mock_get_client:
             mock_client = AsyncMock()
@@ -363,6 +379,7 @@ class TestEmbedQuery:
 # =============================================================================
 # Embed Batch Tests
 # =============================================================================
+
 
 class TestEmbedBatch:
     """Test batch embedding."""
@@ -406,6 +423,7 @@ class TestEmbedBatch:
 
         async def mock_embed(text):
             import time
+
             call_times.append(time.time())
             await asyncio.sleep(0.01)  # Small delay
             return np.random.randn(EMBEDDING_DIM).astype(np.float32)
@@ -424,6 +442,7 @@ class TestEmbedBatch:
 # =============================================================================
 # Normalization Tests
 # =============================================================================
+
 
 class TestNormalization:
     """Test embedding normalization."""
@@ -478,6 +497,7 @@ class TestNormalization:
 # SyncEmbedder Tests
 # =============================================================================
 
+
 class TestSyncEmbedder:
     """Test synchronous embedder wrapper."""
 
@@ -492,7 +512,9 @@ class TestSyncEmbedder:
         """Should wrap async health_check."""
         embedder = SyncEmbedder()
 
-        with patch.object(embedder._async_embedder, "health_check", new_callable=AsyncMock) as mock_health:
+        with patch.object(
+            embedder._async_embedder, "health_check", new_callable=AsyncMock
+        ) as mock_health:
             mock_health.return_value = True
 
             result = embedder.health_check()
@@ -504,7 +526,9 @@ class TestSyncEmbedder:
         embedder = SyncEmbedder()
         expected = np.random.randn(EMBEDDING_DIM).astype(np.float32)
 
-        with patch.object(embedder._async_embedder, "embed", new_callable=AsyncMock) as mock_embed:
+        with patch.object(
+            embedder._async_embedder, "embed", new_callable=AsyncMock
+        ) as mock_embed:
             mock_embed.return_value = expected
 
             result = embedder.embed("test text")
@@ -516,7 +540,9 @@ class TestSyncEmbedder:
         embedder = SyncEmbedder()
         expected = np.random.randn(EMBEDDING_DIM).astype(np.float32)
 
-        with patch.object(embedder._async_embedder, "embed_query", new_callable=AsyncMock) as mock_embed:
+        with patch.object(
+            embedder._async_embedder, "embed_query", new_callable=AsyncMock
+        ) as mock_embed:
             mock_embed.return_value = expected
 
             result = embedder.embed_query("search query")
@@ -528,7 +554,9 @@ class TestSyncEmbedder:
         embedder = SyncEmbedder()
         expected = np.random.randn(3, EMBEDDING_DIM).astype(np.float32)
 
-        with patch.object(embedder._async_embedder, "embed_batch", new_callable=AsyncMock) as mock_embed:
+        with patch.object(
+            embedder._async_embedder, "embed_batch", new_callable=AsyncMock
+        ) as mock_embed:
             mock_embed.return_value = expected
 
             result = embedder.embed_batch(["a", "b", "c"])
@@ -539,7 +567,9 @@ class TestSyncEmbedder:
         """Should close async embedder and loop."""
         embedder = SyncEmbedder()
 
-        with patch.object(embedder._async_embedder, "close", new_callable=AsyncMock) as mock_close:
+        with patch.object(
+            embedder._async_embedder, "close", new_callable=AsyncMock
+        ) as mock_close:
             embedder.close()
 
             mock_close.assert_called_once()
@@ -548,6 +578,7 @@ class TestSyncEmbedder:
 # =============================================================================
 # Integration Tests (marked)
 # =============================================================================
+
 
 @pytest.mark.integration
 class TestEmbedderIntegration:
@@ -607,6 +638,7 @@ class TestEmbedderIntegration:
 # Edge Case Tests
 # =============================================================================
 
+
 class TestEdgeCases:
     """Test edge cases and error handling."""
 
@@ -617,7 +649,9 @@ class TestEdgeCases:
 
         mock_response = Mock()
         mock_response.status_code = 200
-        mock_response.json.return_value = {"embeddings": [np.random.randn(EMBEDDING_DIM).tolist()]}
+        mock_response.json.return_value = {
+            "embeddings": [np.random.randn(EMBEDDING_DIM).tolist()]
+        }
 
         with patch.object(embedder, "_get_client") as mock_get_client:
             mock_client = AsyncMock()
@@ -635,14 +669,18 @@ class TestEdgeCases:
 
         mock_response = Mock()
         mock_response.status_code = 200
-        mock_response.json.return_value = {"embeddings": [np.random.randn(EMBEDDING_DIM).tolist()]}
+        mock_response.json.return_value = {
+            "embeddings": [np.random.randn(EMBEDDING_DIM).tolist()]
+        }
 
         with patch.object(embedder, "_get_client") as mock_get_client:
             mock_client = AsyncMock()
             mock_client.post = AsyncMock(return_value=mock_response)
             mock_get_client.return_value = mock_client
 
-            result = await embedder.embed("Unicode: \u4e2d\u6587 \u65e5\u672c\u8a9e \ud83d\ude00")
+            result = await embedder.embed(
+                "Unicode: \u4e2d\u6587 \u65e5\u672c\u8a9e \ud83d\ude00"
+            )
 
             assert isinstance(result, np.ndarray)
 
@@ -655,7 +693,9 @@ class TestEdgeCases:
 
         mock_response = Mock()
         mock_response.status_code = 200
-        mock_response.json.return_value = {"embeddings": [np.random.randn(EMBEDDING_DIM).tolist()]}
+        mock_response.json.return_value = {
+            "embeddings": [np.random.randn(EMBEDDING_DIM).tolist()]
+        }
 
         with patch.object(embedder, "_get_client") as mock_get_client:
             mock_client = AsyncMock()
@@ -671,11 +711,13 @@ class TestEdgeCases:
         """Should handle special characters."""
         embedder = Embedder()
 
-        special_text = "Tab:\t Newline:\n Quote:\" Backslash:\\ Null:\x00"
+        special_text = 'Tab:\t Newline:\n Quote:" Backslash:\\ Null:\x00'
 
         mock_response = Mock()
         mock_response.status_code = 200
-        mock_response.json.return_value = {"embeddings": [np.random.randn(EMBEDDING_DIM).tolist()]}
+        mock_response.json.return_value = {
+            "embeddings": [np.random.randn(EMBEDDING_DIM).tolist()]
+        }
 
         with patch.object(embedder, "_get_client") as mock_get_client:
             mock_client = AsyncMock()
