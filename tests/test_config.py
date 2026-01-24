@@ -66,14 +66,14 @@ class TestPathResolution:
             assert path == config_file.resolve()
 
     def test_get_config_path_default(self):
-        """Default config path should be in tool_compass directory."""
+        """Default config path should be in tool_compass/tool-compass directory."""
         with patch.dict(os.environ, {}, clear=True):
             os.environ.pop("TOOL_COMPASS_CONFIG", None)
             path = get_config_path()
             assert path.name == "compass_config.json"
-            # Check that path is relative to config.py location (repo root)
-            # Works whether repo is named 'tool-compass' or 'tool_compass'
-            assert path.parent.exists() or "compass" in str(path).lower()
+            # Accept both tool_compass (local) and tool-compass (CI/GitHub)
+            path_str = str(path).lower()
+            assert "tool_compass" in path_str or "tool-compass" in path_str
 
 
 class TestCompassConfig:

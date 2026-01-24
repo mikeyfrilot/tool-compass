@@ -256,7 +256,10 @@ class ChainIndexer:
 
             chain = self._id_to_chain.get(label)
             if chain:
-                results.append(ChainSearchResult(chain=chain, score=similarity))
+                results.append(ChainSearchResult(
+                    chain=chain,
+                    score=float(similarity)  # Convert numpy float to Python float
+                ))
 
         # Sort by score and limit
         results.sort(key=lambda x: x.score, reverse=True)

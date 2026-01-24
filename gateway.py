@@ -32,7 +32,8 @@ except ImportError:
 from indexer import CompassIndex, SearchResult
 from tool_manifest import ToolDefinition
 from config import load_config, CompassConfig, CONFIG_PATH
-from backend_client import BackendManager
+# Use simple backend client to avoid anyio conflicts when nested inside another MCP server
+from backend_client_simple import SimpleBackendManager as BackendManager, ToolInfo
 from analytics import CompassAnalytics, get_analytics
 from sync_manager import SyncManager, get_sync_manager
 from chain_indexer import ChainIndexer, get_chain_indexer
@@ -322,15 +323,13 @@ async def compass(
                 intent, top_k=3, min_confidence=min_confidence
             )
             for cr in chain_results:
-                chain_matches.append(
-                    {
-                        "name": cr.chain.name,
-                        "tools": cr.chain.tools,
-                        "description": cr.chain.description,
-                        "confidence": round(cr.score, 3),
-                        "use_count": cr.chain.use_count,
-                    }
-                )
+                chain_matches.append({
+                    "name": cr.chain.name,
+                    "tools": cr.chain.tools,
+                    "description": cr.chain.description,
+                    "confidence": float(round(cr.score, 3)),
+                    "use_count": cr.chain.use_count,
+                })
 
     # Build response - progressive disclosure means we only return summaries
     matches = []
@@ -340,7 +339,7 @@ async def compass(
             "description": r.tool.description,
             "server": r.tool.server,
             "category": r.tool.category,
-            "confidence": round(r.score, 3),
+            "confidence": float(round(r.score, 3)),
         }
 
         # Only include full schema if progressive disclosure is disabled
@@ -918,24 +917,48 @@ async def compass_audit(
 
 async def sync_from_backends():
     """Sync tool definitions from live backend servers and rebuild index."""
-    print("Syncing tools from backend servers...")
+    import sys
 
+    print("\n" + "=" * 60)
+    print("  TOOL COMPASS - INDEX SYNC")
+    print("=" * 60)
+
+    # Step 1: Load config
+    print("\n[1/4] Loading configuration...", end=" ", flush=True)
     config = load_config()
+    print(f"OK ({len(config.backends)} backends configured)")
+
+    # Step 2: Connect to backends
+    print(f"\n[2/4] Connecting to backends...")
     manager = BackendManager(config)
 
-    # Connect to all backends
-    print(f"Connecting to {len(config.backends)} backends...")
     results = await manager.connect_all()
 
+    connected = 0
     for name, success in results.items():
-        status = "OK" if success else "FAILED"
-        print(f"  {name}: {status}")
+        if success:
+            print(f"      ✓ {name}")
+            connected += 1
+        else:
+            print(f"      ✗ {name} (FAILED)")
 
-    # Get all tools
+    if connected == 0:
+        print("\n❌ No backends connected. Check that servers are running.")
+        print("   Hint: Start MCP servers or check compass_config.json")
+        return
+
+    # Step 3: Discover tools
+    print(f"\n[3/4] Discovering tools...")
     tools = manager.get_all_tools()
-    print(f"\nDiscovered {len(tools)} tools from backends")
+    print(f"      Found {len(tools)} tools from {connected} backend(s)")
+
+    if not tools:
+        print("\n❌ No tools discovered. Backends may be misconfigured.")
+        await manager.disconnect_all()
+        return
 
     # Convert to ToolDefinition format for indexing
+    print("      Converting to index format...", end=" ", flush=True)
     tool_defs = []
     for tool in tools:
         # Parse server and name from qualified name
@@ -966,25 +989,38 @@ async def sync_from_backends():
             )
         )
 
-    # Build index
-    print("\nBuilding search index...")
+    print(f"OK ({len(tool_defs)} definitions)")
+
+    # Step 4: Build index
+    print(f"\n[4/4] Building HNSW search index...")
     index = CompassIndex()
 
+    # Check Ollama first
+    print("      Checking Ollama embeddings service...", end=" ", flush=True)
     if not await index.embedder.health_check():
-        print("ERROR: Ollama not available. Run: ollama pull nomic-embed-text")
+        print("FAILED")
+        print("\n❌ Ollama not available. Please start Ollama and pull the embedding model:")
+        print("   1. ollama serve")
+        print("   2. ollama pull nomic-embed-text")
         await manager.disconnect_all()
         return
+    print("OK")
 
+    print("      Generating embeddings and building index...")
     result = await index.build_index(tool_defs)
-    print(
-        f"Index built: {result['tools_indexed']} tools in {result['total_time']:.2f}s"
-    )
 
     # Cleanup
     await index.close()
     await manager.disconnect_all()
 
-    print("\nSync complete!")
+    # Summary
+    print("\n" + "-" * 60)
+    print("  SYNC COMPLETE")
+    print("-" * 60)
+    print(f"  Tools indexed: {result['tools_indexed']}")
+    print(f"  Build time: {result['total_time']:.2f}s")
+    print(f"  Index ready for queries")
+    print("-" * 60 + "\n")
 
 
 def categorize_tool(name: str, description: str) -> str:
@@ -1121,23 +1157,43 @@ async def async_main(args):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Tool Compass Gateway - MCP Proxy Server",
+        prog="gateway",
+        description="Tool Compass Gateway - Semantic MCP Proxy Server",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  python gateway.py              Start the gateway server
+  python gateway.py              Start the MCP gateway server (stdio mode)
   python gateway.py --sync       Sync tools from backends and rebuild index
-  python gateway.py --test       Run test queries
+  python gateway.py --test       Run test queries against the index
   python gateway.py --config     Show current configuration
-        """,
+
+Prerequisites:
+  - Ollama must be running: ollama serve
+  - Embedding model required: ollama pull nomic-embed-text
+
+Workflow:
+  1. First run --sync to build the tool index from backend servers
+  2. Then start the gateway for MCP clients to connect
+  3. Use compass() -> describe() -> execute() pattern
+
+For more info, see: https://github.com/your-repo/tool-compass
+        """
     )
-    parser.add_argument(
-        "--sync", action="store_true", help="Sync tools from backend servers"
-    )
-    parser.add_argument("--test", action="store_true", help="Run test queries")
-    parser.add_argument("--config", action="store_true", help="Show configuration")
+    parser.add_argument("--sync", action="store_true",
+                        help="Sync tools from backend MCP servers and rebuild the HNSW index")
+    parser.add_argument("--test", action="store_true",
+                        help="Run semantic search tests to verify index quality")
+    parser.add_argument("--config", action="store_true",
+                        help="Display current configuration including backends and settings")
+    parser.add_argument("--verbose", "-v", action="store_true",
+                        help="Enable verbose output with detailed progress")
 
     args = parser.parse_args()
+
+    # Set verbose logging if requested
+    if args.verbose:
+        logging.getLogger().setLevel(logging.DEBUG)
+        logger.debug("Verbose mode enabled")
 
     if args.config:
         show_config()

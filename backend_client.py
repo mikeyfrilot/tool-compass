@@ -18,8 +18,9 @@ from config import CompassConfig, StdioBackend, load_config
 logger = logging.getLogger(__name__)
 
 # Timeout constants (in seconds)
-CONNECTION_TIMEOUT = 30  # Max time to establish backend connection
-TOOL_CALL_TIMEOUT = 60  # Max time for a single tool execution
+# NOTE: Claude Code's MCP timeout is ~30s, so we need faster connections
+CONNECTION_TIMEOUT = 15  # Max time to establish backend connection
+TOOL_CALL_TIMEOUT = 20   # Max time for a single tool execution
 
 
 @dataclass
