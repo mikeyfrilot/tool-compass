@@ -630,14 +630,20 @@ class TestCompassAuditTool:
         gateway._config = test_config_with_backends
         gateway._analytics = test_analytics
         gateway._backend_manager = Mock()
-        gateway._backend_manager.get_stats = Mock(
-            return_value={
-                "configured_backends": [],
-                "connected_backends": [],
-                "total_tools": 0,
-                "tools_by_backend": {},
-            }
-        )
+        gateway._backend_manager.get_stats = Mock(return_value={
+            "configured_backends": [],
+            "connected_backends": [],
+            "total_tools": 0,
+            "tools_by_backend": {}
+        })
+        # Mock chain indexer to avoid DB path issues in CI
+        mock_chain_indexer = Mock()
+        mock_chain_indexer._chain_cache = {}
+        mock_chain_indexer.load_chains_from_db = AsyncMock(return_value=[])
+        gateway._chain_indexer = mock_chain_indexer
+        # Mock sync manager to avoid DB issues
+        gateway._sync_manager = Mock()
+        gateway._sync_manager.get_sync_status = AsyncMock(return_value={})
 
         # Record some data
         await test_analytics.record_search("query", [], 5.0)
