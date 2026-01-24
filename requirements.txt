@@ -10,6 +10,6 @@ httpx>=0.27.0,<1.0.0
 mcp>=1.0.0,<2.0.0
 
 # Web UI (5.x fixes CVE-2024-47872, CVE-2024-8021, and others)
-gradio>=5.0.0,<6.0.0
+gradio>=5.0.0,<7.0.0
 
 # Database (sqlite3 is built-in)
