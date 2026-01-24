@@ -644,7 +644,11 @@ class TestCompassAuditTool:
 
         from gateway import compass_audit
 
-        result = await compass_audit(timeframe="1h")
+        # Patch get_analytics_instance and get_chain_indexer_instance to avoid
+        # issues with singletons creating new instances with default paths
+        with patch.object(gateway, "get_analytics_instance", AsyncMock(return_value=test_analytics)):
+            with patch.object(gateway, "get_chain_indexer_instance", AsyncMock(return_value=None)):
+                result = await compass_audit(timeframe="1h")
 
         assert "hot_cache" in result
         assert "analytics" in result
