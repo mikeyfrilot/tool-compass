@@ -8,9 +8,6 @@ Based on FastMCP testing patterns: https://gofastmcp.com/patterns/testing
 import pytest
 from pathlib import Path
 from unittest.mock import Mock, AsyncMock, patch
-import sys
-
-sys.path.insert(0, str(Path(__file__).parent.parent))
 
 
 class TestCompassTool:

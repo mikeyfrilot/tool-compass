@@ -7,9 +7,6 @@ Tests backend change detection, hash computation, and sync operations.
 import pytest
 from pathlib import Path
 from unittest.mock import Mock, AsyncMock, patch
-import sys
-
-sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from sync_manager import SyncManager, get_sync_manager
 from config import CompassConfig, StdioBackend

@@ -4,12 +4,12 @@
 
 **Semantic navigator for MCP tools - Find the right tool by intent, not memory**
 
-[![Tests](https://github.com/mikeyfrilot/tool-compass/actions/workflows/test.yml/badge.svg)](https://github.com/mikeyfrilot/tool-compass/actions/workflows/test.yml)
-[![codecov](https://codecov.io/gh/mikeyfrilot/tool-compass/graph/badge.svg)](https://codecov.io/gh/mikeyfrilot/tool-compass)
+[![Tests](https://github.com/mcp-tool-shop/tool-compass/actions/workflows/test.yml/badge.svg)](https://github.com/mcp-tool-shop/tool-compass/actions/workflows/test.yml)
+[![codecov](https://codecov.io/gh/mcp-tool-shop/tool-compass/graph/badge.svg)](https://codecov.io/gh/mcp-tool-shop/tool-compass)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg?logo=python&logoColor=white)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Docker](https://img.shields.io/badge/docker-ready-blue.svg?logo=docker&logoColor=white)](https://www.docker.com/)
-[![GitHub stars](https://img.shields.io/github/stars/mikeyfrilot/tool-compass?style=social)](https://github.com/mikeyfrilot/tool-compass)
+[![GitHub stars](https://img.shields.io/github/stars/mcp-tool-shop/tool-compass?style=social)](https://github.com/mcp-tool-shop/tool-compass)
 
 *95% fewer tokens. Find tools by describing what you want to do.*
 
@@ -51,7 +51,7 @@ Tool Compass uses **semantic search** to find relevant tools from a natural lang
 ollama pull nomic-embed-text
 
 # Clone and setup
-git clone https://github.com/mikeyfrilot/tool-compass.git
+git clone https://github.com/mcp-tool-shop/tool-compass.git
 cd tool-compass/tool_compass
 
 # Create virtual environment
@@ -75,7 +75,7 @@ python ui.py
 
 ```bash
 # Clone the repo
-git clone https://github.com/mikeyfrilot/tool-compass.git
+git clone https://github.com/mcp-tool-shop/tool-compass.git
 cd tool-compass/tool_compass
 
 # Start with Docker Compose (requires Ollama running locally)
@@ -162,15 +162,53 @@ Returns:
 | `compass_sync(force)` | Rebuild index from backends |
 | `compass_audit()` | Full system report |
 
+### Progressive Disclosure Pattern
+
+Tool Compass uses a three-step progressive disclosure pattern to minimize token usage:
+
+```
+1. compass("your intent")     → Get tool name + short description (~100 tokens)
+2. describe("tool:name")      → Get full parameter schema (~500 tokens)
+3. execute("tool:name", args) → Run the tool
+```
+
+**Why this matters:**
+- Loading 77 tools upfront = ~38,500 tokens
+- Progressive disclosure = ~600 tokens per tool used
+- Savings: **95%+ for typical workflows**
+
+**Example workflow:**
+
+```python
+# Step 1: Find the right tool
+compass("generate an image from text")
+# Returns: comfy:comfy_generate (confidence: 0.91)
+
+# Step 2: Get the schema (only if needed)
+describe("comfy:comfy_generate")
+# Returns: Full parameter definitions, types, examples
+
+# Step 3: Execute
+execute("comfy:comfy_generate", {"prompt": "a sunset over mountains"})
+```
+
+The `hint` field in compass results guides this flow, suggesting when to use `describe()`.
+
 ## Configuration
 
 | Variable | Description | Default |
 |----------|-------------|---------|
 | `TOOL_COMPASS_BASE_PATH` | Project root | Auto-detected |
 | `TOOL_COMPASS_PYTHON` | Python executable | Auto-detected |
-| `TOOL_COMPASS_CONFIG` | Config file path | `./compass_config.json` |
+| `TOOL_COMPASS_CONFIG` | Config file path | `~/.config/tool-compass/compass_config.json` |
+| `TOOL_COMPASS_DATA_DIR` | Data directory | Platform-specific (see below) |
 | `OLLAMA_URL` | Ollama server URL | `http://localhost:11434` |
 | `COMFYUI_URL` | ComfyUI server | `http://localhost:8188` |
+
+**Default data directories:**
+- **Windows:** `%LOCALAPPDATA%\tool-compass\`
+- **macOS:** `~/Library/Application Support/tool-compass/`
+- **Linux:** `~/.config/tool-compass/` (or `$XDG_CONFIG_HOME/tool-compass/`)
 
 See [`.env.example`](.env.example) for all options.
 
@@ -265,6 +303,6 @@ For security vulnerabilities, please see [SECURITY.md](SECURITY.md). **Do not op
 
 Tool Compass reduces entropy in the MCP ecosystem by organizing tools by semantic meaning.
 
-**[Documentation](https://github.com/mikeyfrilot/tool-compass#readme)** • **[Issues](https://github.com/mikeyfrilot/tool-compass/issues)** • **[Discussions](https://github.com/mikeyfrilot/tool-compass/discussions)**
+**[Documentation](https://github.com/mcp-tool-shop/tool-compass#readme)** • **[Issues](https://github.com/mcp-tool-shop/tool-compass/issues)** • **[Discussions](https://github.com/mcp-tool-shop/tool-compass/discussions)**
 
 </div>

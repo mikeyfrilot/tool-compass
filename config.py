@@ -5,8 +5,14 @@ Defines how backends are configured and connected.
 Environment Variables:
     TOOL_COMPASS_BASE_PATH: Base path for the project (default: parent of tool_compass)
     TOOL_COMPASS_PYTHON: Path to Python executable (default: auto-detect from venv)
-    TOOL_COMPASS_CONFIG: Path to config file (default: ./compass_config.json)
+    TOOL_COMPASS_CONFIG: Path to config file (default: <user_config_dir>/compass_config.json)
+    TOOL_COMPASS_DATA_DIR: Override user data directory (default: platform-specific)
     OLLAMA_URL: Ollama server URL (default: http://localhost:11434)
+
+Default config directories by platform:
+    Windows: %LOCALAPPDATA%/tool-compass/
+    macOS: ~/Library/Application Support/tool-compass/
+    Linux: ~/.config/tool-compass/ (or $XDG_CONFIG_HOME/tool-compass/)
 """
 
 from dataclasses import dataclass, field
@@ -279,7 +285,27 @@ def get_python_executable() -> str:
 
 def get_default_config() -> CompassConfig:
     """
-    Get default config for the MCP tool shop setup.
+    Get default config with no backends configured.
+
+    Users should create a compass_config.json with their own backend configurations.
+    See get_example_config() for an example configuration.
+
+    Uses environment variables for Ollama URL and other settings.
+    """
+    return CompassConfig(
+        backends={},  # No backends by default - user must configure
+        ollama_url=os.environ.get("OLLAMA_URL", "http://localhost:11434"),
+        auto_sync=True,
+        progressive_disclosure=True,
+    )
+
+
+def get_example_config() -> CompassConfig:
+    """
+    Get example config demonstrating backend configuration patterns.
+
+    This is for documentation purposes - actual paths will vary by installation.
+    Copy compass_config.example.json to compass_config.json and customize.
 
     Uses environment variables and auto-detection for cross-platform support.
     Set TOOL_COMPASS_BASE_PATH to override the project root.
@@ -332,18 +358,50 @@ def get_default_config() -> CompassConfig:
     )
 
 
+def get_user_config_dir() -> Path:
+    """
+    Get the user-writable config directory for Tool Compass.
+
+    Resolution order:
+    1. TOOL_COMPASS_DATA_DIR environment variable
+    2. Platform-specific user config directory:
+       - Windows: %LOCALAPPDATA%/tool-compass
+       - macOS: ~/Library/Application Support/tool-compass
+       - Linux: ~/.config/tool-compass (or $XDG_CONFIG_HOME/tool-compass)
+    """
+    env_dir = os.environ.get("TOOL_COMPASS_DATA_DIR")
+    if env_dir:
+        return Path(env_dir).resolve()
+
+    if sys.platform == "win32":
+        # Windows: use LOCALAPPDATA
+        local_app_data = os.environ.get("LOCALAPPDATA")
+        if local_app_data:
+            return Path(local_app_data) / "tool-compass"
+        return Path.home() / "AppData" / "Local" / "tool-compass"
+    elif sys.platform == "darwin":
+        # macOS: use Application Support
+        return Path.home() / "Library" / "Application Support" / "tool-compass"
+    else:
+        # Linux/Unix: use XDG_CONFIG_HOME or ~/.config
+        xdg_config = os.environ.get("XDG_CONFIG_HOME")
+        if xdg_config:
+            return Path(xdg_config) / "tool-compass"
+        return Path.home() / ".config" / "tool-compass"
+
+
 def get_config_path() -> Path:
     """
     Get the config file path.
 
     Resolution order:
     1. TOOL_COMPASS_CONFIG environment variable
-    2. ./compass_config.json in tool_compass directory
+    2. User config directory: <user_config_dir>/compass_config.json
     """
     env_config = os.environ.get("TOOL_COMPASS_CONFIG")
     if env_config:
         return Path(env_config).resolve()
-    return Path(__file__).parent / "compass_config.json"
+    return get_user_config_dir() / "compass_config.json"
 
 
 # Default config file location (for backward compatibility)

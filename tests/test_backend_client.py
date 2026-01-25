@@ -8,9 +8,6 @@ import pytest
 import asyncio
 from pathlib import Path
 from unittest.mock import Mock, AsyncMock, patch
-import sys
-
-sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from backend_client import (
     BackendConnection,

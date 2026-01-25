@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
 """
-Tool Compass - Setup Script
+Tool Compass - Bootstrap Script
 Run this to install dependencies and build the index.
+
+Usage:
+    python bootstrap.py
 """
 
 import subprocess

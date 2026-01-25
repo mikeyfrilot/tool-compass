@@ -102,6 +102,7 @@ exclude = [
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+pythonpath = ["."]  # Allow imports without sys.path.insert
 python_files = ["test_*.py"]
 python_functions = ["test_*"]
 addopts = "-v --tb=short"
@@ -114,7 +115,7 @@ markers = [
 source = ["."]
 omit = [
     "tests/*",
-    "setup.py",
+    "bootstrap.py",
     "archive/*",
 ]
 

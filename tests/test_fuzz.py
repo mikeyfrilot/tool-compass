@@ -9,11 +9,7 @@ from hypothesis import given, settings, assume, HealthCheck
 from hypothesis import strategies as st
 from unittest.mock import patch
 import json
-import sys
 from pathlib import Path
-
-# Add parent to path
-sys.path.insert(0, str(Path(__file__).parent.parent))
 
 
 # =============================================================================

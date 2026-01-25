@@ -10,9 +10,6 @@ import numpy as np
 from pathlib import Path
 from unittest.mock import Mock, AsyncMock, patch
 import httpx
-import sys
-
-sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from embedder import (
     Embedder,

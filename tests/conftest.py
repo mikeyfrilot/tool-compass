@@ -4,17 +4,15 @@ Tool Compass - Pytest Fixtures and Configuration
 Provides shared fixtures for testing the semantic search gateway.
 Based on FastMCP testing best practices:
 https://gofastmcp.com/patterns/testing
+
+Note: pythonpath is configured in pyproject.toml to allow direct imports.
 """
 
 import asyncio
 import pytest
-import sys
 from pathlib import Path
 from unittest.mock import Mock, AsyncMock, patch
 import numpy as np
-
-# Add parent directory to path for imports
-sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from config import CompassConfig, StdioBackend
 from tool_manifest import ToolDefinition
