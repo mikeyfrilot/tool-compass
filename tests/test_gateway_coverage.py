@@ -449,6 +449,58 @@ class TestCompassFallback:
             result = await compass(intent="read_file", min_confidence=0.9, top_k=3)
             assert result["matches"] == []
 
+    @pytest.mark.asyncio
+    async def test_compass_empty_matches_zero_confidence_chain_no_indexerror(
+        self, test_index, test_config_with_backends
+    ):
+        """GW-COMPOSED-001: matches==[] plus a single chain match scoring 0.0
+        (min_confidence=0.0) must NOT raise IndexError in the hint builder — it
+        must return a structured dict with a chains-only hint."""
+        import gateway
+        from chain_indexer import ToolChain, ChainSearchResult
+
+        # index.search returns nothing -> matches == [].
+        async def empty_search(*args, **kwargs):
+            return []
+
+        # A single chain match at score 0.0 — the exact confidence that made
+        # `0.0 > 0` False and fell through to `matches[0]` -> IndexError.
+        zero_chain = ToolChain(
+            id=1,
+            name="edge_case_chain",
+            tools=["test:read_file", "test:write_file"],
+            description="Zero-confidence workflow",
+            use_count=0,
+            is_auto_detected=False,
+        )
+        mock_chain = Mock()
+        mock_chain.search_chains = AsyncMock(
+            return_value=[ChainSearchResult(chain=zero_chain, score=0.0)]
+        )
+
+        with patch.object(test_index, "search", side_effect=empty_search):
+            gateway._compass_index = test_index
+            gateway._config = test_config_with_backends
+            gateway._chain_indexer = mock_chain
+            gateway._startup_sync_done = True
+            gateway._analytics = None
+
+            from gateway import compass
+
+            # Must not raise; must return a structured payload (BE-B-004).
+            result = await compass(
+                intent="zzzzzz_no_match",
+                min_confidence=0.0,
+                top_k=3,
+                include_chains=True,
+            )
+
+        assert isinstance(result, dict)
+        assert result["matches"] == []
+        # The chains-only hint names the chain rather than indexing matches[0].
+        assert "edge_case_chain" in result["hint"]
+        assert result.get("chains")
+
 
 # =============================================================================
 # describe() — sqlite error path + nearest_tools envelope
@@ -1270,6 +1322,125 @@ class TestCompassChainsErrors:
         # The extra **valid_actions kwarg flows through.
         assert env["valid_actions"] == ["list", "create", "detect"]
 
+    @pytest.mark.asyncio
+    async def test_chains_create_embedder_failure_envelope(
+        self, test_config_with_backends
+    ):
+        """GW-COMPOSED-002: add_chain() raising (Ollama down) must NOT leak a
+        raw exception — compass_chains(create) returns a structured
+        ollama_unavailable / service_unavailable envelope."""
+        import gateway
+
+        gateway._config = test_config_with_backends
+
+        # A chain indexer whose add_chain raises the real breaker-open error.
+        mock_chain = Mock()
+        mock_chain.add_chain = AsyncMock(
+            side_effect=RuntimeError("Ollama circuit breaker open")
+        )
+
+        with patch(
+            "gateway.get_chain_indexer_instance",
+            AsyncMock(return_value=mock_chain),
+        ):
+            from gateway import compass_chains
+
+            # Must not raise.
+            result = await compass_chains(
+                action="create",
+                chain_name="my_workflow",
+                tools=["a:one", "b:two"],
+            )
+
+        env = result["error_envelope"]
+        assert env["code"] == "ollama_unavailable"
+        assert env["category"] == "service_unavailable"
+        assert env["retryable"] is True
+
+    @pytest.mark.asyncio
+    async def test_chains_detect_embedder_failure_envelope(
+        self, test_config_with_backends
+    ):
+        """GW-COMPOSED-002: detect_chains() / add_chain() raising must NOT leak
+        a raw exception — compass_chains(detect) returns a structured
+        service_unavailable envelope."""
+        import gateway
+
+        gateway._config = test_config_with_backends
+
+        mock_chain = Mock()
+        mock_chain.add_chain = AsyncMock()
+        gateway._chain_indexer = mock_chain
+
+        mock_analytics = Mock()
+        mock_analytics.detect_chains = AsyncMock(
+            side_effect=RuntimeError("Ollama circuit breaker open")
+        )
+
+        with patch(
+            "gateway.get_chain_indexer_instance",
+            AsyncMock(return_value=mock_chain),
+        ), patch(
+            "gateway.get_analytics_instance",
+            AsyncMock(return_value=mock_analytics),
+        ):
+            from gateway import compass_chains
+
+            # Must not raise.
+            result = await compass_chains(action="detect")
+
+        env = result["error_envelope"]
+        assert env["code"] == "ollama_unavailable"
+        assert env["category"] == "service_unavailable"
+        assert env["retryable"] is True
+
+    @pytest.mark.asyncio
+    async def test_chains_detect_indexes_into_hnsw(
+        self, test_config_with_backends
+    ):
+        """IDX-COMPOSED-003: detected chains must be added into the live chain
+        HNSW index (via chain_indexer.add_chain), not merely raw-INSERTed into
+        the DB. Assert add_chain is invoked for each detected chain."""
+        import gateway
+
+        gateway._config = test_config_with_backends
+
+        detected_chain = {
+            "name": "read_to_write",
+            "tools": ["test:read_file", "test:write_file"],
+            "description": "Workflow: read file → write file",
+            "occurrences": 5,
+        }
+
+        mock_chain = Mock()
+        mock_chain.add_chain = AsyncMock()
+        gateway._chain_indexer = mock_chain
+
+        mock_analytics = Mock()
+        mock_analytics.detect_chains = AsyncMock(return_value=[detected_chain])
+
+        with patch(
+            "gateway.get_chain_indexer_instance",
+            AsyncMock(return_value=mock_chain),
+        ), patch(
+            "gateway.get_analytics_instance",
+            AsyncMock(return_value=mock_analytics),
+        ):
+            from gateway import compass_chains
+
+            result = await compass_chains(action="detect")
+
+        # The detected chain was pushed into the live HNSW index.
+        mock_chain.add_chain.assert_awaited_once()
+        _, kwargs = mock_chain.add_chain.call_args
+        assert kwargs["name"] == "read_to_write"
+        assert kwargs["tools"] == ["test:read_file", "test:write_file"]
+        assert kwargs["is_auto_detected"] is True
+        # And the response reflects what actually happened.
+        assert result["count"] == 1
+        assert result["indexed"] == 1
+        assert "indexed and searchable" in result["hint"]
+
 
 # =============================================================================
 # compass_sync() — error envelopes
@@ -1643,7 +1814,15 @@ class TestMainEntrypoint:
         from gateway import main
 
         monkeypatch.setattr("sys.argv", ["gateway.py", "--sync"])
-        with patch("gateway.asyncio.run") as mock_run:
+
+        # TST-RA-001: consume the async_main coroutine so it doesn't leak a
+        # "coroutine was never awaited" RuntimeWarning — mirror the fake_run
+        # pattern used in test_main_exits_1_on_failed_sync below.
+        def fake_run(coro):
+            coro.close()
+            return True  # truthy -> main() does not sys.exit(1) on this path
+
+        with patch("gateway.asyncio.run", side_effect=fake_run) as mock_run:
             main()
             mock_run.assert_called_once()
 
@@ -1652,7 +1831,14 @@ class TestMainEntrypoint:
         from gateway import main
 
         monkeypatch.setattr("sys.argv", ["gateway.py", "--test"])
-        with patch("gateway.asyncio.run") as mock_run:
+
+        # TST-RA-001: consume the async_main coroutine to avoid the
+        # "coroutine was never awaited" RuntimeWarning.
+        def fake_run(coro):
+            coro.close()
+            return True  # truthy -> main() does not sys.exit(1) on this path
+
+        with patch("gateway.asyncio.run", side_effect=fake_run) as mock_run:
             main()
             mock_run.assert_called_once()
 

@@ -950,6 +950,15 @@ async def compass(
         # Chain is the best match
         chain_name = chain_matches[0]["name"]
         hint = f"Found workflow '{chain_name}' ({chain_matches[0]['confidence']:.0%}). Tools: {' → '.join(chain_matches[0]['tools'])}"
+    elif not matches:
+        # GW-COMPOSED-001: matches is empty but chains exist and none of them
+        # scored above the (0) tool threshold — e.g. a single chain matched at
+        # 0.000 with min_confidence=0.0. The prior chain of elifs fell through
+        # to the final `else`, which indexed matches[0] and raised IndexError
+        # (violating BE-B-004: handlers return a structured payload, never
+        # raise). Produce a chains-only hint instead of touching matches[0].
+        chain_name = chain_matches[0]["name"]
+        hint = f"Found workflow '{chain_name}' ({chain_matches[0]['confidence']:.0%}). Tools: {' → '.join(chain_matches[0]['tools'])}"
     elif len(matches) == 1:
         tool_name = matches[0]["tool"]
         if config.progressive_disclosure:
@@ -1538,12 +1547,33 @@ async def compass_chains(
                 ],
             ))
 
-        chain = await chain_indexer.add_chain(
-            name=chain_name,
-            tools=tools,
-            description=description,
-            is_auto_detected=False,
-        )
+        # GW-COMPOSED-002: add_chain() calls embedder.embed(), which raises
+        # when Ollama is unreachable (breaker open -> RuntimeError; connect/
+        # timeout -> httpx.TransportError/TimeoutException). Mirror the rest of
+        # the surface (compass/execute) and return a structured
+        # service_unavailable envelope instead of leaking a raw exception.
+        try:
+            chain = await chain_indexer.add_chain(
+                name=chain_name,
+                tools=tools,
+                description=description,
+                is_auto_detected=False,
+            )
+        except Exception as e:
+            _mark_ollama_down(e)
+            logger.warning(
+                f"[compass_chains] [{trace_id}] create failed "
+                f"({type(e).__name__}: {e}); embedding service unavailable"
+            )
+            return _augment_with_health(_error_envelope(
+                code="ollama_unavailable",
+                title="Embedding service unavailable",
+                detail=f"Could not embed chain '{chain_name}': {e}",
+                category="service_unavailable",
+                retryable=True,
+                trace_id=trace_id,
+                suggestions=["Start Ollama: ollama serve", "Retry once Ollama is reachable."],
+            ))
 
         return _augment_with_health({
             "created": {
@@ -1557,11 +1587,51 @@ async def compass_chains(
     elif action == "detect":
         analytics = await get_analytics_instance()
         if analytics:
-            detected = await analytics.detect_chains()
+            # GW-COMPOSED-002 + IDX-COMPOSED-003: detect_chains() raw-INSERTs
+            # promoted chains into tool_chains but does NOT embed them into the
+            # chain HNSW index, so they were unsearchable until process restart
+            # even though the hint claimed "indexed and searchable". Add each
+            # detected chain into the live index via chain_indexer.add_chain()
+            # (embeds + dual-writes DB+HNSW). Both the detect call and the
+            # per-chain embedding can fail when Ollama is down, so guard the
+            # whole block and degrade into the same envelope as create.
+            try:
+                detected = await analytics.detect_chains()
+                indexed = 0
+                for c in detected:
+                    await chain_indexer.add_chain(
+                        name=c["name"],
+                        tools=c["tools"],
+                        description=c.get("description"),
+                        is_auto_detected=True,
+                    )
+                    indexed += 1
+            except Exception as e:
+                _mark_ollama_down(e)
+                logger.warning(
+                    f"[compass_chains] [{trace_id}] detect failed "
+                    f"({type(e).__name__}: {e}); embedding service unavailable"
+                )
+                return _augment_with_health(_error_envelope(
+                    code="ollama_unavailable",
+                    title="Embedding service unavailable",
+                    detail=f"Chain detection/indexing failed: {e}",
+                    category="service_unavailable",
+                    retryable=True,
+                    trace_id=trace_id,
+                    suggestions=["Start Ollama: ollama serve", "Retry once Ollama is reachable."],
+                ))
+
             return _augment_with_health({
                 "detected": detected,
                 "count": len(detected),
-                "hint": "Detected chains are now indexed and searchable",
+                "indexed": indexed,
+                "hint": (
+                    f"Detected {len(detected)} chain(s); {indexed} now indexed "
+                    "and searchable via compass()."
+                    if detected
+                    else "No new chains detected."
+                ),
             })
         return _augment_with_health(_error_envelope(
             code="analytics_unavailable",

@@ -628,17 +628,53 @@ def _cmd_search(args: argparse.Namespace) -> int:
             exit_code=1,
         )
 
+    # cli-ui-001: on ANY embedder failure, degrade to the lexical keyword
+    # fallback rather than erroring out — mirroring gateway.compass and
+    # ui.search_tools, which both fall back to `gateway._lexical_search_fallback`
+    # on any semantic-search exception. This makes the subcommand help ("If
+    # Ollama is unreachable, search falls back to keyword matching") true.
+    #
+    # The old guard was `except (ConnectionError, OSError)`, which the real
+    # embedder outages never raise: `embedder._embed_with_concurrency_cap`
+    # raises `RuntimeError("Ollama circuit breaker open")` when the breaker is
+    # open and re-raises `httpx.TransportError` / `httpx.TimeoutException` on
+    # connect/timeout — none subclass ConnectionError/OSError, so they fell
+    # through to main()'s catch-all (wrong exit code 2, no actionable hint, and
+    # no fallback despite the help promising one).
+    degraded = False
     try:
         results = asyncio.run(index.search(args.intent, top_k=args.top))
-    except (ConnectionError, OSError) as e:
-        return _print_error(
+    except Exception as e:  # noqa: BLE001 — degrade broadly, like gateway/ui
+        from gateway import _lexical_search_fallback
+
+        matches = _lexical_search_fallback(
+            index, args.intent, args.top, None, None
+        )
+        # Reshape the lexical dicts into the SearchResult-like duck shape the
+        # renderer below expects (.rank / .score / .tool.{name,description,
+        # category,server}) — same pattern ui.search_tools uses.
+        from types import SimpleNamespace
+
+        results = [
+            SimpleNamespace(
+                rank=i + 1,
+                score=m["confidence"],
+                tool=SimpleNamespace(
+                    name=m["tool"],
+                    description=m.get("description") or "",
+                    category=m["category"],
+                    server=m["server"],
+                ),
+            )
+            for i, m in enumerate(matches)
+        ]
+        degraded = True
+        # Log the reason to stderr (dim) so the exit-0 degradation is not
+        # silent, without derailing the results on stdout.
+        _print_dim(
             err_console,
-            f"Search failed: {e}",
-            hint=(
-                "Ollama may be unreachable. Run `tool-compass doctor` to "
-                "confirm and check `ollama serve` is running."
-            ),
-            exit_code=1,
+            f"› Semantic search unavailable ({type(e).__name__}); showing "
+            "keyword results. Run `tool-compass doctor` to confirm Ollama.",
         )
 
     if args.json:
@@ -650,6 +686,9 @@ def _cmd_search(args: argparse.Namespace) -> int:
                 "category": r.tool.category,
                 "server": r.tool.server,
                 "description": r.tool.description,
+                # cli-ui-001: flag keyword-fallback results so scripts can tell
+                # a degraded response from a semantic one (mirrors ui.py's JSON).
+                "degraded": degraded,
             }
             for r in results
         ]
@@ -669,6 +708,16 @@ def _cmd_search(args: argparse.Namespace) -> int:
             "`tool-compass describe <name>` if you know the tool name.",
         )
         return 0
+
+    # cli-ui-001: single inline notice when the results came from the keyword
+    # fallback (Ollama/embedder down). Adjacent to the results, like ui.py's
+    # _inline_fallback_banner — the user sees WHY the ordering looks coarse.
+    if degraded:
+        _print_warn(
+            out_console,
+            "Showing keyword-based results (semantic search unavailable).",
+            hint="Start Ollama and re-run for better matches.",
+        )
 
     # Plain-text table — Rich-styled. Header dim, score column green where
     # it's a high-confidence match (>= 0.7) so users can eyeball the spread.
@@ -727,12 +776,21 @@ def _cmd_describe(args: argparse.Namespace) -> int:
             # FE-A-018: if no exact match, gather up to 3 substring suggestions
             # so the user is not left on a dead-end "not found". Matches the UI
             # surface's partial-match LIKE path so CLI and UI behave the same.
+            #
+            # cli-ui-002: escape LIKE wildcards (% and _) in the tool name and
+            # pair every LIKE with `ESCAPE '\'` — otherwise a name containing
+            # those chars is interpreted as a wildcard (e.g. `a_c` matching
+            # `axc`), diverging from gateway._lexical_search_fallback and the UI,
+            # which both escape + append ESCAPE. Reuse gateway._escape_like so
+            # there is one source of truth for the escape rule.
             if row is None:
-                needle = f"%{args.tool_name}%"
+                from gateway import _escape_like
+
+                needle = f"%{_escape_like(args.tool_name)}%"
                 rows = conn.execute(
                     "SELECT name FROM tools "
-                    "WHERE name LIKE ? OR description LIKE ? "
-                    "ORDER BY (CASE WHEN name LIKE ? THEN 0 ELSE 1 END), name "
+                    "WHERE name LIKE ? ESCAPE '\\' OR description LIKE ? ESCAPE '\\' "
+                    "ORDER BY (CASE WHEN name LIKE ? ESCAPE '\\' THEN 0 ELSE 1 END), name "
                     "LIMIT 3",
                     (needle, needle, needle),
                 ).fetchall()

@@ -1066,6 +1066,39 @@ def _stub_index(results):
     return _Index()
 
 
+def _stub_index_with_db(rows, *, search_raises=None):
+    """Fake CompassIndex whose ``.search`` raises and whose ``.db`` is a real
+    in-memory SQLite ``tools`` table.
+
+    cli-ui-001: exercises the Option-A lexical fallback path in ``_cmd_search``.
+    When ``.search`` raises the given embedder-style exception, ``_cmd_search``
+    is expected to fall back to ``gateway._lexical_search_fallback`` scanning
+    this ``.db``. ``rows`` is a list of (name, description, category, server).
+    """
+    import sqlite3
+
+    db = sqlite3.connect(":memory:")
+    db.row_factory = sqlite3.Row
+    db.execute(
+        "CREATE TABLE tools (name TEXT, description TEXT, category TEXT, server TEXT)"
+    )
+    for name, desc, cat, srv in rows:
+        db.execute(
+            "INSERT INTO tools (name, description, category, server) VALUES (?, ?, ?, ?)",
+            (name, desc, cat, srv),
+        )
+    db.commit()
+
+    class _Index:
+        def __init__(self):
+            self.db = db
+
+        async def search(self, query, top_k=5, **kwargs):
+            raise search_raises or RuntimeError("Ollama circuit breaker open")
+
+    return _Index()
+
+
 def _result(rank: int, name: str, score: float, desc: str = "desc"):
     """Build a result object matching cli._cmd_search's expected attrs."""
     return SimpleNamespace(
@@ -1123,28 +1156,113 @@ class TestCmdSearchExtended:
         assert "sync" in err.lower()
         assert rc == 1
 
-    def test_search_connection_error_emits_hint(self, monkeypatch, capsys):
-        class _BadIndex:
-            async def search(self, query, top_k=5):
-                raise ConnectionError("ollama unreachable")
+    def test_search_connection_error_falls_back_to_keyword(self, monkeypatch, capsys):
+        """cli-ui-001: ConnectionError from the embedder now degrades to the
+        lexical keyword fallback (Option A) rather than exiting 1. The help text
+        (cli.py) promises "falls back to keyword matching" — this keeps it true.
+        """
+        idx = _stub_index_with_db(
+            [("bridge:read_file", "read a file", "file", "bridge")],
+            search_raises=ConnectionError("ollama unreachable"),
+        )
+        monkeypatch.setattr(cli, "_load_index", lambda: idx)
+        rc = cli.main(["search", "read"])
+        captured = capsys.readouterr()
+        # Keyword result surfaced, exit 0 (a degraded-but-served response).
+        assert rc == 0
+        assert "bridge:read_file" in captured.out
+        # A keyword/degraded notice is emitted (adjacent to results).
+        assert "keyword" in (captured.out + captured.err).lower()
 
-        monkeypatch.setattr(cli, "_load_index", lambda: _BadIndex())
-        rc = cli.main(["search", "foo"])
-        err = capsys.readouterr().err
-        assert "Search failed" in err
-        assert "Ollama" in err or "ollama" in err
-        assert rc == 1
+    def test_search_os_error_falls_back_to_keyword(self, monkeypatch, capsys):
+        """cli-ui-001: OSError from the embedder also degrades to keyword
+        results + exit 0 (was exit 1 with a dead hint before the fix)."""
+        idx = _stub_index_with_db(
+            [("bridge:read_file", "read a file", "file", "bridge")],
+            search_raises=OSError("disk gone"),
+        )
+        monkeypatch.setattr(cli, "_load_index", lambda: idx)
+        rc = cli.main(["search", "read"])
+        captured = capsys.readouterr()
+        assert rc == 0
+        assert "bridge:read_file" in captured.out
 
-    def test_search_os_error_emits_hint(self, monkeypatch, capsys):
-        class _BadIndex:
-            async def search(self, query, top_k=5):
-                raise OSError("disk gone")
+    def test_search_breaker_open_falls_back_to_keyword(self, monkeypatch, capsys):
+        """cli-ui-001 core regression: the embedder raises
+        ``RuntimeError("Ollama circuit breaker open")`` when the breaker is open
+        (embedder.py). RuntimeError does NOT subclass ConnectionError/OSError, so
+        before the fix it fell straight through the ``except (ConnectionError,
+        OSError)`` guard, hit main()'s catch-all, and exited 2 with a generic
+        message and no actionable hint — while the help text promised a keyword
+        fallback that never happened. Option A wires the real fallback.
+        """
+        idx = _stub_index_with_db(
+            [
+                ("bridge:read_file", "read a file", "file", "bridge"),
+                ("comfy:generate", "make an image", "ai", "comfy"),
+            ],
+            search_raises=RuntimeError("Ollama circuit breaker open"),
+        )
+        monkeypatch.setattr(cli, "_load_index", lambda: idx)
+        rc = cli.main(["search", "read"])
+        captured = capsys.readouterr()
+        # Degraded-but-served: exit 0, keyword result present, notice shown.
+        assert rc == 0, (
+            "breaker-open must degrade to keyword fallback (exit 0), not "
+            "exit 2 via the catch-all"
+        )
+        assert "bridge:read_file" in captured.out
+        assert "keyword" in (captured.out + captured.err).lower()
 
-        monkeypatch.setattr(cli, "_load_index", lambda: _BadIndex())
-        rc = cli.main(["search", "foo"])
-        err = capsys.readouterr().err
-        assert "Search failed" in err
-        assert rc == 1
+    def test_search_transport_error_falls_back_to_keyword(self, monkeypatch, capsys):
+        """cli-ui-001: httpx.TransportError (connect/timeout re-raised by the
+        embedder) also degrades to the keyword fallback + exit 0. Like
+        RuntimeError, httpx.TransportError is not a ConnectionError/OSError
+        subclass, so the old narrow guard missed it."""
+        import httpx
+
+        idx = _stub_index_with_db(
+            [("bridge:read_file", "read a file", "file", "bridge")],
+            search_raises=httpx.TransportError("connect failed"),
+        )
+        monkeypatch.setattr(cli, "_load_index", lambda: idx)
+        rc = cli.main(["search", "read"])
+        captured = capsys.readouterr()
+        assert rc == 0
+        assert "bridge:read_file" in captured.out
+
+    def test_search_fallback_no_matches_is_empty_not_error(self, monkeypatch, capsys):
+        """cli-ui-001 corollary: when the embedder is down AND the lexical scan
+        finds nothing, the CLI shows the standard no-match message at exit 0 —
+        it does not resurrect the old "Search failed" exit-1 path."""
+        idx = _stub_index_with_db(
+            [("bridge:read_file", "read a file", "file", "bridge")],
+            search_raises=RuntimeError("Ollama circuit breaker open"),
+        )
+        monkeypatch.setattr(cli, "_load_index", lambda: idx)
+        rc = cli.main(["search", "zzz_no_such_tool_xyz"])
+        captured = capsys.readouterr()
+        assert rc == 0
+        assert "Search failed" not in captured.err
+        assert (
+            "No tools matched" in captured.out
+            or "no tools" in captured.out.lower()
+        )
+
+    def test_search_help_text_promises_keyword_fallback(self):
+        """cli-ui-001: the search subcommand help must still promise the keyword
+        fallback — and now the behavior actually delivers it (Option A). This
+        guards against the help/behavior drift the finding flagged."""
+        parser = cli._build_parser()
+        # Locate the `search` subparser's epilog via the subparsers action.
+        search_epilog = None
+        for action in parser._actions:
+            choices = getattr(action, "choices", None)
+            if isinstance(choices, dict) and "search" in choices:
+                search_epilog = choices["search"].epilog or ""
+                break
+        assert search_epilog is not None
+        assert "keyword" in search_epilog.lower()
 
     def test_search_empty_results(self, monkeypatch, capsys):
         monkeypatch.setattr(cli, "_load_index", lambda: _stub_index([]))
@@ -1324,6 +1442,78 @@ class TestCmdDescribeExtended:
         out = capsys.readouterr().out
         assert rc == 0
         assert "no description" in out.lower()
+
+    def test_describe_suggestion_underscore_is_literal_not_wildcard(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        """cli-ui-002: the not-found suggestion LIKE must treat ``_`` as a
+        literal, not a single-char wildcard.
+
+        We look up a tool name ``a_c`` that does not exist. With ``_`` unescaped
+        (the bug), ``%a_c%`` wildcard-matches the unrelated tool ``axc`` and
+        offers it as a bogus "Did you mean". With the fix (``_escape_like`` +
+        ``ESCAPE``), ``_`` is literal, so ``axc`` must NOT be suggested — only a
+        tool literally containing ``a_c`` would match, and none does here.
+        """
+        _setup_describe_db(
+            tmp_path,
+            monkeypatch,
+            [
+                {"name": "axc", "description": "unrelated wildcard bait"},
+                {"name": "ayc", "description": "more bait"},
+            ],
+        )
+        rc = cli.main(["describe", "a_c"])
+        err = capsys.readouterr().err
+        assert rc == 1
+        assert "not found" in err.lower() or "Tool not found" in err
+        # The wildcard-interpretation would have surfaced axc/ayc as suggestions.
+        # Escaped, they must not appear — no bogus "Did you mean".
+        assert "axc" not in err
+        assert "ayc" not in err
+
+    def test_describe_suggestion_literal_underscore_matches(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        """cli-ui-002 corollary: a tool whose name literally contains ``_`` is
+        still surfaced as a suggestion when the (non-exact) query shares that
+        literal ``_`` substring — proving the ESCAPE makes ``_`` match itself,
+        not that escaping breaks legitimate matches."""
+        _setup_describe_db(
+            tmp_path,
+            monkeypatch,
+            [
+                {"name": "read_file", "description": "reads a file"},
+                {"name": "write_file", "description": "writes a file"},
+            ],
+        )
+        # Query 'read_' is not an exact tool name, so the suggestion path runs.
+        # The literal '_' must match 'read_file' (which contains 'read_').
+        rc = cli.main(["describe", "read_"])
+        err = capsys.readouterr().err
+        assert rc == 1
+        assert "read_file" in err
+        # 'read_' does not appear in 'write_file', so it must NOT be suggested
+        # (it would only via a wildcard reading of '_').
+        assert "write_file" not in err
+
+    def test_describe_suggestion_percent_is_literal_not_wildcard(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        """cli-ui-002: ``%`` in the queried name must be a literal too. A query
+        of ``a%c`` (no exact match) must not wildcard-match ``abc``."""
+        _setup_describe_db(
+            tmp_path,
+            monkeypatch,
+            [
+                {"name": "abc", "description": "percent wildcard bait"},
+            ],
+        )
+        rc = cli.main(["describe", "a%c"])
+        err = capsys.readouterr().err
+        assert rc == 1
+        assert "not found" in err.lower() or "Tool not found" in err
+        assert "abc" not in err
 
 
 # =============================================================================

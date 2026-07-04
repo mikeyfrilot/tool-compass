@@ -868,29 +868,57 @@ class TestOrphanVectorCompaction:
         orphan vectors accumulate forever and build_index is NEVER called from
         the incremental path. Drive enough cycles to cross the threshold and
         assert exactly one full rebuild happens, and the counter resets.
+
+        BE-COMPACT-002: this test previously asserted ``len(rebuilt_arg) == 1``
+        with a single-backend mock, which FALSELY certified the 'full tool set'
+        invariant — it never exercised the multi-backend case where the
+        table-truncating build_index would delete an idle backend's tools. It
+        now wires BOTH configured backends and asserts the rebuild carries the
+        FULL connected catalog (see also TestCompactionPreservesAllBackends).
         """
-        self._set_old_names(sync_manager, ["backend1:gone"])
+        # backend1 churns (one tool vanished this cycle); backend2 is a stable,
+        # idle-but-connected backend whose single tool must survive compaction.
+        current = {
+            "backend1": [ToolInfo("kept", "backend1:kept", "Kept", "backend1", {})],
+            "backend2": [ToolInfo("b2t", "backend2:b2t", "B2 Tool", "backend2", {})],
+        }
         sync_manager.backends.get_backend_tools = Mock(
-            return_value=[
-                ToolInfo("kept", "backend1:kept", "Kept", "backend1", {}),
-            ]
+            side_effect=lambda name: current.get(name, [])
         )
+        sync_manager.backends.is_backend_connected = Mock(return_value=True)
+
+        old_names = {
+            "backend1": ["backend1:kept", "backend1:gone"],
+            "backend2": ["backend2:b2t"],
+        }
+
+        def fake_execute(query, params=()):
+            backend = params[0] if params else None
+            rows = [{"name": n} for n in old_names.get(backend, [])]
+            result = Mock()
+            result.fetchall = Mock(return_value=rows)
+            return result
+
+        sync_manager.index.db.execute.side_effect = fake_execute
         sync_manager.index.remove_tool = AsyncMock(return_value=True)
         sync_manager.index.add_single_tool = AsyncMock(return_value=True)
-        sync_manager.index.build_index = AsyncMock(return_value={"tools_indexed": 1})
+        sync_manager.index.build_index = AsyncMock(return_value={"tools_indexed": 2})
 
         threshold = sync_manager._rebuild_after_incremental_cycles
 
-        # Run threshold cycles, each removing the vanished tool.
+        # Run threshold cycles, each removing the vanished tool from backend1.
         for _ in range(threshold):
             await sync_manager._rebuild_for_backends(["backend1"])
 
         # Exactly one full rebuild on the cycle that crossed the threshold,
-        # and the counter reset afterward.
+        # over the FULL connected catalog (both backends), counter reset.
         sync_manager.index.build_index.assert_called_once()
         rebuilt_arg = sync_manager.index.build_index.call_args.args[0]
-        # Rebuild is over the full current tool set, not an empty list.
-        assert len(rebuilt_arg) == 1
+        rebuilt_names = {t.name for t in rebuilt_arg}
+        assert rebuilt_names == {"backend1:kept", "backend2:b2t"}, (
+            "compaction rebuild must carry the full connected tool set, not "
+            "just the changed subset"
+        )
         assert sync_manager._incremental_cycles_since_rebuild == 0
 
     @pytest.mark.asyncio
@@ -913,6 +941,89 @@ class TestOrphanVectorCompaction:
         # No removals ever -> counter stays at 0, no forced rebuild.
         sync_manager.index.remove_tool.assert_not_called()
         sync_manager.index.build_index.assert_not_called()
+        assert sync_manager._incremental_cycles_since_rebuild == 0
+
+
+class TestCompactionPreservesAllBackends:
+    """BE-COMPACT-001 / BE-COMPACT-002: the orphan-vector compaction rebuild
+    must operate over the CURRENT FULL tool set across EVERY connected backend
+    — not just the changed subset passed to _rebuild_for_backends.
+
+    build_index is a FULL table-truncating replace (DELETE FROM tools + rebuild
+    HNSW from only the passed tools). When sync_if_needed calls
+    _rebuild_for_backends(changed_backends) with only the churned backend and
+    the compaction threshold trips, passing the changed-subset all_tools to
+    build_index silently deletes every OTHER connected backend's tools →
+    compass() returns "no matching tool" for them until a manual full_sync.
+
+    The regression drives ONLY backend1's churn to the compaction threshold
+    while backend2 sits idle-but-connected, and asserts the compaction rebuild
+    argument contains BOTH backends' tools (backend2 survives).
+    """
+
+    def _wire_two_backends(self, sync_manager):
+        """Configure backend1 (churning) + backend2 (idle-but-connected).
+
+        - get_backend_tools returns each backend's CURRENT tool list.
+        - index.db.execute(SELECT ... WHERE server = ?) returns the OLD indexed
+          names per backend so backend1 shows one removal every cycle (which is
+          what advances the compaction counter) while backend2 is stable.
+        """
+        # Current tools reported by each connected backend.
+        current = {
+            "backend1": [ToolInfo("kept", "backend1:kept", "Kept", "backend1", {})],
+            "backend2": [ToolInfo("b2t", "backend2:b2t", "B2 Tool", "backend2", {})],
+        }
+        sync_manager.backends.get_backend_tools = Mock(
+            side_effect=lambda name: current.get(name, [])
+        )
+        sync_manager.backends.is_backend_connected = Mock(return_value=True)
+
+        # Old indexed name-sets per backend. backend1 also has ":gone" that
+        # vanished this cycle -> a removal every cycle -> counter advances.
+        old_names = {
+            "backend1": ["backend1:kept", "backend1:gone"],
+            "backend2": ["backend2:b2t"],
+        }
+
+        def fake_execute(query, params=()):
+            # _get_backend_tool_names binds (backend_name,) as params.
+            backend = params[0] if params else None
+            rows = [{"name": n} for n in old_names.get(backend, [])]
+            result = Mock()
+            result.fetchall = Mock(return_value=rows)
+            return result
+
+        sync_manager.index.db.execute.side_effect = fake_execute
+
+        sync_manager.index.remove_tool = AsyncMock(return_value=True)
+        sync_manager.index.add_single_tool = AsyncMock(return_value=True)
+        sync_manager.index.build_index = AsyncMock(return_value={"tools_indexed": 2})
+
+    @pytest.mark.asyncio
+    async def test_compaction_rebuild_includes_all_connected_backends(
+        self, sync_manager
+    ):
+        """When compaction fires from a single-backend change, the rebuild's
+        tool set must still contain the idle backend2's tools."""
+        self._wire_two_backends(sync_manager)
+
+        threshold = sync_manager._rebuild_after_incremental_cycles
+
+        # sync_if_needed only rebuilds the CHANGED subset — here only backend1.
+        for _ in range(threshold):
+            await sync_manager._rebuild_for_backends(["backend1"])
+
+        sync_manager.index.build_index.assert_called_once()
+        rebuilt = sync_manager.index.build_index.call_args.args[0]
+        rebuilt_names = {t.name for t in rebuilt}
+
+        # The bug: rebuilt would be {"backend1:kept"} only, nuking backend2.
+        assert "backend1:kept" in rebuilt_names
+        assert "backend2:b2t" in rebuilt_names, (
+            "compaction rebuild dropped an idle backend's tools — build_index "
+            "truncates the tools table, so backend2 would be silently deleted"
+        )
         assert sync_manager._incremental_cycles_since_rebuild == 0
 
 

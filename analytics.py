@@ -21,7 +21,7 @@ import hashlib
 import threading
 from collections import deque
 import numpy as np
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional, List, Dict, Any, Deque
 from dataclasses import dataclass
@@ -798,7 +798,12 @@ class CompassAnalytics:
 
         # Parse timeframe
         hours = {"1h": 1, "24h": 24, "7d": 168, "30d": 720}.get(timeframe, 24)
-        since = datetime.now() - timedelta(hours=hours)
+        # CA-001: created_at is written by SQLite CURRENT_TIMESTAMP, which is UTC.
+        # Compute the window bound in UTC too — datetime.now() is naive LOCAL
+        # wall-clock, so a naive bound skews every window by the host's UTC
+        # offset. strftime drops the tz suffix, yielding a UTC
+        # 'YYYY-MM-DD HH:MM:SS' string that matches CURRENT_TIMESTAMP.
+        since = datetime.now(timezone.utc) - timedelta(hours=hours)
         # Use SQLite-compatible format (YYYY-MM-DD HH:MM:SS) for timestamp comparison
         since_str = since.strftime("%Y-%m-%d %H:%M:%S")
 

@@ -96,7 +96,13 @@ CMD ["python", "ui.py"]
 FROM production AS mcp-gateway
 
 # Override for HTTP mode (Fly.io / Smithery)
-ENV PORT=8080
+# ci-infra-01: gateway.py's _run_http defaults HOST to 127.0.0.1 (loopback), so
+# without this the published image binds loopback and any orchestrator's proxy /
+# health check (the HEALTHCHECK below hits localhost, but Fly/Smithery reach the
+# container over the network) can't reach the gateway. 0.0.0.0 is the documented
+# reverse-proxy path — this image is meant to sit behind an authenticated edge.
+ENV PORT=8080 \
+    HOST=0.0.0.0
 
 # Expose MCP HTTP port
 EXPOSE 8080

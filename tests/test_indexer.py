@@ -4,6 +4,8 @@ Tests for Tool Compass indexer module.
 Tests HNSW index building, searching, and metadata management.
 """
 
+from unittest.mock import patch
+
 import numpy as np
 import pytest
 
@@ -225,6 +227,136 @@ class TestEmbeddingCacheSelfHeal:
         # And search still works after the self-heal.
         results = await index.search("read a file", top_k=3)
         assert len(results) > 0
+
+        await index.close()
+
+
+class TestBuildIndexAtomicRollbackWithCacheMiss:
+    """IDX-COMPOSED-002: a cache write during build_index must NOT commit the
+    open BEGIN IMMEDIATE transaction mid-rebuild.
+
+    build_index wraps DELETE FROM tools + per-tool INSERTs + HNSW save in a
+    single BEGIN IMMEDIATE txn whose documented purpose is atomic rollback:
+    'Only commit AFTER HNSW save succeeds, so a failure leaves the previous DB
+    state intact (no orphan SQLite rows).' But on a cache MISS the loop calls
+    _cache_put, which issued self.db.commit() on the SHARED connection —
+    prematurely committing the DELETE + INSERTs. If the subsequent HNSW save
+    then failed, the tool rows were already committed with a stale/missing HNSW
+    index → DB/HNSW divergence, silently degrading recall until the next
+    successful full rebuild.
+
+    The fix defers cache writes made during a rebuild and flushes them AFTER
+    build_index's own commit; so when the HNSW save fails, rollback genuinely
+    restores the previous tools table.
+    """
+
+    @pytest.mark.asyncio
+    async def test_hnsw_save_failure_after_cache_miss_leaves_tools_unchanged(
+        self, temp_index_path, temp_db_path, mock_embedder, sample_tools
+    ):
+        """Force an HNSW-save failure partway through a rebuild that had a
+        cache miss; the tools table must reflect the PREVIOUS state (rows NOT
+        committed by the cache write)."""
+        import hnswlib
+
+        index = CompassIndex(
+            index_path=temp_index_path,
+            db_path=temp_db_path,
+            embedder=mock_embedder,
+        )
+
+        # First build: legitimate, populates the tools table + embedding cache.
+        await index.build_index(sample_tools)
+
+        pre_names = {
+            r["name"]
+            for r in index.db.execute("SELECT name FROM tools").fetchall()
+        }
+        assert pre_names == {t.name for t in sample_tools}, "precondition"
+        pre_count = len(pre_names)
+
+        # A DIFFERENT tool set with a BRAND-NEW embedding_text -> guaranteed
+        # cache MISS -> _cache_put runs during the open rebuild txn.
+        new_tools = [
+            ToolDefinition(
+                name="test:brand_new_alpha",
+                description="A brand new alpha tool never seen before",
+                category="other",
+                server="test",
+                parameters={"x": "str"},
+                examples=["totally novel embedding text alpha"],
+                is_core=False,
+            ),
+            ToolDefinition(
+                name="test:brand_new_beta",
+                description="A brand new beta tool never seen before",
+                category="other",
+                server="test",
+                parameters={"y": "int"},
+                examples=["totally novel embedding text beta"],
+                is_core=False,
+            ),
+        ]
+
+        # Make the HNSW index created DURING this rebuild fail on save_index,
+        # AFTER the DELETE/INSERT and the cache-miss _cache_put have run.
+        class _FailingSaveIndex(hnswlib.Index):
+            def save_index(self, *args, **kwargs):
+                raise RuntimeError("simulated HNSW save failure")
+
+        # The rebuild must raise (save fails inside the txn) and roll back.
+        with patch.object(hnswlib, "Index", _FailingSaveIndex):
+            with pytest.raises(RuntimeError, match="simulated HNSW save failure"):
+                await index.build_index(new_tools)
+
+        # THE INVARIANT: rollback restored the previous tools table — the
+        # cache write did NOT prematurely commit the DELETE + new INSERTs.
+        post_names = {
+            r["name"]
+            for r in index.db.execute("SELECT name FROM tools").fetchall()
+        }
+        assert post_names == pre_names, (
+            "build_index rollback must leave the previous tools table intact; "
+            "a cache-miss _cache_put committed the open rebuild transaction"
+        )
+        post_count = index.db.execute(
+            "SELECT COUNT(*) AS c FROM tools"
+        ).fetchone()["c"]
+        assert post_count == pre_count
+        # The failed rebuild's brand-new rows must NOT be present.
+        assert "test:brand_new_alpha" not in post_names
+        assert "test:brand_new_beta" not in post_names
+
+        await index.close()
+
+    @pytest.mark.asyncio
+    async def test_successful_rebuild_still_persists_cache_entries(
+        self, temp_index_path, temp_db_path, mock_embedder, sample_tools
+    ):
+        """The deferral must not lose cache entries on the happy path: after a
+        successful rebuild with misses, the embedding_cache is populated (so a
+        subsequent rebuild registers hits)."""
+        index = CompassIndex(
+            index_path=temp_index_path,
+            db_path=temp_db_path,
+            embedder=mock_embedder,
+        )
+
+        # First build populates cache via deferred-then-flushed puts.
+        await index.build_index(sample_tools)
+
+        cache_size = index.db.execute(
+            "SELECT COUNT(*) AS c FROM embedding_cache"
+        ).fetchone()["c"]
+        assert cache_size == len(sample_tools), (
+            "deferred cache puts must be flushed after a successful rebuild"
+        )
+
+        # Second identical build should be all cache HITS (proves the flushed
+        # entries are readable and keyed correctly).
+        hits_before = index._cache_hits
+        await index.build_index(sample_tools)
+        assert index._cache_hits >= hits_before + len(sample_tools)
 
         await index.close()
 

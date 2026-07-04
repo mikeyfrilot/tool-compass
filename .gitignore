@@ -126,3 +126,6 @@ npm/README.pt-BR.md
 npm/node_modules/
 npm/package-lock.json
 npm/*.tgz
+
+# Dogfood swarm working artifacts (manifest, wave outputs) — not shipped
+swarms/

@@ -6,6 +6,8 @@ Tests usage tracking, hot cache, and chain detection.
 
 import asyncio
 import threading
+from datetime import datetime, timedelta, timezone
+from unittest.mock import patch
 
 import pytest
 
@@ -372,6 +374,54 @@ class TestAnalyticsSummary:
 
         assert summary["tool_calls"]["total"] >= 3
         # Success rate should reflect 2/3 successes (approximately 66.7%)
+
+    @pytest.mark.asyncio
+    async def test_summary_window_bound_is_utc_not_local(self, test_analytics):
+        """CA-001: the timeframe window bound must be computed in UTC.
+
+        `created_at` columns are written by SQLite CURRENT_TIMESTAMP (UTC).
+        If get_analytics_summary computes `since` from naive local wall-clock
+        (datetime.now()), then on an ahead-of-UTC host the local bound
+        overshoots the just-inserted UTC row and it silently vanishes from the
+        window. This test forces that skew regardless of the real host TZ by
+        making naive datetime.now() report a time well ahead of true UTC while
+        datetime.now(timezone.utc) still returns real UTC. The row must still
+        appear in the "1h" window — which only holds if the bound is UTC.
+        """
+
+        class MockResult:
+            class MockTool:
+                name = "test:read_file"
+
+            tool = MockTool()
+
+        # Record a search first — SQLite stamps created_at in real UTC.
+        await test_analytics.record_search(
+            query="utc window bound check",
+            results=[MockResult()],
+            latency_ms=12.0,
+        )
+
+        real_utc = datetime.now(timezone.utc)
+        # Simulate an ahead-of-UTC host: naive now() is 6h in the future
+        # relative to the UTC-stored row. A buggy local-time bound of
+        # (naive_now - 1h) = real_utc + 5h excludes the just-inserted row;
+        # a correct UTC bound of (real_utc - 1h) includes it.
+        fake_local_now = real_utc.replace(tzinfo=None) + timedelta(hours=6)
+
+        class _FrozenDateTime(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                if tz is None:
+                    return fake_local_now
+                return datetime.now(tz)
+
+        with patch("analytics.datetime", _FrozenDateTime):
+            summary = await test_analytics.get_analytics_summary("1h")
+
+        # The row is within the last hour of real UTC, so a correct UTC bound
+        # must include it. Fails today because the bound is naive-local.
+        assert summary["searches"]["total"] >= 1
 
 
 class TestPersistence:

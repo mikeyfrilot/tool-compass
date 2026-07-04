@@ -168,6 +168,18 @@ async def test_sqlite_db_locked_surfaces_error(
     returns False (the err-path logs and surfaces) within a short
     busy-timeout window instead of blocking indefinitely.
     """
+    # TST-RA-003: assert the concrete locked-write contract, not a tautology.
+    # remove_tool reads the row (SELECT succeeds), then DELETEs + commits under
+    # an EXCLUSIVE lock. That write must fail and be caught, so:
+    #   1. remove_tool returns False (the operation could not succeed), and
+    #   2. no partial write occurred — the row still exists once the lock lifts.
+
+    # Sanity: the target tool exists before we try to remove it.
+    pre = test_index.db.execute(
+        "SELECT COUNT(*) AS n FROM tools WHERE name = ?", ("test:read_file",)
+    ).fetchone()
+    assert pre["n"] == 1
+
     # Take an exclusive lock in a second connection.
     locker = sqlite3.connect(str(temp_db_path), timeout=0.1)
     locker.execute("BEGIN EXCLUSIVE")
@@ -178,17 +190,21 @@ async def test_sqlite_db_locked_surfaces_error(
         # hit the lock.
         test_index.db.execute("PRAGMA busy_timeout = 200")
 
-        # remove_tool catches exceptions internally and logs/returns False.
-        # The critical contract is "returns without hanging".
+        # remove_tool catches the "database is locked" write error internally
+        # and returns False. The concrete contract: the locked write cannot
+        # succeed, so the return must be exactly False (not just "either").
         result = await test_index.remove_tool("test:read_file")
-        # Either False (locked write failed and was caught) or True (SQLite
-        # allowed it for some reason on this platform). The behavior we're
-        # locking in is "does not hang". A crash would fail the test via
-        # timeout.
-        assert result in (True, False)
+        assert result is False
     finally:
         # Always release the lock so the fixture teardown can run.
         try:
             locker.rollback()
         finally:
             locker.close()
+
+    # No partial write: with the lock released, the row must still be present
+    # (the failed DELETE did not remove it). State is unchanged.
+    post = test_index.db.execute(
+        "SELECT COUNT(*) AS n FROM tools WHERE name = ?", ("test:read_file",)
+    ).fetchone()
+    assert post["n"] == 1
