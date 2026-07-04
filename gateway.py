@@ -1376,9 +1376,24 @@ async def compass_status() -> Dict[str, Any]:
                     "size": len(analytics._hot_cache),
                     "tools": list(analytics._hot_cache.keys()),
                 }
+                # PC-B-003: surface the analytics _degraded flag on the primary
+                # runtime status surface. get_health() already computes it (so the
+                # UI/status tab can distinguish "analytics fine" from "sqlite
+                # broke; tool calls still work but metrics aren't recorded"), but
+                # until now it was only readable via config.doctor(), a separate
+                # out-of-process command. Fold it into the health block so the
+                # degraded flag the code already tracks is visible here too.
+                health = analytics.get_health()
+                response["health"]["analytics_degraded"] = health.get("degraded", False)
+                response["health"]["analytics_degraded_reason"] = health.get("reason")
         except Exception as e:
+            # Status must never itself raise if analytics is unavailable
+            # (BE-B-004): degrade this section, and surface the analytics-health
+            # subsystem as unknown rather than asserting it is healthy.
             logger.error(f"[compass_status] [{trace_id}] analytics failed: {e}")
             response["hot_cache"] = {"error": f"{type(e).__name__}: {e}"}
+            response["health"]["analytics_degraded"] = None
+            response["health"]["analytics_degraded_reason"] = f"{type(e).__name__}: {e}"
 
     # Add sync status if enabled
     if config.auto_sync:

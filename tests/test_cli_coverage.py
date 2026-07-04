@@ -909,6 +909,66 @@ class TestCmdAnalytics:
         assert "\x1b[" not in out
         assert rc == 0
 
+    def test_analytics_empty_state_line_when_no_usage(self, monkeypatch, capsys):
+        """cli-ux-03: with analytics enabled but no usage yet (empty top_tools
+        AND empty summary — the normal state right after sync), text mode must
+        print a dim empty-state line instead of just a bare header. Mirrors the
+        empty-state guidance in search/chains."""
+        _patch_gateway(monkeypatch, "compass_analytics", {})
+        rc = cli.main(["analytics"])
+        out = capsys.readouterr().out
+        assert rc == 0
+        low = out.lower()
+        assert "no usage recorded" in low
+        # The timeframe is echoed into the empty-state line.
+        assert "24h" in out
+
+    def test_analytics_empty_state_line_honors_timeframe(self, monkeypatch, capsys):
+        """cli-ux-03: the empty-state line reflects the requested timeframe."""
+        _patch_gateway(monkeypatch, "compass_analytics", {})
+        rc = cli.main(["analytics", "--timeframe", "7d"])
+        out = capsys.readouterr().out
+        assert rc == 0
+        assert "no usage recorded" in out.lower()
+        assert "7d" in out
+
+    def test_analytics_no_empty_state_line_when_data_present(self, monkeypatch, capsys):
+        """cli-ux-03 negative: when top_tools has content, the empty-state line
+        must NOT appear."""
+        payload = {"top_tools": [{"tool_name": "bridge:read_file", "call_count": 3}]}
+        _patch_gateway(monkeypatch, "compass_analytics", payload)
+        rc = cli.main(["analytics"])
+        out = capsys.readouterr().out
+        assert rc == 0
+        assert "no usage recorded" not in out.lower()
+
+    def test_analytics_no_empty_state_line_when_summary_present(
+        self, monkeypatch, capsys
+    ):
+        """cli-ux-03 negative: a non-empty summary alone suppresses the line."""
+        _patch_gateway(
+            monkeypatch, "compass_analytics", {"summary": {"total_calls": 5}}
+        )
+        rc = cli.main(["analytics"])
+        out = capsys.readouterr().out
+        assert rc == 0
+        assert "no usage recorded" not in out.lower()
+
+    def test_analytics_emits_sync_hint_on_cold_install(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        """cli-ux-02: analytics (a read-only gateway-backed command) must emit
+        the cold-install "run sync first" hint when the index DB is absent,
+        matching status/categories/audit."""
+        import indexer
+
+        monkeypatch.setattr(indexer, "SQLITE_DB_PATH", tmp_path / "nope.db")
+        _patch_gateway(monkeypatch, "compass_analytics", {})
+        rc = cli.main(["analytics"])
+        err = capsys.readouterr().err
+        assert rc == 0
+        assert "sync" in err.lower()
+
 
 # =============================================================================
 # cmd_chains — list + detect + envelope + empty + handler-raises
@@ -999,6 +1059,21 @@ class TestCmdChains:
         out = capsys.readouterr().out
         assert "\x1b[" not in out
         assert rc == 0
+
+    def test_chains_emits_sync_hint_on_cold_install(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        """cli-ux-02: chains (a read-only gateway-backed command) must emit the
+        cold-install "run sync first" hint when the index DB is absent, matching
+        status/categories/audit/analytics."""
+        import indexer
+
+        monkeypatch.setattr(indexer, "SQLITE_DB_PATH", tmp_path / "nope.db")
+        _patch_gateway(monkeypatch, "compass_chains", {"chains": []})
+        rc = cli.main(["chains"])
+        err = capsys.readouterr().err
+        assert rc == 0
+        assert "sync" in err.lower()
 
 
 # =============================================================================
@@ -1272,6 +1347,51 @@ class TestCmdSearchExtended:
         # Empty results = exit 0 with a "no tools matched" message.
         assert rc == 0
         assert "No tools matched" in out or "no match" in out.lower()
+
+    def test_search_top_zero_rejected(self, monkeypatch, capsys):
+        """cli-ux-01: --top 0 is out of the documented 1-10 range and must be
+        rejected with a validation error + exit 2, not silently produce a
+        misleading "No tools matched". The index must never be consulted."""
+        called = {"loaded": False}
+
+        def _boom():
+            called["loaded"] = True
+            return _stub_index([])
+
+        monkeypatch.setattr(cli, "_load_index", _boom)
+        rc = cli.main(["search", "read", "--top", "0"])
+        captured = capsys.readouterr()
+        assert rc == 2
+        assert "--top must be between 1 and 10" in captured.err
+        assert "0" in captured.err
+        # Validation happens before the index is loaded.
+        assert called["loaded"] is False
+
+    def test_search_top_too_high_rejected(self, monkeypatch, capsys):
+        """cli-ux-01: --top 99 is above the documented 1-10 range and rejected."""
+        monkeypatch.setattr(cli, "_load_index", lambda: _stub_index([]))
+        rc = cli.main(["search", "read", "--top", "99"])
+        captured = capsys.readouterr()
+        assert rc == 2
+        assert "--top must be between 1 and 10" in captured.err
+        assert "99" in captured.err
+
+    def test_search_top_negative_rejected(self, monkeypatch, capsys):
+        """cli-ux-01: negative --top is rejected too (was passed through raw)."""
+        monkeypatch.setattr(cli, "_load_index", lambda: _stub_index([]))
+        rc = cli.main(["search", "read", "--top", "-3"])
+        captured = capsys.readouterr()
+        assert rc == 2
+        assert "--top must be between 1 and 10" in captured.err
+
+    def test_search_top_in_range_still_works(self, monkeypatch, capsys):
+        """cli-ux-01: valid --top (1-10) is unaffected by the new guard."""
+        results = [_result(1, "bridge:read_file", 0.9, "read a file")]
+        monkeypatch.setattr(cli, "_load_index", lambda: _stub_index(results))
+        rc = cli.main(["search", "read", "--top", "5"])
+        out = capsys.readouterr().out
+        assert rc == 0
+        assert "bridge:read_file" in out
 
 
 # =============================================================================

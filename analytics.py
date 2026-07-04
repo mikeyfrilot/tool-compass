@@ -931,26 +931,60 @@ class CompassAnalytics:
             ORDER BY rank
         """)
 
+        # PC-B-001: this runs on the mandatory init path — get_analytics_instance()
+        # awaits it unconditionally and compass()/execute() call that UNWRAPPED,
+        # so a raw exception here surfaces as a bare traceback through the MCP
+        # JSON-RPC envelope (violates the BE-B-004 "handlers never raise"
+        # invariant). Persisted blobs can be corrupt: a bad schema_json raises
+        # json.JSONDecodeError and a truncated embedding blob raises ValueError
+        # from np.frombuffer — neither is a sqlite3.Error, so nothing above
+        # catches them. Guard per-row and SKIP a bad row rather than aborting the
+        # whole load, matching record_search / record_tool_call which degrade
+        # instead of raising. A per-row skip keeps every good row loadable.
+        skipped = 0
         for row in cursor.fetchall():
-            embedding = None
-            if row["embedding"]:
-                embedding = np.frombuffer(row["embedding"], dtype=np.float32)
+            try:
+                embedding = None
+                if row["embedding"]:
+                    blob = row["embedding"]
+                    # SC-002 (indexer._cache_get): validate the blob byte length
+                    # before np.frombuffer. float32 == 4 bytes/element; a length
+                    # that is not a whole multiple of 4 is a truncated/corrupt
+                    # write and would raise ValueError.
+                    if len(blob) % 4 != 0:
+                        raise ValueError(
+                            f"corrupt embedding blob for {row['tool_name']}: "
+                            f"{len(blob)} bytes not a multiple of 4"
+                        )
+                    embedding = np.frombuffer(blob, dtype=np.float32)
 
-            schema = None
-            if row["schema_json"]:
-                schema = json.loads(row["schema_json"])
+                schema = None
+                if row["schema_json"]:
+                    schema = json.loads(row["schema_json"])
 
-            self._hot_cache[row["tool_name"]] = HotToolEntry(
-                tool_name=row["tool_name"],
-                rank=row["rank"],
-                call_count=row["call_count"],
-                embedding=embedding,
-                schema=schema,
-                description=row["description"] or "",
-                last_called_at=None,
-            )
+                self._hot_cache[row["tool_name"]] = HotToolEntry(
+                    tool_name=row["tool_name"],
+                    rank=row["rank"],
+                    call_count=row["call_count"],
+                    embedding=embedding,
+                    schema=schema,
+                    description=row["description"] or "",
+                    last_called_at=None,
+                )
+            except (json.JSONDecodeError, ValueError, TypeError, sqlite3.Error) as e:
+                # Skip the bad row; a single corrupt persisted blob must not
+                # take down the whole hot-cache load (and thus the first
+                # compass()/execute() of the process).
+                skipped += 1
+                logger.warning(
+                    f"Skipping corrupt hot_tools row "
+                    f"'{row['tool_name'] if 'tool_name' in row.keys() else '?'}': {e}"
+                )
 
-        logger.info(f"Loaded {len(self._hot_cache)} tools into hot cache from DB")
+        logger.info(
+            f"Loaded {len(self._hot_cache)} tools into hot cache from DB"
+            + (f" ({skipped} corrupt row(s) skipped)" if skipped else "")
+        )
 
     def close(self):
         """Close database connection.

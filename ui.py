@@ -1086,24 +1086,36 @@ def get_analytics_dashboard(timeframe: str = "24h") -> str:
     searches = summary["searches"]
     calls = summary["tool_calls"]
 
+    # UX-C-002: first-run empty state. On a fresh install both totals are 0,
+    # so the four "0 / 0 / 0% / 0ms" stat cards read as broken. Replace them
+    # with a centered empty-state card (same style used by Search/Chains
+    # empty states) that tells the user how to populate the dashboard.
+    if searches["total"] == 0 and calls["total"] == 0:
+        return """
+    <div style="text-align: center; padding: 40px; color: #a0a0b0;">
+        <div style="font-size: 2em; margin-bottom: 12px;" aria-hidden="true">📊</div>
+        <p style="color: #e8e8f0;">No activity recorded yet — run some searches and tool calls, then refresh to see usage analytics.</p>
+    </div>
+    """
+
     # Local var named `out` (not `html`) to avoid shadowing the html module.
     out = f"""
     <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 16px; margin-bottom: 24px;">
         <div style="background: #1a2e3a; padding: 16px; border-radius: 8px; text-align: center;">
             <div style="font-size: 2em; font-weight: bold; color: #4fc3f7;">{searches["total"]}</div>
-            <div style="color: #b0b0b0;">Searches ({timeframe})</div>
+            <div style="color: #a0a0b0;">Searches ({timeframe})</div>
         </div>
         <div style="background: #1a3a2a; padding: 16px; border-radius: 8px; text-align: center;">
             <div style="font-size: 2em; font-weight: bold; color: #81c784;">{calls["total"]}</div>
-            <div style="color: #b0b0b0;">Tool Calls</div>
+            <div style="color: #a0a0b0;">Tool Calls</div>
         </div>
         <div style="background: #3a2a1a; padding: 16px; border-radius: 8px; text-align: center;">
             <div style="font-size: 2em; font-weight: bold; color: #ffb74d;">{calls["success_rate"]}%</div>
-            <div style="color: #b0b0b0;">Success Rate</div>
+            <div style="color: #a0a0b0;">Success Rate</div>
         </div>
         <div style="background: #2a2a3a; padding: 16px; border-radius: 8px; text-align: center;">
             <div style="font-size: 2em; font-weight: bold; color: #ba68c8;">{searches["avg_latency_ms"]}ms</div>
-            <div style="color: #b0b0b0;">Avg Search Latency</div>
+            <div style="color: #a0a0b0;">Avg Search Latency</div>
         </div>
     </div>
     """
@@ -1114,19 +1126,19 @@ def get_analytics_dashboard(timeframe: str = "24h") -> str:
         <h3 style="color: #4fc3f7;">Top Tools</h3>
         <table style="width: 100%; border-collapse: collapse; margin-bottom: 24px;">
             <tr style="background: #2a2a4a;">
-                <th style="padding: 8px; text-align: left; border: 1px solid #444;">Tool</th>
-                <th style="padding: 8px; text-align: right; border: 1px solid #444;">Calls</th>
-                <th style="padding: 8px; text-align: right; border: 1px solid #444;">Success</th>
-                <th style="padding: 8px; text-align: right; border: 1px solid #444;">Latency</th>
+                <th style="padding: 8px; text-align: left; border: 1px solid #3a3a52;">Tool</th>
+                <th style="padding: 8px; text-align: right; border: 1px solid #3a3a52;">Calls</th>
+                <th style="padding: 8px; text-align: right; border: 1px solid #3a3a52;">Success</th>
+                <th style="padding: 8px; text-align: right; border: 1px solid #3a3a52;">Latency</th>
             </tr>
         """
         for t in calls["top_tools"][:10]:
             out += f"""
             <tr>
-                <td style="padding: 8px; border: 1px solid #444; color: #4fc3f7;">{html.escape(t["tool"], quote=True)}</td>
-                <td style="padding: 8px; border: 1px solid #444; text-align: right;">{t["calls"]}</td>
-                <td style="padding: 8px; border: 1px solid #444; text-align: right; color: {"#81c784" if t["success_rate"] > 90 else "#ffb74d"};">{t["success_rate"]}%</td>
-                <td style="padding: 8px; border: 1px solid #444; text-align: right; color: #b0b0b0;">{t["avg_latency_ms"]}ms</td>
+                <td style="padding: 8px; border: 1px solid #3a3a52; color: #4fc3f7;">{html.escape(t["tool"], quote=True)}</td>
+                <td style="padding: 8px; border: 1px solid #3a3a52; text-align: right;">{t["calls"]}</td>
+                <td style="padding: 8px; border: 1px solid #3a3a52; text-align: right; color: {"#81c784" if t["success_rate"] > 90 else "#ffb74d"};">{t["success_rate"]}%</td>
+                <td style="padding: 8px; border: 1px solid #3a3a52; text-align: right; color: #a0a0b0;">{t["avg_latency_ms"]}ms</td>
             </tr>
             """
         out += "</table>"
@@ -1135,17 +1147,17 @@ def get_analytics_dashboard(timeframe: str = "24h") -> str:
     if searches["top_queries"]:
         out += """
         <h3 style="color: #81c784;">Top Queries</h3>
-        <ul style="color: #d4d4d4;">
+        <ul style="color: #e8e8f0;">
         """
         for q in searches["top_queries"][:10]:
-            out += f'<li>"{html.escape(q["query"], quote=True)}" <span style="color: #b0b0b0;">({q["count"]} times)</span></li>'
+            out += f'<li>"{html.escape(q["query"], quote=True)}" <span style="color: #a0a0b0;">({q["count"]} times)</span></li>'
         out += "</ul>"
 
     # Failures
     if summary.get("failures"):
         out += """
         <h3 style="color: #ef5350;">Recent Failures</h3>
-        <ul style="color: #d4d4d4;">
+        <ul style="color: #e8e8f0;">
         """
         for f in summary["failures"][:5]:
             out += f'<li style="color: #ef5350;">{html.escape(f["tool"], quote=True)}: {html.escape(f["error"] or "Unknown error", quote=True)} ({f["count"]}x)</li>'
@@ -1156,7 +1168,7 @@ def get_analytics_dashboard(timeframe: str = "24h") -> str:
     if hot_cache.get("tools"):
         out += f"""
         <h3 style="color: #ba68c8;">Hot Cache ({hot_cache["size"]} tools)</h3>
-        <p style="color: #b0b0b0; font-family: monospace;">{html.escape(", ".join(hot_cache["tools"]), quote=True)}</p>
+        <p style="color: #a0a0b0; font-family: monospace;">{html.escape(", ".join(hot_cache["tools"]), quote=True)}</p>
         """
 
     return out
@@ -1173,7 +1185,7 @@ def get_chains_view() -> str:
     if not chain_indexer:
         return """
         <div style="text-align: center; padding: 40px; color: #b0b0b0;">
-            <div style="font-size: 2em; margin-bottom: 12px;">⚙️</div>
+            <div style="font-size: 2em; margin-bottom: 12px;" aria-hidden="true">⚙️</div>
             <p style="color: #ffb74d;">Chain indexing is disabled in configuration.</p>
             <p style="font-size: 0.9em;">Enable <code>chain_indexing_enabled</code> in compass_config.json to use workflows.</p>
         </div>
@@ -1192,7 +1204,7 @@ def get_chains_view() -> str:
     if not chains:
         return """
         <div style="text-align: center; padding: 40px; color: #b0b0b0;">
-            <div style="font-size: 2em; margin-bottom: 12px;">🔗</div>
+            <div style="font-size: 2em; margin-bottom: 12px;" aria-hidden="true">🔗</div>
             <p>No workflows defined yet.</p>
             <p style="font-size: 0.9em; color: #b0b0b0;">Workflows are auto-detected from usage patterns.</p>
             <p style="font-size: 0.9em; color: #b0b0b0;">Use tools together to create workflows.</p>
@@ -1219,17 +1231,20 @@ def get_chains_view() -> str:
         safe_flow_short = html.escape(truncate_text(tool_flow, 80), quote=True)
         safe_desc = html.escape(truncate_text(chain.description or "", 120), quote=True)
 
+        # UX-D-004: card palette aligned to the refreshed tonal ladder
+        # (SD-V-002/004) — border #3a3a52, background #22223e, primary body
+        # #e8e8f0, secondary grey #a0a0b0 — so Chains cards match Search/Browser.
         html_parts.append(f"""
-        <div style="border: 1px solid #444; border-radius: 8px; padding: 16px; margin: 12px 0; background: #1a2e1a;">
+        <div style="border: 1px solid #3a3a52; border-radius: 8px; padding: 16px; margin: 12px 0; background: #22223e;">
             <div style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 8px;">
                 <span style="font-size: 1.2em; font-weight: bold; color: #81c784;" title="{safe_chain_name}">{safe_chain_name_short}</span>
-                <span style="color: #b0b0b0; font-size: 0.9em;">{badge}</span>
+                <span style="color: #a0a0b0; font-size: 0.9em;">{badge}</span>
             </div>
             <div style="font-family: monospace; color: #4fc3f7; margin: 12px 0; font-size: 1.1em;" title="{safe_flow}">
                 {safe_flow_short}
             </div>
-            <p style="color: #d4d4d4; margin: 8px 0;">{safe_desc}</p>
-            <div style="color: #b0b0b0; font-size: 0.9em;">
+            <p style="color: #e8e8f0; margin: 8px 0;">{safe_desc}</p>
+            <div style="color: #a0a0b0; font-size: 0.9em;">
                 Used {chain.use_count} time{"s" if chain.use_count != 1 else ""}
             </div>
         </div>
@@ -1318,14 +1333,14 @@ def get_system_status() -> str:
     <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 24px;">
         <div>
             <h3 style="color: #4fc3f7;">System Health</h3>
-            <ul style="color: #d4d4d4; list-style: none; padding-left: 0;">
+            <ul style="color: #e8e8f0; list-style: none; padding-left: 0;">
                 <li style="margin: 8px 0;">Index: {index_status}</li>
                 <li style="margin: 8px 0;">Analytics: {analytics_status}</li>
                 <li style="margin: 8px 0;">Ollama: {ollama_status}</li>
             </ul>
 
             <h3 style="color: #4fc3f7;">Index Status</h3>
-            <ul style="color: #d4d4d4;">
+            <ul style="color: #e8e8f0;">
                 <li>Total tools: <strong>{stats.get("total_tools", 0)}</strong></li>
                 <li>Core tools: {stats.get("core_tools", 0)}</li>
                 <li>Index path: <code style="font-size: 0.85em;">{truncate_text(index_path, 40)}</code></li>
@@ -1335,31 +1350,31 @@ def get_system_status() -> str:
     """
 
     if stats.get("by_server"):
-        out += "<ul style='color: #d4d4d4;'>"
+        out += "<ul style='color: #e8e8f0;'>"
         for server, count in sorted(stats.get("by_server", {}).items()):
             safe_server = html.escape(str(server), quote=True)
             out += f"<li>{safe_server}: {count}</li>"
         out += "</ul>"
     else:
-        out += "<p style='color: #b0b0b0; font-style: italic;'>No data</p>"
+        out += "<p style='color: #a0a0b0; font-style: italic;'>No data</p>"
 
     out += "<h4 style='color: #81c784;'>By Category</h4>"
 
     if stats.get("by_category"):
-        out += "<ul style='color: #d4d4d4;'>"
+        out += "<ul style='color: #e8e8f0;'>"
         for category, count in sorted(stats.get("by_category", {}).items()):
             safe_category = html.escape(str(category), quote=True)
             out += f"<li>{safe_category}: {count}</li>"
         out += "</ul>"
     else:
-        out += "<p style='color: #b0b0b0; font-style: italic;'>No data</p>"
+        out += "<p style='color: #a0a0b0; font-style: italic;'>No data</p>"
 
     out += f"""
         </div>
 
         <div>
             <h3 style="color: #4fc3f7;">Configuration</h3>
-            <ul style="color: #d4d4d4;">
+            <ul style="color: #e8e8f0;">
                 <li>Progressive disclosure: {"✅" if _config.progressive_disclosure else "❌"}</li>
                 <li>Auto sync: {"✅" if _config.auto_sync else "❌"}</li>
                 <li>Analytics: {"✅" if _config.analytics_enabled else "❌"}</li>
@@ -1369,7 +1384,7 @@ def get_system_status() -> str:
             </ul>
 
             <h3 style="color: #4fc3f7;">Backends ({len(_config.backends)})</h3>
-            <ul style="color: #d4d4d4;">
+            <ul style="color: #e8e8f0;">
     """
 
     for name in _config.backends.keys():
@@ -1380,7 +1395,7 @@ def get_system_status() -> str:
             </ul>
 
             <h3 style="color: #4fc3f7;">Quick Commands</h3>
-            <div style="font-size: 0.9em; color: #b0b0b0;">
+            <div style="font-size: 0.9em; color: #a0a0b0;">
                 <p style="margin: 4px 0;"><code>tool-compass sync</code> &mdash; Rebuild index</p>
                 <p style="margin: 4px 0;"><code>tool-compass doctor</code> &mdash; Print diagnostic info</p>
                 <p style="margin: 4px 0;"><code>ollama serve</code> &mdash; Start Ollama</p>
@@ -1481,7 +1496,10 @@ def create_ui() -> gr.Blocks:
                     "Re-check Ollama", size="sm", variant="secondary"
                 )
                 refresh_status_btn.click(
-                    fn=_check_ollama_banner, inputs=[], outputs=[ollama_banner]
+                    fn=_check_ollama_banner,
+                    inputs=[],
+                    outputs=[ollama_banner],
+                    show_progress="minimal",
                 )
 
                 with gr.Row():
@@ -1567,7 +1585,7 @@ def create_ui() -> gr.Blocks:
                 chain_results = gr.HTML(
                     value="""
                     <div style="text-align: center; padding: 40px; color: #b0b0b0;">
-                        <div style="font-size: 2em; margin-bottom: 12px;">🔗</div>
+                        <div style="font-size: 2em; margin-bottom: 12px;" aria-hidden="true">🔗</div>
                         <p>Enter a query to search for workflows.</p>
                         <p style="font-size: 0.9em;">Try: "modify a file", "commit changes", "generate and save image"</p>
                     </div>
@@ -1647,7 +1665,7 @@ def create_ui() -> gr.Blocks:
                 tool_details = gr.HTML(
                     value="""
                     <div style="text-align: center; padding: 40px; color: #b0b0b0;">
-                        <div style="font-size: 2em; margin-bottom: 12px;">🔎</div>
+                        <div style="font-size: 2em; margin-bottom: 12px;" aria-hidden="true">🔎</div>
                         <p>Enter a tool name to view details.</p>
                         <p style="font-size: 0.9em;">Or click on a tool from the browser above.</p>
                     </div>
@@ -1686,6 +1704,7 @@ def create_ui() -> gr.Blocks:
                     fn=get_analytics_dashboard,
                     inputs=[timeframe],
                     outputs=[analytics_html],
+                    show_progress="minimal",
                 )
 
             # =================================================================
@@ -1699,7 +1718,12 @@ def create_ui() -> gr.Blocks:
                 chains_btn = gr.Button("Refresh Workflows", variant="primary")
                 chains_html = gr.HTML(value=get_chains_view())
 
-                chains_btn.click(fn=get_chains_view, inputs=[], outputs=[chains_html])
+                chains_btn.click(
+                    fn=get_chains_view,
+                    inputs=[],
+                    outputs=[chains_html],
+                    show_progress="minimal",
+                )
 
             # =================================================================
             # STATUS TAB
@@ -1710,7 +1734,12 @@ def create_ui() -> gr.Blocks:
                 status_btn = gr.Button("Refresh Status", variant="primary")
                 status_html = gr.HTML(value=get_system_status())
 
-                status_btn.click(fn=get_system_status, inputs=[], outputs=[status_html])
+                status_btn.click(
+                    fn=get_system_status,
+                    inputs=[],
+                    outputs=[status_html],
+                    show_progress="minimal",
+                )
 
         # VIS-D-003: footer grey lifted to #b4b4c4 — #a0a0a0 on the #1a1a2e
         # surface is only ~4.0:1, which clears AA for large text (3:1) but NOT
@@ -1943,7 +1972,7 @@ def main():
         ):
             print(
                 f"Port {args.port} is already in use. Try:\n"
-                f"  python ui.py --port {args.port + 1}\n"
+                f"  tool-compass ui --port {args.port + 1}\n"
                 f"Or free the port and retry.",
                 file=sys.stderr,
             )

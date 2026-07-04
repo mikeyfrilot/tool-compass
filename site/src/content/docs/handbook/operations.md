@@ -152,8 +152,9 @@ The embedding model likely changed. Delete db/compass.hnsw and run
 The published image supports multi-arch:
 
 ```bash
-docker pull ghcr.io/mcp-tool-shop-org/tool-compass:v2.2.0
+docker pull ghcr.io/mcp-tool-shop-org/tool-compass:latest
 # linux/amd64 + linux/arm64 from the same tag
+# (pin a specific release instead of :latest for reproducible deploys, e.g. :v2.5.0)
 ```
 
 Same tag runs on x86_64 servers and Apple Silicon / ARM workstations

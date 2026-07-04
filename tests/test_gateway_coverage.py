@@ -985,6 +985,66 @@ class TestCompassStatusErrorBlocks:
         assert result["health"]["degraded_mode"] is True
         assert result["health"]["last_ollama_error"] == "test error"
 
+    @pytest.mark.asyncio
+    async def test_status_surfaces_analytics_degraded_flag(
+        self, test_index, test_config_with_backends
+    ):
+        """PC-B-003: when analytics is degraded, compass_status()'s health block
+        surfaces analytics_degraded=True (previously only readable via the
+        out-of-process config.doctor())."""
+        import gateway
+
+        gateway._compass_index = test_index
+        gateway._config = test_config_with_backends
+        gateway._config.analytics_enabled = True
+        mgr = Mock()
+        mgr.get_stats = Mock(return_value={})
+        gateway._backend_manager = mgr
+
+        analytics = Mock()
+        analytics._hot_cache = {}
+        analytics.get_health = Mock(
+            return_value={"degraded": True, "reason": "sqlite write failure"}
+        )
+
+        with patch(
+            "gateway.get_analytics_instance", AsyncMock(return_value=analytics)
+        ):
+            from gateway import compass_status
+
+            result = await compass_status()
+
+        assert result["health"]["analytics_degraded"] is True
+        assert result["health"]["analytics_degraded_reason"] == "sqlite write failure"
+
+    @pytest.mark.asyncio
+    async def test_status_surfaces_analytics_healthy_flag(
+        self, test_index, test_config_with_backends
+    ):
+        """PC-B-003: a healthy analytics reports analytics_degraded=False."""
+        import gateway
+
+        gateway._compass_index = test_index
+        gateway._config = test_config_with_backends
+        gateway._config.analytics_enabled = True
+        mgr = Mock()
+        mgr.get_stats = Mock(return_value={})
+        gateway._backend_manager = mgr
+
+        analytics = Mock()
+        analytics._hot_cache = {}
+        analytics.get_health = Mock(return_value={"degraded": False, "reason": None})
+
+        with patch(
+            "gateway.get_analytics_instance", AsyncMock(return_value=analytics)
+        ):
+            from gateway import compass_status
+
+            result = await compass_status()
+
+        assert result["health"]["analytics_degraded"] is False
+        assert result["health"]["analytics_degraded_reason"] is None
+
 
 # =============================================================================
 # compass_audit() — per-block exception paths

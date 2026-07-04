@@ -9,6 +9,7 @@ import threading
 from datetime import datetime, timedelta, timezone
 from unittest.mock import patch
 
+import numpy as np
 import pytest
 
 from analytics import HotToolEntry
@@ -455,6 +456,54 @@ class TestPersistence:
         entry = test_analytics._hot_cache["test:persistent_tool"]
         assert entry.tool_name == "test:persistent_tool"
         assert entry.call_count == 5
+
+    @pytest.mark.asyncio
+    async def test_load_hot_cache_skips_corrupt_rows(self, test_analytics):
+        """PC-B-001: a corrupt schema_json or truncated embedding blob in
+        hot_tools must NOT raise out of load_hot_cache_from_db().
+
+        load_hot_cache_from_db runs on the mandatory init path (awaited
+        unconditionally inside get_analytics_instance(), which compass() and
+        execute() call unwrapped). Before the fix it called json.loads /
+        np.frombuffer directly on persisted blobs, so one corrupt row raised a
+        raw JSONDecodeError / ValueError through the MCP envelope. It must
+        degrade to "skip the bad row" and still load the good rows, mirroring
+        record_search / record_tool_call.
+        """
+        db = test_analytics._get_db()
+
+        # A well-formed good row that must survive.
+        good_vec = np.arange(4, dtype=np.float32).tobytes()
+        # A row with corrupt (non-JSON) schema_json → json.JSONDecodeError.
+        # A row with a truncated embedding blob (not a multiple of 4 bytes)
+        # → ValueError from np.frombuffer.
+        with test_analytics._lock:
+            db.execute(
+                "INSERT INTO hot_tools (tool_name, rank, call_count, embedding, schema_json, description) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                ("test:good", 0, 3, good_vec, '{"ok": true}', "good tool"),
+            )
+            db.execute(
+                "INSERT INTO hot_tools (tool_name, rank, call_count, embedding, schema_json, description) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                ("test:bad_schema", 1, 2, None, "{not valid json", "bad schema"),
+            )
+            db.execute(
+                "INSERT INTO hot_tools (tool_name, rank, call_count, embedding, schema_json, description) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                ("test:bad_embedding", 2, 1, b"\x01\x02\x03", None, "bad embedding"),
+            )
+            db.commit()
+
+        test_analytics._hot_cache.clear()
+
+        # Must NOT raise despite the two corrupt rows.
+        await test_analytics.load_hot_cache_from_db()
+
+        # Good row is still loaded; corrupt rows are skipped, not fatal.
+        assert "test:good" in test_analytics._hot_cache
+        assert "test:bad_schema" not in test_analytics._hot_cache
+        assert "test:bad_embedding" not in test_analytics._hot_cache
 
     def test_close(self, test_analytics):
         """Should close database connection cleanly."""

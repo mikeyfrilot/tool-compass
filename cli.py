@@ -619,6 +619,20 @@ def _cmd_search(args: argparse.Namespace) -> int:
     err_console = _make_console(stderr=True, no_color_flag=_no_color(args))
     out_console = _make_console(no_color_flag=_no_color(args))
 
+    # cli-ux-01: --top help promises "1-10 valid" but the value was passed
+    # straight to index.search(top_k=...) / _lexical_search_fallback with no
+    # guard. `--top 0` silently rendered a misleading "No tools matched"; huge
+    # or negative values slipped through too. Reject out-of-range early (before
+    # the index is even loaded) so --help stays truthful. Exit code 2 mirrors
+    # argparse's own usage-error convention for bad CLI input.
+    if not 1 <= args.top <= 10:
+        return _print_error(
+            err_console,
+            f"--top must be between 1 and 10, got {args.top}.",
+            hint="Try --top 5.",
+            exit_code=2,
+        )
+
     index = _load_index()
     if index is None:
         return _print_error(
@@ -1707,7 +1721,8 @@ def _cmd_analytics(args: argparse.Namespace) -> int:
     # sorted shape. The gateway's exact shape can vary by analytics build, so
     # we fall back to `_dump_json` rendering if the expected keys are absent.
     top_tools = payload.get("top_tools") or payload.get("hot_tools") or []
-    if isinstance(top_tools, list) and top_tools:
+    rendered_top = isinstance(top_tools, list) and bool(top_tools)
+    if rendered_top:
         out_console.print(f"  [{_C_DIM}]top tools:[/{_C_DIM}]")
         for entry in top_tools[:10]:
             if isinstance(entry, dict):
@@ -1720,10 +1735,23 @@ def _cmd_analytics(args: argparse.Namespace) -> int:
     if summary:
         total = summary.get("total_calls", 0)
         out_console.print(f"  [{_C_DIM}]total calls:[/{_C_DIM}] {total}")
+    # cli-ux-03: with analytics enabled but nothing logged yet (empty top_tools
+    # AND empty summary — the normal state right after `sync`), the command
+    # otherwise prints only the header, which reads as broken. Emit a dim
+    # empty-state line mirroring the search/chains empty-state guidance.
+    if not rendered_top and not summary:
+        _print_dim(
+            out_console,
+            f"  (no usage recorded in the last {args.timeframe} — analytics is "
+            "enabled and waiting for tool calls)",
+        )
     if include_failures:
         failures = payload.get("failures") or []
         if failures:
             _print_warn(err_console, f"{len(failures)} failure(s) recorded in window")
+    # cli-ux-02: emit the cold-install "run sync first" hint when the index DB
+    # is absent, uniform with status/categories/audit/chains.
+    _maybe_suggest_sync(err_console)
     return 0
 
 
@@ -1764,6 +1792,7 @@ def _cmd_chains(args: argparse.Namespace) -> int:
         )
         if not chains:
             out_console.print(f"  [{_C_DIM}](no chains detected yet)[/{_C_DIM}]")
+            _maybe_suggest_sync(err_console)
             return 0
         for c in chains:
             name = c.get("name", "?")
@@ -1790,6 +1819,9 @@ def _cmd_chains(args: argparse.Namespace) -> int:
                 )
             else:
                 out_console.print(f"  {c}")
+    # cli-ux-02: emit the cold-install "run sync first" hint when the index DB
+    # is absent, uniform with status/categories/audit/analytics.
+    _maybe_suggest_sync(err_console)
     return 0
 
 

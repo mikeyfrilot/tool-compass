@@ -1243,6 +1243,28 @@ class TestGetAnalyticsDashboard:
         assert "test:bad" in out
 
     def test_empty_summary_skips_optional_sections(self):
+        # UX-C-002: use nonzero totals so this exercises the "has activity but
+        # no optional sections" path, distinct from the all-zero empty state.
+        fake = MagicMock()
+
+        async def fake_summary(timeframe):
+            return {
+                "searches": {"total": 3, "avg_latency_ms": 0, "top_queries": []},
+                "tool_calls": {"total": 0, "success_rate": 0, "top_tools": []},
+            }
+
+        fake.get_analytics_summary = fake_summary
+        with patch.object(ui, "get_analytics_instance", return_value=fake):
+            out = ui.get_analytics_dashboard("1h")
+        assert "Top Tools" not in out
+        assert "Top Queries" not in out
+        assert "Recent Failures" not in out
+        # Normal stat cards still render when there is activity.
+        assert "Searches (1h)" in out
+
+    def test_all_zero_shows_first_run_empty_state(self):
+        # UX-C-002: fresh install (no searches AND no tool calls) shows a
+        # guidance card instead of "0 / 0 / 0% / 0ms" stat tiles.
         fake = MagicMock()
 
         async def fake_summary(timeframe):
@@ -1253,10 +1275,30 @@ class TestGetAnalyticsDashboard:
 
         fake.get_analytics_summary = fake_summary
         with patch.object(ui, "get_analytics_instance", return_value=fake):
-            out = ui.get_analytics_dashboard("1h")
-        assert "Top Tools" not in out
-        assert "Top Queries" not in out
-        assert "Recent Failures" not in out
+            out = ui.get_analytics_dashboard("24h")
+        assert "No activity recorded yet" in out
+        # The zero-value stat tiles must NOT render in the empty state.
+        assert "Searches (24h)" not in out
+        assert "Success Rate" not in out
+        # Decorative emoji is aria-hidden (UX-C-003 pattern).
+        assert 'aria-hidden="true"' in out
+
+    def test_only_searches_renders_normal_cards(self):
+        # UX-C-002: the empty state gates on BOTH totals being zero. If there
+        # is any search activity, the normal dashboard renders.
+        fake = MagicMock()
+
+        async def fake_summary(timeframe):
+            return {
+                "searches": {"total": 1, "avg_latency_ms": 5, "top_queries": []},
+                "tool_calls": {"total": 0, "success_rate": 0, "top_tools": []},
+            }
+
+        fake.get_analytics_summary = fake_summary
+        with patch.object(ui, "get_analytics_instance", return_value=fake):
+            out = ui.get_analytics_dashboard("24h")
+        assert "No activity recorded yet" not in out
+        assert "Searches (24h)" in out
 
     def test_query_in_top_queries_is_escaped(self):
         fake = MagicMock()
@@ -1293,6 +1335,8 @@ class TestGetChainsView:
         with patch.object(ui, "get_chain_indexer_instance", return_value=None):
             out = ui.get_chains_view()
         assert "Chain indexing is disabled" in out
+        # UX-C-003: decorative emoji in the disabled empty state is aria-hidden.
+        assert 'aria-hidden="true"' in out
 
     def test_empty_chains_renders_help_text(self):
         fake_ci = MagicMock()
@@ -1304,6 +1348,8 @@ class TestGetChainsView:
         with patch.object(ui, "get_chain_indexer_instance", return_value=fake_ci):
             out = ui.get_chains_view()
         assert "No workflows defined yet" in out
+        # UX-C-003: decorative emoji in the no-workflows empty state is aria-hidden.
+        assert 'aria-hidden="true"' in out
 
     def test_chains_rendered(self):
         fake_ci = MagicMock()
@@ -1333,6 +1379,11 @@ class TestGetChainsView:
         assert "flow-2" in out
         assert "Auto-detected" in out
         assert "Manual" in out
+        # UX-D-004: chain cards use the refreshed tonal ladder — card base
+        # #22223e + border #3a3a52 — matching Search/Browser (no stale #444).
+        assert "background: #22223e" in out
+        assert "border: 1px solid #3a3a52" in out
+        assert "#444" not in out
 
     def test_load_failure_renders_error(self):
         fake_ci = MagicMock()
