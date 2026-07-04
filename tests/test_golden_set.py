@@ -50,6 +50,7 @@ from pathlib import Path
 import pytest
 import yaml
 
+from config import CompassConfig
 from indexer import CompassIndex
 from tests.golden_set.deterministic_embedder import (
     build_deterministic_embedder,
@@ -231,3 +232,157 @@ class TestGoldenSetRetrieval:
         for k in (1, 3, 5, 10):
             results = await golden_index.search("read a file", top_k=k)
             assert len(results) <= k, f"top_k={k}, got {len(results)} results"
+
+
+# -----------------------------------------------------------------------------
+# GW-DISC-002 (DEFECT 2) — the FUSED (shipped-default) compass() ranking path
+# -----------------------------------------------------------------------------
+# The benchmark above calls golden_index.search() directly — the pure-semantic
+# path. But hybrid_search + exact_name_boost both DEFAULT True, so production
+# actually serves the FUSED compass() ranking (RRF fusion + exact-name boost).
+# Without exercising that path, a ranking regression on the actually-served
+# path passes CI. These tests drive compass() end-to-end over the golden corpus
+# with the default (fusion+boost ON) config and assert the same floors, so a
+# fused-path regression fails CI. Floors are pinned at the pure-semantic floors
+# — fusion must never regress the served path below what pure semantics clears.
+
+
+def _mrr(expected: list[str], retrieved: list[str]) -> float:
+    """Reciprocal rank of the first relevant hit (Karpukhin et al. 2020 / DPR
+    canonical dense-retrieval metric). 0.0 if no expected tool retrieved."""
+    exp = set(expected)
+    for i, name in enumerate(retrieved):
+        if name in exp:
+            return 1.0 / (i + 1)
+    return 0.0
+
+
+@pytest.fixture
+async def fused_gateway(golden_index):
+    """Wire gateway module globals to the golden index with the DEFAULT
+    (shipped) fusion+boost config, then restore via the autouse
+    _reset_gateway_globals fixture in conftest.py."""
+    import gateway
+
+    cfg = CompassConfig(
+        backends={},
+        auto_sync=False,
+        analytics_enabled=False,
+        chain_indexing_enabled=False,
+        progressive_disclosure=True,
+        min_confidence=0.3,
+    )
+    # Assert we are exercising the SHIPPED defaults, not a hand-tuned config.
+    assert cfg.hybrid_search is True
+    assert cfg.exact_name_boost is True
+
+    gateway._compass_index = golden_index
+    gateway._config = cfg
+    gateway._startup_sync_done = True
+    gateway._analytics = None
+    gateway._health_state["ollama_available"] = True
+    gateway._health_state["index_available"] = True
+    return gateway
+
+
+async def _fused_retrieved(query: str, k: int = 5) -> list[str]:
+    """Run the FUSED compass() path and return the ordered tool names."""
+    from gateway import compass
+
+    result = await compass(intent=query, top_k=k, include_chains=False)
+    return [m["tool"] for m in result["matches"]]
+
+
+@pytest.mark.golden
+# The deterministic golden embedder is an AsyncMock; compass()'s health-probe
+# surface touches an unconfigured async attribute on it, leaking a harmless
+# "coroutine never awaited" RuntimeWarning. That is a property of the test
+# double, not production code (the real embedder is not a mock), so scope-ignore
+# it here rather than let it add noise to the suite.
+@pytest.mark.filterwarnings("ignore::RuntimeWarning")
+class TestGoldenSetFusedPathDISC02:
+    """DEFECT 2: the fused (RRF fusion + exact-name boost) compass() path — the
+    one production actually serves — has its own golden-benchmark coverage.
+
+    Floors are set AT the pure-semantic floors (Recall@5>=0.80, nDCG@5>=0.70,
+    Hit@5>=0.85) plus an MRR floor. Fusion currently clears them with margin
+    (Recall/Hit ~0.95, nDCG ~0.87, MRR ~0.85); pinning at the semantic floor
+    means a fusion regression that drops the SERVED path below the pure-semantic
+    quality bar fails CI, while day-to-day fusion noise does not flake.
+    """
+
+    @pytest.mark.asyncio
+    async def test_fused_recall_at_5_meets_floor(self, fused_gateway):
+        queries = _load_queries()
+        recalls: list[float] = []
+        misses: list[str] = []
+        for q in queries:
+            retrieved = await _fused_retrieved(q["query"], 5)
+            r = _recall_at_k(q["expected"], retrieved, 5)
+            recalls.append(r)
+            if r < 1.0:
+                misses.append(
+                    f"  {q['query']!r}\n"
+                    f"    expected: {q['expected']}\n"
+                    f"    got:      {retrieved}"
+                )
+        avg_recall = sum(recalls) / len(recalls)
+        assert avg_recall >= 0.80, (
+            f"FUSED Recall@5 = {avg_recall:.3f} < 0.80 floor (fusion regressed "
+            f"the served path below the pure-semantic bar). Misses:\n"
+            + "\n".join(misses)
+        )
+
+    @pytest.mark.asyncio
+    async def test_fused_ndcg_at_5_meets_floor(self, fused_gateway):
+        queries = _load_queries()
+        ndcgs: list[float] = []
+        for q in queries:
+            retrieved = await _fused_retrieved(q["query"], 5)
+            ndcgs.append(_ndcg_at_k(q["expected"], retrieved, 5))
+        avg_ndcg = sum(ndcgs) / len(ndcgs)
+        assert avg_ndcg >= 0.70, f"FUSED nDCG@5 = {avg_ndcg:.3f} < 0.70 floor"
+
+    @pytest.mark.asyncio
+    async def test_fused_hit_rate_at_5_meets_floor(self, fused_gateway):
+        queries = _load_queries()
+        hits = 0
+        for q in queries:
+            retrieved = set(await _fused_retrieved(q["query"], 5))
+            if any(e in retrieved for e in q["expected"]):
+                hits += 1
+        hit_rate = hits / len(queries)
+        assert hit_rate >= 0.85, f"FUSED Hit@5 = {hit_rate:.3f} < 0.85 floor"
+
+    @pytest.mark.asyncio
+    async def test_fused_mrr_meets_floor(self, fused_gateway):
+        """MRR rewards correct TOP placement — the metric most sensitive to a
+        fusion/boost reorder regression on the served path."""
+        queries = _load_queries()
+        rrs = [
+            _mrr(q["expected"], await _fused_retrieved(q["query"], 5))
+            for q in queries
+        ]
+        avg_mrr = sum(rrs) / len(rrs)
+        assert avg_mrr >= 0.75, f"FUSED MRR = {avg_mrr:.3f} < 0.75 floor"
+
+    @pytest.mark.asyncio
+    async def test_fused_exact_name_paste_pins_tool_at_top(self, fused_gateway):
+        """The exact-name boost (default ON) must pin an exact tool-name paste
+        to rank #1 at exact_match_confidence on the served path — a behavior the
+        pure-semantic tests never exercise. The confidence assertion is the
+        boost-specific signal: with the boost OFF the top match would carry its
+        raw semantic score (~0.77), not the stamped 1.0."""
+        from gateway import compass
+
+        result = await compass(intent="git:commit", top_k=5, include_chains=False)
+        matches = result["matches"]
+        assert matches, "expected the boosted exact match"
+        assert matches[0]["tool"] == "git:commit", (
+            "exact-name paste must pin the tool at #1 on the fused path; got "
+            + str([m["tool"] for m in matches])
+        )
+        # exact_match_confidence default is 1.0 — the boost stamp, not a
+        # semantic score. This distinguishes the boost from pure semantics.
+        assert matches[0]["confidence"] == fused_gateway._config.exact_match_confidence
+        assert matches[0]["confidence"] == 1.0

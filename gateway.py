@@ -875,11 +875,21 @@ _RRF_K = 60
 
 
 def _exact_name_boost_lookup(
-    index: "CompassIndex", intent: str
+    index: "CompassIndex",
+    intent: str,
+    category: Optional[str] = None,
+    server: Optional[str] = None,
 ) -> Optional[Dict[str, Any]]:
     """DISC-02: probe the tools table for a row whose name exactly matches the
     intent (case-insensitively), matching either the full ``server:tool``
     qualified name OR a bare tool name against the ``server:tool`` suffix.
+
+    GW-DISC-002: the ACTIVE category/server filters are applied to this probe
+    exactly as index.search() applies them (indexer.py:816-819) — each clause
+    is added only when that filter is set. Without this, a boosted exact-name
+    hit that the category/server filter would have excluded gets resurrected at
+    rank #1, silently bypassing the filter the caller asked for. A tool that
+    fails the active filters must NEVER be a boost candidate.
 
     Single indexed lookup via ``idx_tools_name``. Returns a response-shaped
     match dict (``tool``/``description``/``server``/``category``) WITHOUT a
@@ -891,13 +901,24 @@ def _exact_name_boost_lookup(
     probe = (intent or "").strip()
     if not probe:
         return None
+    where = [
+        "(lower(name)=lower(?) "
+        "OR lower(substr(name, instr(name,':')+1))=lower(?))"
+    ]
+    params: List[Any] = [probe, probe]
+    # Mirror indexer.py:816-819 — apply each filter only when it is set.
+    if category:
+        where.append("category = ?")
+        params.append(category)
+    if server:
+        where.append("server = ?")
+        params.append(server)
+    sql = (
+        "SELECT name, description, category, server FROM tools "
+        "WHERE " + " AND ".join(where) + " LIMIT 1"
+    )
     try:
-        row = index.db.execute(
-            "SELECT name, description, category, server FROM tools "
-            "WHERE lower(name)=lower(?) "
-            "OR lower(substr(name, instr(name,':')+1))=lower(?) LIMIT 1",
-            (probe, probe),
-        ).fetchone()
+        row = index.db.execute(sql, params).fetchone()
     except sqlite3.Error as e:
         logger.warning(
             f"[compass] exact-name boost probe failed "
@@ -936,8 +957,17 @@ def _rrf_fuse(
 
     The lexical list's job is to LIFT a lexically-obvious tool that semantics
     buried mid-rank — which by definition is still in the semantic candidate
-    set. Ties break on the original semantic rank, so when the lexical list
-    adds no signal the output is exactly the pure-semantic ordering.
+    set. Ties break on the original semantic rank.
+
+    GW-DISC-003: a NON-EMPTY lexical list CAN reorder the semantic top — this
+    is standard RRF-by-rank behavior, not a bug. A lexical hit on a
+    lower-ranked semantic candidate raises that candidate's fused score, and if
+    that lift exceeds the semantic #1's score the lists disagree at the top and
+    the lower candidate is promoted above the semantic #1. The pure-semantic
+    ordering is therefore preserved ONLY when the lexical list is EMPTY (no rank
+    signal to add at all) — NOT merely when its top happens to differ from the
+    semantic top. Callers that need the semantic ordering untouched must pass an
+    empty lexical list (or leave hybrid_search off).
     """
     scores: Dict[str, float] = defaultdict(float)
     semantic_rank: Dict[str, int] = {}
@@ -1275,7 +1305,10 @@ async def compass(
         # the rest, and counted as one of top_k. Applied AFTER fusion so the
         # exact hit always stays pinned regardless of RRF ordering.
         if config.exact_name_boost:
-            exact = _exact_name_boost_lookup(index, intent)
+            # GW-DISC-002: pass the active filters so the boost respects the
+            # same category/server gate index.search() already applied — a tool
+            # outside the filter must never be resurrected at rank #1.
+            exact = _exact_name_boost_lookup(index, intent, category, server)
             if exact is not None:
                 exact_name = exact["tool"]
                 boosted = dict(exact)

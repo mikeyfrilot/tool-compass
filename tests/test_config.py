@@ -1149,6 +1149,89 @@ class TestGatewayAuthToken:
         assert config.gateway_auth_token == "file-token"
 
 
+class TestBackendNameColonRejected:
+    """BR-A-018: a backend NAME containing ':' makes the ``backend:tool``
+    qualified-name scheme ambiguous. ``qualified_name.split(":", 1)`` in the
+    router, the sync_manager policy check (``_tool_allowed``), and the gateway
+    policy check (``_tool_denied_by_policy``) all resolve the WRONG backend for
+    a name like ``grp:svc``: the qualified name ``grp:svc:tool`` mis-splits to
+    server ``grp``, no config is found, and the FEAT-06 allow/deny policy FAILS
+    OPEN — a denied tool gets indexed AND executed while the index-aware router
+    still routes to the real backend. Reject the ambiguous name at config load
+    (fail-closed) so the hole is closed at the source rather than papered over
+    downstream.
+    """
+
+    def test_colon_in_stdio_backend_name_rejected(self):
+        """A stdio backend whose name contains ':' raises a clear error."""
+        import pytest
+
+        with pytest.raises(ValueError, match=r"contains ':'"):
+            CompassConfig.from_dict(
+                {
+                    "backends": {
+                        "grp:svc": {"type": "stdio", "command": "python"}
+                    }
+                }
+            )
+
+    def test_colon_in_http_backend_name_rejected(self):
+        """The check triggers for http backends too."""
+        import pytest
+
+        with pytest.raises(ValueError, match=r"contains ':'"):
+            CompassConfig.from_dict(
+                {
+                    "backends": {
+                        "github:org": {"type": "http", "url": "http://x:1"}
+                    }
+                }
+            )
+
+    def test_colon_in_import_backend_name_rejected(self):
+        """The check triggers for import backends too."""
+        import pytest
+
+        with pytest.raises(ValueError, match=r"contains ':'"):
+            CompassConfig.from_dict(
+                {
+                    "backends": {
+                        "internal:secure": {"type": "import", "module": "m"}
+                    }
+                }
+            )
+
+    def test_error_message_names_the_offending_backend(self):
+        """The error message is actionable — it names the bad backend and why
+        colons are disallowed (the backend:tool separator)."""
+        import pytest
+
+        with pytest.raises(ValueError) as excinfo:
+            CompassConfig.from_dict(
+                {
+                    "backends": {
+                        "bad:name": {"type": "stdio", "command": "python"}
+                    }
+                }
+            )
+        msg = str(excinfo.value)
+        assert "bad:name" in msg
+        assert "backend:tool" in msg
+
+    def test_normal_backend_names_still_load(self):
+        """Colon-free names load exactly as before (no false positives)."""
+        config = CompassConfig.from_dict(
+            {
+                "backends": {
+                    "github": {"type": "stdio", "command": "python"},
+                    "comfy_ui": {"type": "http", "url": "http://x:1"},
+                    "local-import": {"type": "import", "module": "m"},
+                }
+            }
+        )
+        assert set(config.backends) == {"github", "comfy_ui", "local-import"}
+
+
 class TestAllNewFieldsRoundtrip:
     """Contract-level: a config dict containing EVERY new field parses,
     serializes, and re-parses identically (load->dump->load stability)."""

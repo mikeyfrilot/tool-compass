@@ -2454,6 +2454,42 @@ class TestExecuteToolHttpTransportRetry:
         assert env["result"] == "retry ok"
         second.call_tool.assert_awaited_once()
 
+    async def test_streamable_http_error_retries_once(self):
+        # INT-01: StreamableHTTPError (server closed/terminated the stream,
+        # malformed SSE frame, session-id mismatch) is a transient, reconnectable
+        # transport fault. It must reconnect + retry once, symmetrically with
+        # httpx.TransportError and the stdio BrokenPipeError path — not fall
+        # through to the generic handler as a non-retried transport_error.
+        cfg = CompassConfig(
+            backends={"web": make_http_backend()}, auto_sync=False
+        )
+        first = Mock()
+        first.is_connected = True
+        first.call_tool = AsyncMock(
+            side_effect=StreamableHTTPError("server terminated the stream")
+        )
+
+        second = Mock()
+        second.is_connected = True
+        second.call_tool = AsyncMock(
+            return_value={"success": True, "result": "retry ok", "content": []}
+        )
+
+        mgr = SimpleBackendManager(cfg)
+        mgr._backends["web"] = first
+        mgr._tool_index["web:fetch"] = "web"
+
+        async def fake_reconnect(name, timeout=None):
+            mgr._backends[name] = second
+            return True
+
+        mgr.connect_backend = AsyncMock(side_effect=fake_reconnect)
+
+        env = await mgr.execute_tool("web:fetch", {})
+        assert env["success"] is True
+        assert env["result"] == "retry ok"
+        second.call_tool.assert_awaited_once()
+
     async def test_httpx_transport_error_retry_fails(self):
         cfg = CompassConfig(
             backends={"web": make_http_backend()}, auto_sync=False

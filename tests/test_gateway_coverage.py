@@ -2855,6 +2855,154 @@ class TestExactNameBoostDISC02:
         assert result["matches"][0]["tool"] == "test:generate_image"
 
 
+class TestExactNameBoostRespectsFiltersGWDISC002:
+    """GW-DISC-002 (DEFECT 1): the exact-name boost must respect the active
+    category/server filter. A tool that fails the filter — and that
+    index.search() therefore already excluded — must NEVER be resurrected at
+    rank #1 by the boost lookup, which used to query on name alone.
+    """
+
+    @pytest.mark.asyncio
+    async def test_boost_does_not_resurrect_tool_outside_category_filter(
+        self, test_index, test_config, sample_tools
+    ):
+        """intent exactly names test:git_status (category=git) but the caller
+        asked for category=file. The git tool must NOT be boosted in."""
+        import gateway
+        from unittest.mock import patch as _patch
+
+        test_config.hybrid_search = False  # isolate the boost behavior
+        test_config.exact_name_boost = True
+        test_config.exact_match_confidence = 1.0
+        gateway._compass_index = test_index
+        gateway._config = test_config
+        gateway._startup_sync_done = True
+        gateway._analytics = None
+
+        # search() (mocked) returns only the in-filter file tools — this is what
+        # a correctly-filtered semantic search would return for category=file.
+        semantic = _mk_search_results(
+            sample_tools,
+            [("test:read_file", 0.7), ("test:write_file", 0.6)],
+        )
+        with _patch.object(test_index, "search", return_value=semantic):
+            from gateway import compass
+
+            result = await compass(
+                intent="test:git_status", category="file", top_k=5
+            )
+
+        names = [m["tool"] for m in result["matches"]]
+        assert "test:git_status" not in names, (
+            "boost resurrected a category=git tool despite category=file filter; "
+            f"got {names}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_boost_does_not_resurrect_tool_outside_server_filter(
+        self, test_index, test_config, sample_tools
+    ):
+        """intent exactly names a tool on server=other, but the caller asked
+        for server=test. The other-server tool must NOT be boosted in."""
+        import gateway
+        from unittest.mock import patch as _patch
+
+        # Insert an out-of-filter tool directly into the real DB the boost
+        # lookup queries. All sample_tools share server=test, so we need a
+        # distinct server to exercise the server_filter clause.
+        test_index.db.execute(
+            "INSERT INTO tools (name, description, category, server) "
+            "VALUES (?, ?, ?, ?)",
+            ("other:special_tool", "A tool on a different server", "misc", "other"),
+        )
+        test_index.db.commit()
+
+        test_config.hybrid_search = False
+        test_config.exact_name_boost = True
+        gateway._compass_index = test_index
+        gateway._config = test_config
+        gateway._startup_sync_done = True
+        gateway._analytics = None
+
+        semantic = _mk_search_results(sample_tools, [("test:read_file", 0.7)])
+        with _patch.object(test_index, "search", return_value=semantic):
+            from gateway import compass
+
+            result = await compass(
+                intent="other:special_tool", server="test", top_k=5
+            )
+
+        names = [m["tool"] for m in result["matches"]]
+        assert "other:special_tool" not in names, (
+            "boost resurrected a server=other tool despite server=test filter; "
+            f"got {names}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_boost_still_pins_exact_tool_inside_category_filter(
+        self, test_index, test_config, sample_tools
+    ):
+        """Regression guard: an exact-name intent for a tool INSIDE the active
+        filter is STILL boosted to #1 (the fix must not over-restrict)."""
+        import gateway
+        from unittest.mock import patch as _patch
+
+        test_config.hybrid_search = False
+        test_config.exact_name_boost = True
+        test_config.exact_match_confidence = 1.0
+        gateway._compass_index = test_index
+        gateway._config = test_config
+        gateway._startup_sync_done = True
+        gateway._analytics = None
+
+        # write_file ranks below read_file semantically, but exact-naming it with
+        # a matching category=file filter must pin it to #1.
+        semantic = _mk_search_results(
+            sample_tools,
+            [("test:read_file", 0.8), ("test:write_file", 0.5)],
+        )
+        with _patch.object(test_index, "search", return_value=semantic):
+            from gateway import compass
+
+            result = await compass(
+                intent="test:write_file", category="file", top_k=5
+            )
+
+        assert result["matches"], "expected the boosted match"
+        assert result["matches"][0]["tool"] == "test:write_file"
+        assert result["matches"][0]["confidence"] == 1.0
+
+    def test_lookup_helper_applies_category_and_server_clauses(self, test_index):
+        """Unit-level: the helper itself returns None for an out-of-filter tool
+        and the row for an in-filter one."""
+        from gateway import _exact_name_boost_lookup
+
+        # git_status is category=git/server=test in the sample corpus.
+        # Wrong category -> no hit.
+        assert (
+            _exact_name_boost_lookup(
+                test_index, "test:git_status", category="file", server=None
+            )
+            is None
+        )
+        # Wrong server -> no hit.
+        assert (
+            _exact_name_boost_lookup(
+                test_index, "test:git_status", category=None, server="other"
+            )
+            is None
+        )
+        # Matching category+server -> the row is returned.
+        hit = _exact_name_boost_lookup(
+            test_index, "test:git_status", category="git", server="test"
+        )
+        assert hit is not None
+        assert hit["tool"] == "test:git_status"
+        # No filters -> back-compat: still returns the row.
+        hit2 = _exact_name_boost_lookup(test_index, "test:git_status")
+        assert hit2 is not None and hit2["tool"] == "test:git_status"
+
+
 class TestHybridSearchDISC01:
     """DISC-01: RRF fusion improves a lexically-obvious mid-ranked tool and is
     a no-op relative to pure-semantic when disabled."""
@@ -2997,6 +3145,83 @@ class TestHybridSearchDISC01:
 
         assert result["degraded"] is False
         assert "degraded_reasons" not in result or result["degraded_reasons"] == []
+
+
+class TestRRFReordersSemanticTopGWDISC003:
+    """GW-DISC-003 (DEFECT 3): a NON-EMPTY lexical list CAN reorder the semantic
+    top — standard RRF-by-rank behavior. The pure-semantic ordering is preserved
+    ONLY when the lexical list is EMPTY, not merely when its top differs. These
+    tests document that actual behavior (the docstring was corrected to match).
+    """
+
+    def test_lexical_hit_on_rank2_demotes_semantic_rank1(self):
+        """A lexical hit on the semantic rank-2 candidate lifts its fused score
+        above the semantic rank-1 (0.9-confidence) tool, promoting it to #1."""
+        from gateway import _rrf_fuse
+
+        semantic = [
+            {"tool": "a:read", "confidence": 0.9},   # semantic #1
+            {"tool": "b:write", "confidence": 0.4},  # semantic #2
+        ]
+        # Lexical false-friend match lands only on the rank-2 tool.
+        lexical = [{"tool": "b:write", "confidence": 0.6}]
+
+        fused = _rrf_fuse(semantic, lexical, top_k=5)
+        names = [m["tool"] for m in fused]
+        # b:write is promoted above a:read despite a:read's 0.9 semantic score.
+        assert names[0] == "b:write", (
+            "lexical hit on rank-2 should reorder the semantic top; got " + str(names)
+        )
+        assert names[1] == "a:read"
+
+    def test_empty_lexical_preserves_pure_semantic_ordering(self):
+        """The only guarantee: an EMPTY lexical list leaves the semantic order
+        byte-for-byte intact."""
+        from gateway import _rrf_fuse
+
+        semantic = [
+            {"tool": "a:read", "confidence": 0.9},
+            {"tool": "b:write", "confidence": 0.4},
+            {"tool": "c:list", "confidence": 0.3},
+        ]
+        fused = _rrf_fuse(semantic, [], top_k=5)
+        assert [m["tool"] for m in fused] == ["a:read", "b:write", "c:list"]
+
+    @pytest.mark.asyncio
+    async def test_full_path_lexical_top_reorders_semantic_top(
+        self, test_index, test_config, sample_tools
+    ):
+        """End-to-end through compass(): the lexical list's top differs from the
+        semantic top and DOES reorder it (documents the served behavior)."""
+        import gateway
+        from unittest.mock import patch as _patch
+
+        gateway._health_state["ollama_available"] = True
+        gateway._health_state["index_available"] = True
+        test_config.hybrid_search = True
+        test_config.exact_name_boost = False  # isolate fusion
+        gateway._compass_index = test_index
+        gateway._config = test_config
+        gateway._startup_sync_done = True
+        gateway._analytics = None
+
+        # Semantic ranks read_file #1 (0.9); the intent literally contains
+        # "git status" so the lexical list ranks git_status top — a different
+        # top. Fusion promotes git_status above the semantic #1.
+        semantic = _mk_search_results(
+            sample_tools,
+            [("test:read_file", 0.9), ("test:git_status", 0.5)],
+        )
+        with _patch.object(test_index, "search", return_value=semantic):
+            from gateway import compass
+
+            result = await compass(intent="git status", top_k=5)
+
+        names = [m["tool"] for m in result["matches"]]
+        assert names[0] == "test:git_status", (
+            "a lexical top different from the semantic top reorders it; got "
+            + str(names)
+        )
 
 
 # =============================================================================

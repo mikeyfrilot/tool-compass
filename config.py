@@ -281,6 +281,20 @@ class CompassConfig:
 
         # Parse backends
         for name, backend_data in data.get("backends", {}).items():
+            # BR-A-018: a backend NAME containing ':' makes the "backend:tool"
+            # qualified-name scheme ambiguous. qualified_name.split(":", 1) —
+            # used by the router (backend_client_simple), the sync_manager
+            # allow/deny policy check, and the gateway policy check — mis-splits
+            # e.g. "grp:svc:tool" to server "grp", finds no config, and the
+            # FEAT-06 allow/deny policy FAILS OPEN (a denied tool gets indexed
+            # AND executed). Reject the ambiguous name here (fail-closed) so the
+            # hole is closed at the source rather than papered over downstream.
+            if ":" in name:
+                raise ValueError(
+                    f"Backend name {name!r} contains ':' which is reserved as "
+                    f"the backend:tool separator — rename the backend without a "
+                    f"colon."
+                )
             backend_type = backend_data.get("type", "stdio")
             if backend_type == "stdio":
                 config.backends[name] = StdioBackend(

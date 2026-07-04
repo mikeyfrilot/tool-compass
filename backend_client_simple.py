@@ -2105,13 +2105,20 @@ class SimpleBackendManager:
             BrokenPipeError,
             ConnectionResetError,
             httpx.TransportError,
+            StreamableHTTPError,
         ) as transport_err:
             # BR-A-005: transport errors are the ONLY case we retry. The
             # backend's pipe broke — reconnect and try once more.
             # INT-01: httpx.TransportError joins the retry set so a dropped
             # HTTP connection (connection reset, read error, remote close)
             # reconnects + retries once, exactly as a broken subprocess pipe
-            # does. HTTPStatusError is NOT a TransportError subclass, so a 4xx/
+            # does. StreamableHTTPError joins it too: an SDK-level transport
+            # fault (server closed/terminated the stream, malformed SSE frame,
+            # session-id mismatch) is transient and reconnectable — call_tool
+            # marks _connected=False and re-raises with the explicit intent
+            # that this path reconnect + retry, symmetrically with the httpx
+            # and stdio (BrokenPipeError) paths. HTTPStatusError is NOT a
+            # TransportError subclass and is deliberately excluded, so a 4xx/
             # 5xx does not trigger a blind retry — it surfaces as a
             # transport_error envelope via the generic handler / call_tool.
             logger.error(
