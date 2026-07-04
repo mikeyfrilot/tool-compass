@@ -32,6 +32,8 @@ HTTP mode (PORT env var set) exposes three operational endpoints:
 
 import asyncio
 import argparse
+import fnmatch
+import hmac
 import logging
 import json
 import os
@@ -165,6 +167,11 @@ _ERROR_CATEGORIES = {
     "backend_error",
     "service_unavailable",
     "configuration",
+    # FEAT-06: policy-forbidden tool call (allow/deny glob at the execute
+    # boundary). Distinct from validation/not_found so an LLM consumer knows
+    # NOT to retry with a different argument — the tool is administratively
+    # blocked.
+    "forbidden",
 }
 
 # Closed enum of error codes (extend deliberately, not opportunistically).
@@ -184,6 +191,8 @@ _ERROR_CODES = {
     "chain_indexer_unavailable",
     "sync_manager_unavailable",
     "execute_unhandled_exception",
+    # FEAT-06: tool blocked by the resolving backend's allow/deny policy.
+    "tool_denied",
 }
 
 
@@ -639,6 +648,85 @@ async def maybe_startup_sync():
             logger.warning(f"Startup sync failed: {e}")
         _startup_sync_done = True
 
+        # auto-refresh: now that a sync_manager exists and the first sync ran,
+        # start background polling (guarded on interval > 0) and opportunistically
+        # prune old analytics rows once. Both are best-effort — a failure here
+        # must never break the sync path.
+        await _maybe_start_background_polling(sync_manager)
+        await _maybe_prune_analytics_once()
+
+
+async def _maybe_start_background_polling(sync_manager) -> bool:
+    """auto-refresh: start the sync manager's background polling loop, once,
+    iff ``config.sync_polling_interval > 0`` and a manager exists.
+
+    Returns True iff a polling task was (or already is) intended to run for the
+    configured interval — i.e. the interval>0 decision was taken. Returns False
+    when polling is disabled (interval<=0) or no manager is available. The
+    actual task-start is delegated to ``sync_manager.start_background_polling``,
+    which is itself idempotent (it no-ops if a task is already live), so calling
+    this more than once is safe.
+
+    The interval is read from config and clamped there (>= 0; 0 disables), so a
+    hand-edited negative value can never spin a hot loop here.
+    """
+    if sync_manager is None:
+        return False
+    interval = int(get_config().sync_polling_interval)
+    if interval <= 0:
+        logger.debug(
+            "auto-refresh: sync_polling_interval<=0; background polling disabled."
+        )
+        return False
+    try:
+        await sync_manager.start_background_polling(interval_seconds=interval)
+    except Exception as e:
+        logger.warning(f"auto-refresh: failed to start background polling: {e}")
+        return True  # the decision to poll was taken even if the start failed
+    return True
+
+
+# auto-refresh / FEAT-04: prune only once per process startup so a busy first
+# minute doesn't issue a DELETE on every early compass() call.
+_analytics_pruned_once = False
+
+
+async def _maybe_prune_analytics_once() -> bool:
+    """FEAT-04 wiring: opportunistically prune analytics rows older than
+    ``config.analytics_retention_days`` exactly once per startup.
+
+    Fully defensive (sibling B4 provides prune_old_records): guarded in
+    try/except and skipped when analytics is disabled/unavailable or the method
+    doesn't exist. Returns True iff a prune call was actually issued.
+    """
+    global _analytics_pruned_once
+    if _analytics_pruned_once:
+        return False
+    retention = int(get_config().analytics_retention_days)
+    try:
+        analytics = await get_analytics_instance()
+    except Exception as e:
+        logger.debug(f"auto-refresh: analytics unavailable for prune: {e}")
+        return False
+    if analytics is None:
+        return False
+    prune = getattr(analytics, "prune_old_records", None)
+    if prune is None or not callable(prune):
+        logger.debug("auto-refresh: prune_old_records not available; skipping.")
+        return False
+    try:
+        removed = await prune(retention)
+        _analytics_pruned_once = True
+        logger.info(
+            f"auto-refresh: pruned analytics rows older than {retention}d "
+            f"(removed={removed})."
+        )
+        return True
+    except Exception as e:
+        logger.warning(f"auto-refresh: analytics prune failed: {e}")
+        # Don't latch on failure — a later startup attempt may succeed.
+        return False
+
 
 # =============================================================================
 # GW-B-001: lexical fallback for when semantic search is unavailable.
@@ -768,6 +856,222 @@ def _lexical_search_fallback(
 
     scored.sort(key=lambda m: m["confidence"], reverse=True)
     return scored[:top_k]
+
+
+# =============================================================================
+# DISC-01 / DISC-02: hybrid search (RRF fusion) + exact-name boost.
+#
+# These operate purely on the compass() success path (over the semantic
+# `results`), NOT inside indexer.search — search() stays pure-semantic so its
+# 8+ callers and the golden benchmark are untouched. Both are gated on config
+# and default to preserving today's ordering when disabled.
+# =============================================================================
+
+# RRF fusion constant. k=60 is the canonical Reciprocal Rank Fusion smoothing
+# term (Cormack, Clarke & Buettcher, SIGIR 2009) — it damps the contribution
+# of any single list's top ranks so a lexically-obvious hit that a semantic
+# list buried mid-rank still surfaces, without letting either list dominate.
+_RRF_K = 60
+
+
+def _exact_name_boost_lookup(
+    index: "CompassIndex", intent: str
+) -> Optional[Dict[str, Any]]:
+    """DISC-02: probe the tools table for a row whose name exactly matches the
+    intent (case-insensitively), matching either the full ``server:tool``
+    qualified name OR a bare tool name against the ``server:tool`` suffix.
+
+    Single indexed lookup via ``idx_tools_name``. Returns a response-shaped
+    match dict (``tool``/``description``/``server``/``category``) WITHOUT a
+    confidence — the caller stamps ``exact_match_confidence`` — or None on no
+    hit / unusable index. Never raises: a sqlite error degrades to "no boost".
+    """
+    if not index or not getattr(index, "db", None):
+        return None
+    probe = (intent or "").strip()
+    if not probe:
+        return None
+    try:
+        row = index.db.execute(
+            "SELECT name, description, category, server FROM tools "
+            "WHERE lower(name)=lower(?) "
+            "OR lower(substr(name, instr(name,':')+1))=lower(?) LIMIT 1",
+            (probe, probe),
+        ).fetchone()
+    except sqlite3.Error as e:
+        logger.warning(
+            f"[compass] exact-name boost probe failed "
+            f"({type(e).__name__}: {e}); skipping boost"
+        )
+        return None
+    if not row:
+        return None
+    return {
+        "tool": row["name"],
+        "description": row["description"],
+        "server": row["server"],
+        "category": row["category"],
+    }
+
+
+def _rrf_fuse(
+    semantic: List[Dict[str, Any]],
+    lexical: List[Dict[str, Any]],
+    top_k: int,
+) -> List[Dict[str, Any]]:
+    """DISC-01: RE-RANK the semantic candidates via Reciprocal Rank Fusion,
+    returning up to ``top_k`` match dicts re-sorted by fused score.
+
+    Both inputs are lists of match dicts keyed on ``tool``. The fused score for
+    a tool is ``sum(1 / (_RRF_K + rank_i))`` over every list it appears in
+    (0-based rank). Crucially, only the SEMANTIC dicts are ever EMITTED — the
+    lexical list contributes rank signal but never introduces a new tool into
+    the results. This preserves BOTH contracts the compass envelope guarantees:
+
+      - min_confidence: every emitted match is a semantic match that already
+        passed the ``score >= min_confidence`` filter; a coarse-confidence
+        lexical-only hit can never sneak past the gate.
+      - envelope shape: emitted dicts keep their semantic fields (including
+        ``parameters``/``examples`` when progressive disclosure is off).
+
+    The lexical list's job is to LIFT a lexically-obvious tool that semantics
+    buried mid-rank — which by definition is still in the semantic candidate
+    set. Ties break on the original semantic rank, so when the lexical list
+    adds no signal the output is exactly the pure-semantic ordering.
+    """
+    scores: Dict[str, float] = defaultdict(float)
+    semantic_rank: Dict[str, int] = {}
+
+    for rank, m in enumerate(semantic):
+        name = m["tool"]
+        scores[name] += 1.0 / (_RRF_K + rank)
+        semantic_rank.setdefault(name, rank)
+    for rank, m in enumerate(lexical):
+        name = m["tool"]
+        # Only contribute rank signal for tools that are ALSO semantic
+        # candidates — never adopt a lexical-only tool into the output.
+        if name in semantic_rank:
+            scores[name] += 1.0 / (_RRF_K + rank)
+
+    # Sort the SEMANTIC dicts by fused score desc, tie-break by original
+    # semantic rank asc (stable) then name for determinism.
+    ordered = sorted(
+        semantic,
+        key=lambda m: (
+            -scores[m["tool"]],
+            semantic_rank.get(m["tool"], len(semantic)),
+            m["tool"],
+        ),
+    )
+    return ordered[:top_k]
+
+
+def _load_raw_schema(
+    index: "CompassIndex", tool_name: str, trace_id: Optional[str] = None
+) -> Optional[Dict[str, Any]]:
+    """FEAT-01: return the full input schema for ``tool_name`` from the index's
+    ``raw_schema`` column, or None to signal "fall back to collapsed params".
+
+    Defensive on THREE axes so describe() keeps working before sibling B3 adds
+    the column:
+
+    1. ``raw_schema`` column absent -> the SELECT raises sqlite3.OperationalError
+       ("no such column"); caught and treated as "no full schema" (returns
+       None). We deliberately do NOT flip the index-unhealthy health flag for
+       this — a not-yet-migrated schema is expected, not a fault.
+    2. Value NULL / empty -> returns None (fall back to collapsed params).
+    3. Value present but malformed JSON -> logged, returns None (fall back).
+
+    Only a dict/JSON-object schema is surfaced; a non-object json (e.g. a bare
+    string) is treated as absent so the response `schema` field is always a
+    structured object when present.
+    """
+    if not index or not getattr(index, "db", None):
+        return None
+    try:
+        row = index.db.execute(
+            "SELECT raw_schema FROM tools WHERE name = ?", (tool_name,)
+        ).fetchone()
+    except sqlite3.OperationalError as e:
+        # Almost certainly "no such column: raw_schema" pre-B3 migration.
+        # Expected, not a fault — degrade silently to collapsed params.
+        logger.debug(
+            f"[describe] [{trace_id}] raw_schema unavailable "
+            f"({type(e).__name__}: {e}); using collapsed parameters"
+        )
+        return None
+    except sqlite3.Error as e:
+        logger.warning(
+            f"[describe] [{trace_id}] raw_schema probe failed "
+            f"({type(e).__name__}: {e}); using collapsed parameters"
+        )
+        return None
+
+    if not row:
+        return None
+    raw = row["raw_schema"]
+    if not raw:
+        return None
+    try:
+        parsed = json.loads(raw)
+    except (json.JSONDecodeError, TypeError) as e:
+        logger.warning(
+            f"[describe] [{trace_id}] malformed raw_schema for {tool_name!r}: "
+            f"{type(e).__name__}: {e}; using collapsed parameters"
+        )
+        return None
+    if not isinstance(parsed, dict):
+        return None
+    return parsed
+
+
+def _tool_denied_by_policy(
+    backend: Any, bare_tool_name: str
+) -> bool:
+    """FEAT-06: True iff ``bare_tool_name`` is blocked by the backend's
+    allow/deny glob policy. Defense-in-depth at the execute boundary — even if
+    a denied tool was somehow indexed, we refuse to proxy it here.
+
+    Semantics (match config._validate_and_clamp_backends + the index-time
+    filter sibling B3 applies):
+      - fnmatch on the BARE tool name (not the ``server:tool`` qualified name).
+      - deny wins: a match in ``deny_tools`` blocks regardless of allow_tools.
+      - empty ``allow_tools`` = allow all (only deny_tools filters).
+      - a non-empty ``allow_tools`` is an allowlist: a tool not matching any
+        allow glob is denied.
+
+    A backend with no policy fields (or None) allows everything.
+    """
+    if backend is None:
+        return False
+    # Read the policy lists defensively: a real backend always carries proper
+    # list[str] (config._validate_and_clamp_backends guarantees it), but a test
+    # double or a malformed object might not. Anything we can't interpret as a
+    # concrete list of string globs -> fail OPEN (no policy) rather than crash
+    # the execute path — deny only blocks on an explicit, well-formed rule.
+    def _globs(attr: str) -> List[str]:
+        raw = getattr(backend, attr, None)
+        if not isinstance(raw, (list, tuple)):
+            return []
+        return [p for p in raw if isinstance(p, str)]
+
+    deny = _globs("deny_tools")
+    allow = _globs("allow_tools")
+
+    # Deny takes precedence.
+    for pattern in deny:
+        if fnmatch.fnmatch(bare_tool_name, pattern):
+            return True
+
+    # Empty allow list = allow all.
+    if not allow:
+        return False
+
+    # Non-empty allow list: must match at least one allow glob.
+    for pattern in allow:
+        if fnmatch.fnmatch(bare_tool_name, pattern):
+            return False
+    return True
 
 
 # =============================================================================
@@ -912,7 +1216,19 @@ async def compass(
     if fallback_matches:
         # Lexical fallback path — fallback_matches is already shaped correctly.
         matches = fallback_matches
-    else:
+    elif not degraded:
+        # Healthy semantic path. Shape the semantic ranked list into match
+        # dicts (same fields as today), then optionally hybrid-fuse (DISC-01)
+        # and pin an exact-name hit at #1 (DISC-02). With both knobs disabled
+        # the output is byte-for-byte today's pure-semantic ordering.
+        #
+        # Gated on `not degraded` so the DISC-01/02 logic NEVER runs on the
+        # Ollama-down path — even when the min_confidence filter emptied
+        # fallback_matches. On that degraded-but-empty path we leave matches=[]
+        # exactly as the pre-DISC code did (results is [] there anyway), rather
+        # than fabricating a boosted/lexical hit that would mislabel a degraded
+        # response as a confident match.
+        semantic_matches: List[Dict[str, Any]] = []
         for r in results:
             match_data = {
                 "tool": r.tool.name,
@@ -927,7 +1243,57 @@ async def compass(
                 match_data["parameters"] = r.tool.parameters
                 match_data["examples"] = r.tool.examples
 
-            matches.append(match_data)
+            semantic_matches.append(match_data)
+
+        matches = semantic_matches
+
+        # DISC-01: hybrid search — fuse semantic + lexical ranked lists via
+        # RRF so a lexically-obvious tool the semantic list buried mid-rank
+        # still surfaces. We reuse _lexical_search_fallback on the HEALTHY path
+        # (Ollama is fine here); it stamps degraded:True per match, so strip
+        # that key before fusing — these responses are NOT degraded.
+        if config.hybrid_search:
+            try:
+                lexical = _lexical_search_fallback(
+                    index, intent, top_k, category, server
+                )
+                for lm in lexical:
+                    lm.pop("degraded", None)
+                if lexical:
+                    matches = _rrf_fuse(semantic_matches, lexical, top_k)
+            except Exception as e:
+                # Fusion is best-effort polish; never let it break the healthy
+                # response. Fall back to the pure-semantic ordering.
+                logger.warning(
+                    f"[compass] [{trace_id}] hybrid fusion failed "
+                    f"({type(e).__name__}: {e}); using semantic ordering"
+                )
+                matches = semantic_matches
+
+        # DISC-02: exact-name boost — if the intent exactly matches a tool
+        # name, force it to rank #1 at exact_match_confidence, deduped out of
+        # the rest, and counted as one of top_k. Applied AFTER fusion so the
+        # exact hit always stays pinned regardless of RRF ordering.
+        if config.exact_name_boost:
+            exact = _exact_name_boost_lookup(index, intent)
+            if exact is not None:
+                exact_name = exact["tool"]
+                boosted = dict(exact)
+                boosted["confidence"] = float(config.exact_match_confidence)
+                # Preserve schema fields on the boosted entry when progressive
+                # disclosure is off, matching the rest of the match shape.
+                if not config.progressive_disclosure:
+                    prior = next(
+                        (m for m in matches if m["tool"] == exact_name), None
+                    )
+                    if prior is not None:
+                        if "parameters" in prior:
+                            boosted["parameters"] = prior["parameters"]
+                        if "examples" in prior:
+                            boosted["examples"] = prior["examples"]
+                rest = [m for m in matches if m["tool"] != exact_name]
+                matches = [boosted] + rest
+                matches = matches[:top_k]
 
     # Stats
     stats = index.get_stats()
@@ -1073,6 +1439,19 @@ async def describe(tool_name: str) -> Dict[str, Any]:
                 "examples": examples,
                 "hint": f"Use execute('{tool_name}', {{...}}) to run this tool.",
             }
+
+            # FEAT-01: prefer the FULL input schema when the index carries one.
+            # Sibling B3 adds a `raw_schema TEXT` column (json.dumps of the tool
+            # inputSchema, with required/descriptions/enums/defaults). We probe
+            # it SEPARATELY from the main SELECT so that — before B3 lands — a
+            # missing column degrades to "no such column", is swallowed here,
+            # and describe() returns the collapsed `parameters` EXACTLY as
+            # today. The full schema is surfaced under a `schema` field
+            # alongside `parameters` for back-compat.
+            full_schema = _load_raw_schema(index, tool_name, trace_id)
+            if full_schema is not None:
+                response["schema"] = full_schema
+
             return _augment_with_health(response)
 
     # Try backends if connected
@@ -1164,6 +1543,55 @@ async def execute(
         hot_tool = analytics.get_hot_tool(tool_name)
         if hot_tool:
             logger.debug(f"Using hot cache for {tool_name}")
+
+    # FEAT-06: enforce the resolving backend's allow/deny glob policy at the
+    # execute boundary (defense-in-depth — a denied tool must never proxy even
+    # if it slipped past the index-time filter). Resolve server + BARE tool
+    # name, look up the backend config, and reject with a structured
+    # tool_denied envelope BEFORE any connect/proxy work happens.
+    if ":" in tool_name:
+        _policy_server = tool_name.split(":", 1)[0]
+        _bare_tool = tool_name.split(":", 1)[1]
+    else:
+        _policy_server = None
+        _bare_tool = tool_name
+    _policy_backend = None
+    try:
+        _policy_backend = manager.config.backends.get(_policy_server)
+    except Exception:
+        _policy_backend = None
+    if _tool_denied_by_policy(_policy_backend, _bare_tool):
+        latency_ms = (time.time() - start_time) * 1000
+        logger.warning(
+            f"[execute] [{trace_id}] tool denied by policy: {tool_name!r}"
+        )
+        if analytics:
+            try:
+                await analytics.record_tool_call(
+                    tool_name,
+                    success=False,
+                    latency_ms=latency_ms,
+                    error_message="tool_denied: blocked by backend allow/deny policy",
+                )
+            except Exception as rec_err:
+                logger.debug(f"analytics record failed: {rec_err}")
+        envelope = _error_envelope(
+            code="tool_denied",
+            title="Tool denied by policy",
+            detail=(
+                f"Tool {tool_name!r} is blocked by the backend's allow/deny "
+                f"policy and was not proxied."
+            ),
+            category="forbidden",
+            retryable=False,
+            trace_id=trace_id,
+            suggestions=[
+                "This tool is administratively blocked; do not retry.",
+                "Use compass() to find an allowed tool for this task.",
+            ],
+        )
+        envelope["success"] = False
+        return _augment_with_health(envelope)
 
     # Connect to backend if needed
     if ":" in tool_name:
@@ -1311,16 +1739,25 @@ async def compass_categories() -> Dict[str, Any]:
 
 
 @mcp.tool()
-async def compass_status() -> Dict[str, Any]:
+async def compass_status(active: bool = False) -> Dict[str, Any]:
     """
     Get Tool Compass gateway status and health information.
 
     Returns index stats, backend connection status, configuration, analytics summary,
     hot cache status, and sync status.
+
+    Args:
+        active: FEAT-03. When True, additionally fire an ACTIVE liveness probe
+            per connected backend (manager.health_check(active=True)) and fold
+            the per-backend probe/degraded results into response['backends']
+            under a 'probes' key. Default False keeps the cheap passive
+            behavior (get_stats only) so routine status calls stay fast and
+            never touch the backends. A hung-but-alive backend is only
+            detectable via the active probe.
     """
     config = get_config()
     trace_id = uuid.uuid4().hex[:8]
-    logger.info(f"[compass_status] [{trace_id}]")
+    logger.info(f"[compass_status] [{trace_id}] active={active}")
 
     # BE-B-004: each subsystem block is wrapped independently so a single
     # failure degrades that section rather than aborting the whole status.
@@ -1342,6 +1779,22 @@ async def compass_status() -> Dict[str, Any]:
     try:
         manager = await get_backends()
         response["backends"] = manager.get_stats()
+        # FEAT-03: fold active-probe results into the backends block on request.
+        # Guarded independently so a probe failure never aborts the status
+        # response — it degrades to "no probes" and records the error.
+        if active:
+            try:
+                probes = await manager.health_check(active=True)
+                if isinstance(response["backends"], dict):
+                    response["backends"]["probes"] = probes
+            except Exception as pe:
+                logger.error(
+                    f"[compass_status] [{trace_id}] active probe failed: {pe}"
+                )
+                if isinstance(response["backends"], dict):
+                    response["backends"]["probes"] = {
+                        "error": f"{type(pe).__name__}: {pe}"
+                    }
     except Exception as e:
         logger.error(f"[compass_status] [{trace_id}] backend stats failed: {e}")
         response["backends"] = {"error": f"{type(e).__name__}: {e}", "trace_id": trace_id}
@@ -2599,6 +3052,85 @@ def build_http_app():
     return mcp.streamable_http_app()
 
 
+# =============================================================================
+# OPS-1: optional bearer-token auth for the HTTP transport.
+#
+# Opt-in and fail-closed only when enabled: if config.gateway_auth_token is
+# unset (None / empty after resolution) the wrapper is never installed and the
+# transport behaves exactly as today (auth deferred to a reverse proxy). When
+# set, every MCP HTTP request must carry `Authorization: Bearer <token>`
+# (constant-time compared); missing/mismatched -> 401. The liveness endpoints
+# /health and /ready stay UNAUTHENTICATED so probes work without the token.
+#
+# Implemented as a raw ASGI middleware (not BaseHTTPMiddleware) so it is
+# stream-safe with the streamable-http SSE responses — it only inspects request
+# headers and either short-circuits with a 401 or passes the scope through
+# untouched. This wrapper is HTTP-only and never touches the stdio transport.
+# =============================================================================
+
+# Paths that must remain reachable without the bearer token (liveness probes).
+_OPS1_AUTH_EXEMPT_PATHS = frozenset({"/health", "/ready"})
+
+
+def _extract_bearer_token(headers: List[tuple]) -> Optional[str]:
+    """Pull the bearer token out of a raw ASGI headers list (list of
+    (name, value) byte tuples). Case-insensitive on the header name and the
+    'Bearer' scheme. Returns None when absent/malformed."""
+    for name, value in headers:
+        if name.lower() == b"authorization":
+            try:
+                decoded = value.decode("latin-1").strip()
+            except Exception:
+                return None
+            parts = decoded.split(None, 1)
+            if len(parts) == 2 and parts[0].lower() == "bearer":
+                return parts[1].strip()
+            return None
+    return None
+
+
+def _make_bearer_auth_middleware(app, token: str):
+    """Wrap an ASGI ``app`` so non-exempt HTTP requests require the bearer
+    ``token`` (constant-time compared). Returns a new ASGI callable.
+
+    Fail-closed: any http request without a matching token gets a 401 JSON
+    body. Non-http scopes (lifespan, websocket) and the exempt liveness paths
+    pass straight through.
+    """
+
+    async def _send_401(send):
+        body = b'{"error":"unauthorized","detail":"Missing or invalid bearer token"}'
+        await send(
+            {
+                "type": "http.response.start",
+                "status": 401,
+                "headers": [
+                    (b"content-type", b"application/json"),
+                    (b"www-authenticate", b"Bearer"),
+                    (b"content-length", str(len(body)).encode("latin-1")),
+                ],
+            }
+        )
+        await send({"type": "http.response.body", "body": body})
+
+    async def _wrapped(scope, receive, send):
+        if scope.get("type") != "http":
+            # lifespan / websocket — not an authenticated MCP request path.
+            await app(scope, receive, send)
+            return
+        path = scope.get("path", "")
+        if path in _OPS1_AUTH_EXEMPT_PATHS:
+            await app(scope, receive, send)
+            return
+        presented = _extract_bearer_token(scope.get("headers") or [])
+        if presented is None or not hmac.compare_digest(presented, token):
+            await _send_401(send)
+            return
+        await app(scope, receive, send)
+
+    return _wrapped
+
+
 def _run_http(port: int) -> None:
     """Run the MCP gateway in HTTP mode with /health, /ready, /metrics.
 
@@ -2606,12 +3138,16 @@ def _run_http(port: int) -> None:
     Binding to a non-loopback interface exposes RCE-class surface. The HOST env
     var defaults to 127.0.0.1 (loopback). Only bind to public interfaces when
     running behind an authenticated reverse proxy (Fly.io edge, etc.).
+
+    OPS-1: when config.gateway_auth_token is set, an opt-in bearer-token check
+    is layered in front of the ASGI app (fail-closed; /health + /ready stay
+    open). When unset, behavior is unchanged (auth deferred to a proxy).
     """
     import os
     from mcp.server.transport_security import TransportSecuritySettings
 
     # Build + register the ops routes (idempotent) before the server starts.
-    build_http_app()
+    app = build_http_app()
 
     host = os.environ.get("HOST", "127.0.0.1")
     if host not in ("127.0.0.1", "localhost", "::1"):
@@ -2633,6 +3169,31 @@ def _run_http(port: int) -> None:
             "127.0.0.1",
         ],
     )
+
+    # OPS-1: resolve the auth token (config field + env override already
+    # applied by apply_env_overrides). Only when a non-empty token is present
+    # do we install the bearer middleware and serve the wrapped app directly
+    # via uvicorn (mirroring FastMCP.run_streamable_http_async). Otherwise fall
+    # back to mcp.run() so the no-auth path is byte-for-byte today's behavior.
+    token = (get_config().gateway_auth_token or "").strip()
+    if token:
+        logger.info(
+            "OPS-1: bearer-token auth ENABLED on the HTTP transport "
+            "(/health + /ready remain open)."
+        )
+        import uvicorn
+
+        wrapped = _make_bearer_auth_middleware(app, token)
+        uv_config = uvicorn.Config(
+            wrapped,
+            host=mcp.settings.host,
+            port=mcp.settings.port,
+            log_level=mcp.settings.log_level.lower(),
+        )
+        server = uvicorn.Server(uv_config)
+        asyncio.run(server.serve())
+        return
+
     mcp.run(transport="streamable-http")
 
 

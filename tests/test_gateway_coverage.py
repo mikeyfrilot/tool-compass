@@ -2715,3 +2715,988 @@ class TestShowConfigRedaction:
         assert "h:11434" in out
         # And the redaction marker is present so the dump stays usable.
         assert "[REDACTED]" in out
+
+
+# =============================================================================
+# DISC-01 / DISC-02 — hybrid search (RRF fusion) + exact-name boost in compass()
+# =============================================================================
+
+
+def _mk_search_results(sample_tools, order_scores):
+    """Build a list of SearchResult from (tool_name, score) pairs, resolving
+    tool_name against the sample_tools fixture."""
+    from indexer import SearchResult
+
+    by_name = {t.name: t for t in sample_tools}
+    out = []
+    for rank, (name, score) in enumerate(order_scores, start=1):
+        out.append(SearchResult(tool=by_name[name], score=score, rank=rank))
+    return out
+
+
+class TestExactNameBoostDISC02:
+    """DISC-02: an exact tool-name paste ranks #1 at exact_match_confidence."""
+
+    @pytest.mark.asyncio
+    async def test_exact_qualified_name_ranks_first_at_exact_confidence(
+        self, test_index, test_config, sample_tools
+    ):
+        import gateway
+        from unittest.mock import patch as _patch
+
+        # Semantic search ranks generate_image #1 and read_file #2. Pasting the
+        # exact qualified name "test:read_file" must force it to #1 at conf=1.0.
+        test_config.hybrid_search = False  # isolate the boost behavior
+        test_config.exact_name_boost = True
+        test_config.exact_match_confidence = 1.0
+        gateway._compass_index = test_index
+        gateway._config = test_config
+        gateway._startup_sync_done = True
+        gateway._analytics = None
+
+        semantic = _mk_search_results(
+            sample_tools,
+            [("test:generate_image", 0.8), ("test:read_file", 0.5)],
+        )
+        with _patch.object(test_index, "search", return_value=semantic):
+            from gateway import compass
+
+            result = await compass(intent="test:read_file", top_k=5)
+
+        assert result["matches"], "expected at least the boosted match"
+        top = result["matches"][0]
+        assert top["tool"] == "test:read_file"
+        assert top["confidence"] == 1.0
+        # Deduped: read_file appears exactly once.
+        assert [m["tool"] for m in result["matches"]].count("test:read_file") == 1
+
+    @pytest.mark.asyncio
+    async def test_exact_bare_name_matches_server_tool_suffix(
+        self, test_index, test_config, sample_tools
+    ):
+        import gateway
+        from unittest.mock import patch as _patch
+
+        # A bare "read_file" should match the server:tool suffix of
+        # "test:read_file" and rank it #1.
+        test_config.hybrid_search = False
+        test_config.exact_name_boost = True
+        gateway._compass_index = test_index
+        gateway._config = test_config
+        gateway._startup_sync_done = True
+        gateway._analytics = None
+
+        semantic = _mk_search_results(
+            sample_tools, [("test:generate_image", 0.9)]
+        )
+        with _patch.object(test_index, "search", return_value=semantic):
+            from gateway import compass
+
+            result = await compass(intent="read_file", top_k=5)
+
+        assert result["matches"][0]["tool"] == "test:read_file"
+        assert result["matches"][0]["confidence"] == test_config.exact_match_confidence
+
+    @pytest.mark.asyncio
+    async def test_exact_confidence_beats_min_confidence(
+        self, test_index, test_config, sample_tools
+    ):
+        """Back-compat: 1.0 >= any min_confidence, so the boosted tool survives
+        even a high min_confidence filter that dropped the semantic hit."""
+        import gateway
+        from unittest.mock import patch as _patch
+
+        test_config.hybrid_search = False
+        test_config.exact_name_boost = True
+        test_config.exact_match_confidence = 1.0
+        gateway._compass_index = test_index
+        gateway._config = test_config
+        gateway._startup_sync_done = True
+        gateway._analytics = None
+
+        # Semantic hit is below min_confidence and gets filtered out; only the
+        # boost can put read_file back on the board.
+        semantic = _mk_search_results(sample_tools, [("test:read_file", 0.4)])
+        with _patch.object(test_index, "search", return_value=semantic):
+            from gateway import compass
+
+            result = await compass(
+                intent="test:read_file", min_confidence=0.9, top_k=5
+            )
+
+        assert result["matches"], "boosted exact match must survive min_conf"
+        assert result["matches"][0]["tool"] == "test:read_file"
+        assert result["matches"][0]["confidence"] == 1.0
+
+    @pytest.mark.asyncio
+    async def test_no_boost_when_disabled(
+        self, test_index, test_config, sample_tools
+    ):
+        import gateway
+        from unittest.mock import patch as _patch
+
+        test_config.hybrid_search = False
+        test_config.exact_name_boost = False
+        gateway._compass_index = test_index
+        gateway._config = test_config
+        gateway._startup_sync_done = True
+        gateway._analytics = None
+
+        semantic = _mk_search_results(
+            sample_tools,
+            [("test:generate_image", 0.8), ("test:read_file", 0.5)],
+        )
+        with _patch.object(test_index, "search", return_value=semantic):
+            from gateway import compass
+
+            result = await compass(intent="test:read_file", top_k=5)
+
+        # Boost off + hybrid off -> pure semantic ordering (generate_image #1).
+        assert result["matches"][0]["tool"] == "test:generate_image"
+
+
+class TestHybridSearchDISC01:
+    """DISC-01: RRF fusion improves a lexically-obvious mid-ranked tool and is
+    a no-op relative to pure-semantic when disabled."""
+
+    @pytest.mark.asyncio
+    async def test_hybrid_promotes_lexically_obvious_midranked_tool(
+        self, test_index, test_config, sample_tools
+    ):
+        import gateway
+        from unittest.mock import patch as _patch
+
+        # Semantic buries git_status at the bottom, but the intent literally
+        # contains "git status" so the lexical list ranks it top. RRF fusion
+        # should lift it above where semantics alone placed it.
+        # Baseline healthy _health_state (module global not reset by conftest).
+        gateway._health_state["ollama_available"] = True
+        gateway._health_state["index_available"] = True
+        test_config.hybrid_search = True
+        test_config.exact_name_boost = False  # isolate fusion
+        gateway._compass_index = test_index
+        gateway._config = test_config
+        gateway._startup_sync_done = True
+        gateway._analytics = None
+
+        semantic = _mk_search_results(
+            sample_tools,
+            [
+                ("test:read_file", 0.70),
+                ("test:write_file", 0.68),
+                ("test:generate_image", 0.66),
+                ("test:search_docs", 0.64),
+                ("test:git_status", 0.62),  # semantically last
+            ],
+        )
+
+        with _patch.object(test_index, "search", return_value=semantic):
+            from gateway import compass
+
+            hybrid_result = await compass(intent="git status", top_k=5)
+
+        # With fusion, git_status (lexical #1) must rank higher than its
+        # semantic-only position (#5 / last).
+        names = [m["tool"] for m in hybrid_result["matches"]]
+        assert "test:git_status" in names
+        assert names.index("test:git_status") < 4, (
+            "fusion should lift git_status above semantic-last; got " + str(names)
+        )
+        # And fusion must NOT falsely mark the healthy response degraded.
+        assert hybrid_result["degraded"] is False
+        # No match should carry the internal degraded flag from the lexical list.
+        for m in hybrid_result["matches"]:
+            assert "degraded" not in m
+
+    @pytest.mark.asyncio
+    async def test_hybrid_does_not_regress_when_semantic_already_best(
+        self, test_index, test_config, sample_tools
+    ):
+        """When semantic already ranks the obvious tool #1, fusion keeps it #1
+        (does-not-regress half of the DISC-01 acceptance)."""
+        import gateway
+        from unittest.mock import patch as _patch
+
+        test_config.hybrid_search = True
+        test_config.exact_name_boost = False
+        gateway._compass_index = test_index
+        gateway._config = test_config
+        gateway._startup_sync_done = True
+        gateway._analytics = None
+
+        semantic = _mk_search_results(
+            sample_tools,
+            [("test:git_status", 0.9), ("test:read_file", 0.5)],
+        )
+        with _patch.object(test_index, "search", return_value=semantic):
+            from gateway import compass
+
+            result = await compass(intent="git status", top_k=5)
+
+        assert result["matches"][0]["tool"] == "test:git_status"
+
+    @pytest.mark.asyncio
+    async def test_hybrid_false_identical_to_pure_semantic(
+        self, test_index, test_config, sample_tools
+    ):
+        import gateway
+        from unittest.mock import patch as _patch
+
+        gateway._compass_index = test_index
+        gateway._config = test_config
+        gateway._startup_sync_done = True
+        gateway._analytics = None
+
+        semantic = _mk_search_results(
+            sample_tools,
+            [
+                ("test:read_file", 0.70),
+                ("test:write_file", 0.68),
+                ("test:git_status", 0.62),
+            ],
+        )
+
+        # Pure semantic ordering (both knobs off).
+        test_config.hybrid_search = False
+        test_config.exact_name_boost = False
+        with _patch.object(test_index, "search", return_value=semantic):
+            from gateway import compass
+
+            pure = await compass(intent="git status", top_k=5)
+        pure_names = [m["tool"] for m in pure["matches"]]
+        pure_confs = [m["confidence"] for m in pure["matches"]]
+
+        # Semantic ordering must be exactly the input order + scores.
+        assert pure_names == ["test:read_file", "test:write_file", "test:git_status"]
+        assert pure_confs == [0.7, 0.68, 0.62]
+
+    @pytest.mark.asyncio
+    async def test_hybrid_healthy_path_not_marked_degraded(
+        self, test_index, test_config, sample_tools
+    ):
+        """The fused healthy path must never set degraded=True even though it
+        reuses _lexical_search_fallback (which stamps degraded on its matches)."""
+        import gateway
+        from unittest.mock import patch as _patch
+
+        # Baseline healthy _health_state (module global not reset by conftest).
+        gateway._health_state["ollama_available"] = True
+        gateway._health_state["index_available"] = True
+        test_config.hybrid_search = True
+        test_config.exact_name_boost = False
+        gateway._compass_index = test_index
+        gateway._config = test_config
+        gateway._startup_sync_done = True
+        gateway._analytics = None
+
+        semantic = _mk_search_results(sample_tools, [("test:read_file", 0.8)])
+        with _patch.object(test_index, "search", return_value=semantic):
+            from gateway import compass
+
+            result = await compass(intent="read file", top_k=5)
+
+        assert result["degraded"] is False
+        assert "degraded_reasons" not in result or result["degraded_reasons"] == []
+
+
+# =============================================================================
+# FEAT-01 — describe() serves the full schema from raw_schema (B3 column)
+# =============================================================================
+
+
+class TestDescribeFullSchemaFEAT01:
+    """describe() prefers the full raw_schema when present, and falls back to
+    the collapsed `parameters` when the value is NULL / malformed, or when the
+    column itself is absent (older DB, pre-migration)."""
+
+    @pytest.mark.asyncio
+    async def test_describe_returns_full_schema_when_raw_schema_present(
+        self, test_index, test_config
+    ):
+        import gateway
+
+        gateway._compass_index = test_index
+        gateway._config = test_config
+        gateway._health_state["index_available"] = True
+
+        # Populate the full inputSchema for one tool (column already exists in
+        # the index schema — B3 added it).
+        full_schema = {
+            "type": "object",
+            "properties": {
+                "filepath": {
+                    "type": "string",
+                    "description": "Absolute path to the file to read",
+                },
+                "encoding": {
+                    "type": "string",
+                    "enum": ["utf-8", "latin-1"],
+                    "default": "utf-8",
+                },
+            },
+            "required": ["filepath"],
+        }
+        test_index.db.execute(
+            "UPDATE tools SET raw_schema = ? WHERE name = ?",
+            (json.dumps(full_schema), "test:read_file"),
+        )
+        test_index.db.commit()
+
+        from gateway import describe
+
+        result = await describe(tool_name="test:read_file")
+
+        # The full schema is surfaced under `schema`.
+        assert result["schema"] == full_schema
+        assert result["schema"]["required"] == ["filepath"]
+        assert result["schema"]["properties"]["encoding"]["enum"] == [
+            "utf-8",
+            "latin-1",
+        ]
+        # `parameters` is preserved for back-compat.
+        assert "parameters" in result
+
+    @pytest.mark.asyncio
+    async def test_describe_falls_back_when_raw_schema_null(
+        self, test_index, test_config
+    ):
+        import gateway
+
+        gateway._compass_index = test_index
+        gateway._config = test_config
+        gateway._health_state["index_available"] = True
+
+        # raw_schema is NULL by default for every freshly-built row.
+        from gateway import describe
+
+        result = await describe(tool_name="test:read_file")
+
+        # No `schema` field — fell back to collapsed parameters exactly.
+        assert "schema" not in result
+        assert result["parameters"] == {"filepath": "str"}
+
+    @pytest.mark.asyncio
+    async def test_describe_falls_back_when_raw_schema_malformed(
+        self, test_index, test_config
+    ):
+        import gateway
+
+        gateway._compass_index = test_index
+        gateway._config = test_config
+        gateway._health_state["index_available"] = True
+
+        test_index.db.execute(
+            "UPDATE tools SET raw_schema = ? WHERE name = ?",
+            ("{not valid json", "test:read_file"),
+        )
+        test_index.db.commit()
+
+        from gateway import describe
+
+        result = await describe(tool_name="test:read_file")
+
+        assert "schema" not in result
+        assert result["parameters"] == {"filepath": "str"}
+
+    @pytest.mark.asyncio
+    async def test_load_raw_schema_handles_missing_column_defensively(
+        self, test_index
+    ):
+        """Direct-unit: before B3's migration the column doesn't exist and the
+        SELECT raises 'no such column'. _load_raw_schema must return None
+        WITHOUT flipping index health to unhealthy (expected, not a fault)."""
+        import gateway
+        from unittest.mock import Mock
+
+        gateway._health_state["index_available"] = True
+
+        # Wrap the real index but make db.execute raise no-such-column.
+        fake_index = Mock()
+        fake_db = Mock()
+        fake_db.execute = Mock(
+            side_effect=sqlite3.OperationalError("no such column: raw_schema")
+        )
+        fake_index.db = fake_db
+
+        assert gateway._load_raw_schema(fake_index, "test:read_file") is None
+        # Health flag untouched — a not-yet-migrated schema is not a fault.
+        assert gateway._health_state["index_available"] is True
+
+    @pytest.mark.asyncio
+    async def test_load_raw_schema_ignores_non_object_json(self, test_index):
+        """A bare-string raw_schema (valid JSON but not an object) is treated as
+        absent so the response `schema` field is always structured."""
+        import gateway
+
+        test_index.db.execute(
+            "UPDATE tools SET raw_schema = ? WHERE name = ?",
+            (json.dumps("just a string"), "test:read_file"),
+        )
+        test_index.db.commit()
+
+        assert gateway._load_raw_schema(test_index, "test:read_file") is None
+
+
+# =============================================================================
+# FEAT-03 — compass_status(active=True) surfaces the active liveness probe
+# =============================================================================
+
+
+class TestCompassStatusActiveProbeFEAT03:
+    """compass_status gains an optional active probe folded into backends."""
+
+    @pytest.mark.asyncio
+    async def test_active_true_surfaces_per_backend_probe(
+        self, test_index, test_config_with_backends
+    ):
+        import gateway
+
+        gateway._compass_index = test_index
+        gateway._config = test_config_with_backends
+        gateway._analytics = None
+
+        probe_result = {
+            "test_backend": {
+                "status": "degraded",
+                "tools": 3,
+                "probe": {"ok": False, "error_kind": "timeout"},
+            }
+        }
+        mgr = Mock()
+        mgr.get_stats = Mock(return_value={"configured_backends": ["test_backend"]})
+        mgr.health_check = AsyncMock(return_value=probe_result)
+        gateway._backend_manager = mgr
+
+        from gateway import compass_status
+
+        result = await compass_status(active=True)
+
+        # The active probe was invoked with active=True.
+        mgr.health_check.assert_awaited_once_with(active=True)
+        # Probe results are folded into backends under 'probes'.
+        assert result["backends"]["probes"] == probe_result
+        assert result["backends"]["probes"]["test_backend"]["status"] == "degraded"
+
+    @pytest.mark.asyncio
+    async def test_active_false_is_unchanged_no_probe(
+        self, test_index, test_config_with_backends
+    ):
+        import gateway
+
+        gateway._compass_index = test_index
+        gateway._config = test_config_with_backends
+        gateway._analytics = None
+
+        mgr = Mock()
+        mgr.get_stats = Mock(return_value={"configured_backends": ["test_backend"]})
+        mgr.health_check = AsyncMock(return_value={"unexpected": True})
+        gateway._backend_manager = mgr
+
+        from gateway import compass_status
+
+        result = await compass_status()  # default active=False
+
+        # No active probe fired, no 'probes' key added.
+        mgr.health_check.assert_not_awaited()
+        assert "probes" not in result["backends"]
+
+    @pytest.mark.asyncio
+    async def test_active_probe_failure_degrades_gracefully(
+        self, test_index, test_config_with_backends
+    ):
+        """A probe that raises must not abort the whole status — the probe
+        section degrades to {error} and the rest of the response survives."""
+        import gateway
+
+        gateway._compass_index = test_index
+        gateway._config = test_config_with_backends
+        gateway._analytics = None
+
+        mgr = Mock()
+        mgr.get_stats = Mock(return_value={"configured_backends": ["test_backend"]})
+        mgr.health_check = AsyncMock(side_effect=RuntimeError("probe boom"))
+        gateway._backend_manager = mgr
+
+        from gateway import compass_status
+
+        result = await compass_status(active=True)
+
+        # Status did not raise; the probe section reports the error.
+        assert "error" in result["backends"]["probes"]
+        # And other sections survived.
+        assert "index" in result
+        assert "config" in result
+
+
+# =============================================================================
+# FEAT-06 — deny/allow enforcement at the execute() boundary
+# =============================================================================
+
+
+def _mgr_with_policy(allow=None, deny=None):
+    """Build a mock BackendManager whose 'test' backend carries the given
+    allow/deny globs. execute_tool is an AsyncMock so we can assert it is (or
+    is not) called."""
+    from config import CompassConfig, StdioBackend
+
+    cfg = CompassConfig(
+        backends={
+            "test": StdioBackend(
+                command="python",
+                args=["-c", "pass"],
+                allow_tools=list(allow or []),
+                deny_tools=list(deny or []),
+            ),
+        },
+        auto_sync=False,
+        analytics_enabled=False,
+        chain_indexing_enabled=False,
+    )
+    mgr = Mock()
+    mgr.config = cfg
+    mgr.is_backend_connected = Mock(return_value=True)
+    mgr.connect_backend = AsyncMock(return_value=True)
+    mgr.execute_tool = AsyncMock(return_value={"success": True, "result": "ran"})
+    return mgr
+
+
+class TestExecuteDenyAllowFEAT06:
+    """execute() rejects policy-denied tools with a tool_denied envelope and
+    never proxies them; allowed tools proxy normally."""
+
+    @pytest.mark.asyncio
+    async def test_denied_tool_returns_tool_denied_and_never_proxies(
+        self, test_config
+    ):
+        import gateway
+
+        gateway._config = test_config
+        gateway._analytics = None
+        mgr = _mgr_with_policy(deny=["danger_*"])
+        gateway._backend_manager = mgr
+
+        from gateway import execute
+
+        result = await execute(tool_name="test:danger_delete", arguments={})
+
+        # Structured tool_denied envelope.
+        env = result["error_envelope"]
+        assert env["code"] == "tool_denied"
+        assert env["category"] == "forbidden"
+        assert env["retryable"] is False
+        assert result["success"] is False
+        # The backend was NEVER asked to run the tool.
+        mgr.execute_tool.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_allowed_tool_proxies_normally(self, test_config):
+        import gateway
+
+        gateway._config = test_config
+        gateway._analytics = None
+        mgr = _mgr_with_policy(deny=["danger_*"])
+        gateway._backend_manager = mgr
+
+        from gateway import execute
+
+        result = await execute(tool_name="test:read_file", arguments={})
+
+        # Not denied -> proxied; backend result flows through.
+        mgr.execute_tool.assert_awaited_once()
+        assert result.get("result") == "ran"
+        assert "error_envelope" not in result
+
+    @pytest.mark.asyncio
+    async def test_empty_lists_allow_everything(self, test_config):
+        import gateway
+
+        gateway._config = test_config
+        gateway._analytics = None
+        mgr = _mgr_with_policy()  # no allow, no deny
+        gateway._backend_manager = mgr
+
+        from gateway import execute
+
+        result = await execute(tool_name="test:anything_goes", arguments={})
+
+        mgr.execute_tool.assert_awaited_once()
+        assert "error_envelope" not in result
+
+    @pytest.mark.asyncio
+    async def test_allowlist_denies_unlisted_tool(self, test_config):
+        """A non-empty allow_tools acts as an allowlist: a tool not matching any
+        allow glob is denied."""
+        import gateway
+
+        gateway._config = test_config
+        gateway._analytics = None
+        mgr = _mgr_with_policy(allow=["read_*"])
+        gateway._backend_manager = mgr
+
+        from gateway import execute
+
+        # write_file does not match read_* -> denied.
+        denied = await execute(tool_name="test:write_file", arguments={})
+        assert denied["error_envelope"]["code"] == "tool_denied"
+        mgr.execute_tool.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_allowlist_permits_matching_tool(self, test_config):
+        import gateway
+
+        gateway._config = test_config
+        gateway._analytics = None
+        mgr = _mgr_with_policy(allow=["read_*"])
+        gateway._backend_manager = mgr
+
+        from gateway import execute
+
+        allowed = await execute(tool_name="test:read_file", arguments={})
+        mgr.execute_tool.assert_awaited_once()
+        assert "error_envelope" not in allowed
+
+    @pytest.mark.asyncio
+    async def test_deny_wins_over_allow(self, test_config):
+        """When a tool matches both allow and deny globs, deny wins."""
+        import gateway
+
+        gateway._config = test_config
+        gateway._analytics = None
+        mgr = _mgr_with_policy(allow=["read_*"], deny=["read_secret"])
+        gateway._backend_manager = mgr
+
+        from gateway import execute
+
+        result = await execute(tool_name="test:read_secret", arguments={})
+        assert result["error_envelope"]["code"] == "tool_denied"
+        mgr.execute_tool.assert_not_awaited()
+
+
+# =============================================================================
+# OPS-1 — optional bearer-token auth on the HTTP transport
+# =============================================================================
+
+
+async def _drive_asgi(app, path="/mcp", headers=None, scope_type="http"):
+    """Drive an ASGI callable and capture the response start + body. Returns
+    (status_code, sent_events, inner_called_flag_dict). If the wrapped inner
+    app runs it appends to `calls`."""
+    raw_headers = []
+    for k, v in (headers or {}).items():
+        raw_headers.append((k.encode("latin-1"), v.encode("latin-1")))
+    scope = {"type": scope_type, "path": path, "headers": raw_headers, "method": "POST"}
+
+    sent = []
+
+    async def receive():
+        return {"type": "http.request", "body": b"", "more_body": False}
+
+    async def send(event):
+        sent.append(event)
+
+    await app(scope, receive, send)
+    status = None
+    for e in sent:
+        if e.get("type") == "http.response.start":
+            status = e.get("status")
+    return status, sent
+
+
+def _stub_inner_app(calls):
+    """An inner ASGI app that records that it was invoked and returns 200."""
+
+    async def inner(scope, receive, send):
+        calls.append(scope.get("path"))
+        if scope.get("type") == "http":
+            await send(
+                {
+                    "type": "http.response.start",
+                    "status": 200,
+                    "headers": [(b"content-type", b"text/plain")],
+                }
+            )
+            await send({"type": "http.response.body", "body": b"ok"})
+
+    return inner
+
+
+class TestExtractBearerTokenOPS1:
+    def test_extracts_valid_bearer(self):
+        from gateway import _extract_bearer_token
+
+        headers = [(b"authorization", b"Bearer sekret123")]
+        assert _extract_bearer_token(headers) == "sekret123"
+
+    def test_case_insensitive_scheme_and_header(self):
+        from gateway import _extract_bearer_token
+
+        headers = [(b"Authorization", b"bearer  spaced  ")]
+        assert _extract_bearer_token(headers) == "spaced"
+
+    def test_missing_header_returns_none(self):
+        from gateway import _extract_bearer_token
+
+        assert _extract_bearer_token([(b"x-other", b"v")]) is None
+
+    def test_non_bearer_scheme_returns_none(self):
+        from gateway import _extract_bearer_token
+
+        assert _extract_bearer_token([(b"authorization", b"Basic abc")]) is None
+
+
+class TestBearerAuthMiddlewareOPS1:
+    @pytest.mark.asyncio
+    async def test_correct_bearer_allowed(self):
+        import gateway
+
+        calls = []
+        inner = _stub_inner_app(calls)
+        wrapped = gateway._make_bearer_auth_middleware(inner, "s3cr3t")
+
+        status, _ = await _drive_asgi(
+            wrapped, path="/mcp", headers={"authorization": "Bearer s3cr3t"}
+        )
+
+        assert status == 200
+        assert calls == ["/mcp"]  # inner app ran
+
+    @pytest.mark.asyncio
+    async def test_wrong_bearer_rejected_401_and_not_proxied(self):
+        import gateway
+
+        calls = []
+        inner = _stub_inner_app(calls)
+        wrapped = gateway._make_bearer_auth_middleware(inner, "s3cr3t")
+
+        status, _ = await _drive_asgi(
+            wrapped, path="/mcp", headers={"authorization": "Bearer wrong"}
+        )
+
+        assert status == 401
+        assert calls == []  # inner app was NEVER invoked
+
+    @pytest.mark.asyncio
+    async def test_missing_bearer_rejected_401(self):
+        import gateway
+
+        calls = []
+        inner = _stub_inner_app(calls)
+        wrapped = gateway._make_bearer_auth_middleware(inner, "s3cr3t")
+
+        status, _ = await _drive_asgi(wrapped, path="/mcp", headers={})
+
+        assert status == 401
+        assert calls == []
+
+    @pytest.mark.asyncio
+    async def test_health_and_ready_reachable_without_token(self):
+        import gateway
+
+        for exempt in ("/health", "/ready"):
+            calls = []
+            inner = _stub_inner_app(calls)
+            wrapped = gateway._make_bearer_auth_middleware(inner, "s3cr3t")
+
+            status, _ = await _drive_asgi(wrapped, path=exempt, headers={})
+
+            assert status == 200, f"{exempt} must be reachable without token"
+            assert calls == [exempt]
+
+    @pytest.mark.asyncio
+    async def test_lifespan_scope_passes_through(self):
+        import gateway
+
+        calls = []
+
+        async def inner(scope, receive, send):
+            calls.append(scope.get("type"))
+
+        wrapped = gateway._make_bearer_auth_middleware(inner, "s3cr3t")
+
+        async def receive():
+            return {"type": "lifespan.startup"}
+
+        async def send(event):
+            pass
+
+        await wrapped({"type": "lifespan"}, receive, send)
+        assert calls == ["lifespan"]  # non-http passes through, no auth
+
+
+class TestBearerAuthTokenUnsetOPS1:
+    """When no token is configured the HTTP path stays open (today's behavior).
+
+    We can't easily boot uvicorn in a unit test, so we assert the decision:
+    the resolved token is empty -> the middleware branch in _run_http is not
+    taken. Verified by inspecting get_config().gateway_auth_token resolution.
+    """
+
+    def test_default_config_has_no_auth_token(self, test_config):
+        # A fresh config (no env var, no file field) resolves to no token, so
+        # the OPS-1 middleware is never installed -> open transport.
+        assert (test_config.gateway_auth_token or "") == ""
+
+
+# =============================================================================
+# auto-refresh — wire background polling into startup + FEAT-04 prune wiring
+# =============================================================================
+
+
+class TestBackgroundPollingStartDecision:
+    """The 'start polling only when interval>0' decision (unit-testable slice
+    of the auto-refresh lifecycle wiring)."""
+
+    @pytest.mark.asyncio
+    async def test_polling_started_when_interval_positive(self, test_config):
+        import gateway
+
+        test_config.sync_polling_interval = 300
+        gateway._config = test_config
+
+        sm = Mock()
+        sm.start_background_polling = AsyncMock()
+
+        started = await gateway._maybe_start_background_polling(sm)
+
+        assert started is True
+        sm.start_background_polling.assert_awaited_once_with(interval_seconds=300)
+
+    @pytest.mark.asyncio
+    async def test_polling_not_started_when_interval_zero(self, test_config):
+        import gateway
+
+        test_config.sync_polling_interval = 0  # disabled by design
+        gateway._config = test_config
+
+        sm = Mock()
+        sm.start_background_polling = AsyncMock()
+
+        started = await gateway._maybe_start_background_polling(sm)
+
+        assert started is False
+        sm.start_background_polling.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_polling_not_started_when_no_manager(self, test_config):
+        import gateway
+
+        test_config.sync_polling_interval = 300
+        gateway._config = test_config
+
+        started = await gateway._maybe_start_background_polling(None)
+        assert started is False
+
+    @pytest.mark.asyncio
+    async def test_polling_start_failure_is_swallowed(self, test_config):
+        import gateway
+
+        test_config.sync_polling_interval = 300
+        gateway._config = test_config
+
+        sm = Mock()
+        sm.start_background_polling = AsyncMock(side_effect=RuntimeError("boom"))
+
+        # Must not raise — the decision was taken (True) but the start failed.
+        started = await gateway._maybe_start_background_polling(sm)
+        assert started is True
+
+
+class TestAnalyticsPruneWiringFEAT04:
+    """FEAT-04: startup issues prune_old_records with the configured retention,
+    exactly once, defensively."""
+
+    @pytest.mark.asyncio
+    async def test_prune_called_with_configured_retention(self, test_config):
+        import gateway
+
+        gateway._analytics_pruned_once = False
+        test_config.analytics_retention_days = 14
+        gateway._config = test_config
+
+        analytics = Mock()
+        analytics.prune_old_records = AsyncMock(return_value=7)
+
+        async def fake_get_analytics():
+            return analytics
+
+        with patch("gateway.get_analytics_instance", side_effect=fake_get_analytics):
+            issued = await gateway._maybe_prune_analytics_once()
+
+        assert issued is True
+        analytics.prune_old_records.assert_awaited_once_with(14)
+
+    @pytest.mark.asyncio
+    async def test_prune_runs_only_once(self, test_config):
+        import gateway
+
+        gateway._analytics_pruned_once = False
+        test_config.analytics_retention_days = 30
+        gateway._config = test_config
+
+        analytics = Mock()
+        analytics.prune_old_records = AsyncMock(return_value=0)
+
+        async def fake_get_analytics():
+            return analytics
+
+        with patch("gateway.get_analytics_instance", side_effect=fake_get_analytics):
+            first = await gateway._maybe_prune_analytics_once()
+            second = await gateway._maybe_prune_analytics_once()
+
+        assert first is True
+        assert second is False  # latched — no second prune
+        analytics.prune_old_records.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_prune_skipped_when_analytics_none(self, test_config):
+        import gateway
+
+        gateway._analytics_pruned_once = False
+        gateway._config = test_config
+
+        async def fake_get_analytics():
+            return None
+
+        with patch("gateway.get_analytics_instance", side_effect=fake_get_analytics):
+            issued = await gateway._maybe_prune_analytics_once()
+
+        assert issued is False
+
+    @pytest.mark.asyncio
+    async def test_prune_skipped_when_method_absent(self, test_config):
+        """Defensive: if B4's prune_old_records isn't present, skip cleanly."""
+        import gateway
+
+        gateway._analytics_pruned_once = False
+        gateway._config = test_config
+
+        analytics = Mock(spec=[])  # no prune_old_records attribute
+
+        async def fake_get_analytics():
+            return analytics
+
+        with patch("gateway.get_analytics_instance", side_effect=fake_get_analytics):
+            issued = await gateway._maybe_prune_analytics_once()
+
+        assert issued is False
+
+    @pytest.mark.asyncio
+    async def test_prune_failure_is_swallowed_and_not_latched(self, test_config):
+        import gateway
+
+        gateway._analytics_pruned_once = False
+        test_config.analytics_retention_days = 30
+        gateway._config = test_config
+
+        analytics = Mock()
+        analytics.prune_old_records = AsyncMock(side_effect=RuntimeError("db locked"))
+
+        async def fake_get_analytics():
+            return analytics
+
+        with patch("gateway.get_analytics_instance", side_effect=fake_get_analytics):
+            issued = await gateway._maybe_prune_analytics_once()
+
+        assert issued is False
+        # Not latched on failure — a later attempt may succeed.
+        assert gateway._analytics_pruned_once is False

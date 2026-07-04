@@ -1423,3 +1423,378 @@ class TestUnreachableVsGoneDEG03:
         # must say so (warning), and must NOT claim it as a clean removal.
         assert "UNREACHABLE" in caplog.text
         assert "backend2" in caplog.text
+
+
+# =============================================================================
+# v2.5.0 FEAT-01 — schema fidelity: full inputSchema carried onto raw_schema
+# =============================================================================
+
+
+class TestSchemaFidelityFEAT01:
+    """FEAT-01: _tool_infos_to_definitions collapses each tool's inputSchema to
+    a flat {param:type} dict and threw the rest away. The full inputSchema is
+    available at collection time (ToolInfo.input_schema); it must be preserved
+    verbatim onto ToolDefinition.raw_schema (the Wave-A field) while the
+    collapsed `parameters` view is kept unchanged (embedding_text + back-compat
+    depend on it).
+    """
+
+    _RICH_SCHEMA = {
+        "type": "object",
+        "properties": {
+            "path": {"type": "string", "description": "File path to read"},
+            "mode": {"type": "string", "enum": ["r", "rb"]},
+            "limit": {"type": ["integer", "null"]},
+        },
+        "required": ["path"],
+    }
+
+    def test_raw_schema_carried_from_tool_info(self, sync_manager):
+        """A tool with a rich inputSchema -> its ToolDefinition.raw_schema
+        carries the FULL schema (required/enum/description all preserved)."""
+        tools = [
+            ToolInfo(
+                "read_file",
+                "backend1:read_file",
+                "Read a file",
+                "backend1",
+                self._RICH_SCHEMA,
+            ),
+        ]
+
+        defs = sync_manager._tool_infos_to_definitions(tools)
+
+        assert len(defs) == 1
+        d = defs[0]
+        # The full schema is preserved verbatim, not the collapsed view.
+        assert d.raw_schema == self._RICH_SCHEMA
+        assert d.raw_schema["required"] == ["path"]
+        assert d.raw_schema["properties"]["mode"]["enum"] == ["r", "rb"]
+        assert (
+            d.raw_schema["properties"]["path"]["description"] == "File path to read"
+        )
+
+    def test_collapsed_parameters_unchanged(self, sync_manager):
+        """The collapsed `parameters` view is kept exactly as before —
+        {param: type}, with list types "/"-joined."""
+        tools = [
+            ToolInfo(
+                "read_file",
+                "backend1:read_file",
+                "Read a file",
+                "backend1",
+                self._RICH_SCHEMA,
+            ),
+        ]
+
+        defs = sync_manager._tool_infos_to_definitions(tools)
+        d = defs[0]
+
+        assert d.parameters == {
+            "path": "string",
+            "mode": "string",
+            "limit": "integer/null",
+        }
+
+    def test_raw_schema_none_when_no_schema(self, sync_manager):
+        """A tool with an empty/absent inputSchema -> raw_schema is None
+        (nothing to preserve), collapsed parameters is {}."""
+        tools = [
+            ToolInfo("noargs", "backend1:noargs", "No args", "backend1", {}),
+        ]
+
+        defs = sync_manager._tool_infos_to_definitions(tools)
+        d = defs[0]
+
+        assert d.raw_schema is None
+        assert d.parameters == {}
+
+
+# =============================================================================
+# v2.5.0 FEAT-02 — change detection hashes description + schema, not just names
+# =============================================================================
+
+
+class TestChangeDetectionFingerprintFEAT02:
+    """FEAT-02: _compute_tool_hash hashed sorted tool NAMES only, so a backend
+    that revised a tool's description/params (same name) read as 'unchanged'
+    and never re-synced. The fingerprint must now hash
+    (qualified_name, description, canonical_json(input_schema)) tuples so any
+    description OR schema change trips a re-sync — and canonicalize the schema
+    so dict key reordering doesn't cause spurious hash churn.
+    """
+
+    def test_changed_description_changes_hash(self, sync_manager):
+        """Same names, but a changed description -> DIFFERENT hash
+        (previously identical -> the bug that skipped the re-sync)."""
+        before = [
+            ToolInfo("t1", "backend1:t1", "Original description", "backend1", {}),
+        ]
+        after = [
+            ToolInfo("t1", "backend1:t1", "REVISED description", "backend1", {}),
+        ]
+
+        assert (
+            sync_manager._compute_tool_hash(before)
+            != sync_manager._compute_tool_hash(after)
+        )
+
+    def test_changed_input_schema_changes_hash(self, sync_manager):
+        """Same names + description, but a changed inputSchema -> DIFFERENT
+        hash."""
+        before = [
+            ToolInfo(
+                "t1",
+                "backend1:t1",
+                "Same description",
+                "backend1",
+                {"type": "object", "properties": {"a": {"type": "string"}}},
+            ),
+        ]
+        after = [
+            ToolInfo(
+                "t1",
+                "backend1:t1",
+                "Same description",
+                "backend1",
+                {"type": "object", "properties": {"a": {"type": "integer"}}},
+            ),
+        ]
+
+        assert (
+            sync_manager._compute_tool_hash(before)
+            != sync_manager._compute_tool_hash(after)
+        )
+
+    def test_identical_tool_sets_same_hash(self, sync_manager):
+        """Two structurally-identical tool sets still produce the SAME hash —
+        no spurious churn."""
+        a = [
+            ToolInfo(
+                "t1",
+                "backend1:t1",
+                "Desc one",
+                "backend1",
+                {"type": "object", "properties": {"a": {"type": "string"}}},
+            ),
+            ToolInfo("t2", "backend1:t2", "Desc two", "backend1", {}),
+        ]
+        b = [
+            ToolInfo(
+                "t1",
+                "backend1:t1",
+                "Desc one",
+                "backend1",
+                {"type": "object", "properties": {"a": {"type": "string"}}},
+            ),
+            ToolInfo("t2", "backend1:t2", "Desc two", "backend1", {}),
+        ]
+
+        assert (
+            sync_manager._compute_tool_hash(a)
+            == sync_manager._compute_tool_hash(b)
+        )
+
+    def test_schema_key_reordering_does_not_change_hash(self, sync_manager):
+        """Canonicalization: reordering dict keys in the inputSchema must NOT
+        change the hash (json.dumps(..., sort_keys=True))."""
+        ordered = [
+            ToolInfo(
+                "t1",
+                "backend1:t1",
+                "Desc",
+                "backend1",
+                {
+                    "type": "object",
+                    "properties": {"a": {"type": "string"}, "b": {"type": "int"}},
+                    "required": ["a"],
+                },
+            ),
+        ]
+        reordered = [
+            ToolInfo(
+                "t1",
+                "backend1:t1",
+                "Desc",
+                "backend1",
+                {
+                    "required": ["a"],
+                    "properties": {"b": {"type": "int"}, "a": {"type": "string"}},
+                    "type": "object",
+                },
+            ),
+        ]
+
+        assert (
+            sync_manager._compute_tool_hash(ordered)
+            == sync_manager._compute_tool_hash(reordered)
+        )
+
+    @pytest.mark.asyncio
+    async def test_check_backend_changes_detects_description_revision(
+        self, sync_manager
+    ):
+        """End-to-end: a stored hash for the OLD description, then the backend
+        revises the description -> check_backend_changes reports changed."""
+        old_tools = [
+            ToolInfo("t1", "backend1:t1", "Original", "backend1", {}),
+        ]
+        stored_hash = sync_manager._compute_tool_hash(old_tools)
+
+        db = sync_manager._get_db()
+        db.execute(
+            """
+            INSERT INTO backend_sync_state (backend_name, tool_count, tool_hash, last_sync_at, sync_status)
+            VALUES (?, ?, ?, CURRENT_TIMESTAMP, 'synced')
+        """,
+            ("backend1", 1, stored_hash),
+        )
+        db.commit()
+
+        # Same name, revised description.
+        new_tools = [
+            ToolInfo("t1", "backend1:t1", "REVISED", "backend1", {}),
+        ]
+        sync_manager.backends.is_backend_connected = Mock(return_value=True)
+        sync_manager.backends.get_backend_tools = Mock(return_value=new_tools)
+
+        result = await sync_manager.check_backend_changes("backend1")
+
+        assert result is True, (
+            "a same-name description revision must trip change detection"
+        )
+
+
+# =============================================================================
+# v2.5.0 FEAT-06 (index-time half) — filter denied tools at sync
+# =============================================================================
+
+
+class TestToolFilteringAtSyncFEAT06:
+    """FEAT-06 (index half): _tool_infos_to_definitions must apply the resolving
+    backend's allow_tools/deny_tools globs so denied tools are NEVER indexed.
+    Match the BARE tool name; deny wins over allow; empty allow_tools = allow
+    all; a non-empty allow_tools = only-those. (The execute() boundary half is
+    owned by sibling B2.)
+    """
+
+    def _backend_names(self, defs):
+        return {d.name for d in defs}
+
+    def test_deny_glob_excludes_matching_tool(self, mock_index, mock_backends, temp_sync_db):
+        """deny_tools=['*secret*'] must not index a tool named 'read_secret'."""
+        config = CompassConfig(
+            backends={
+                "backend1": StdioBackend(
+                    command="python",
+                    args=[],
+                    deny_tools=["*secret*"],
+                ),
+            }
+        )
+        with patch("sync_manager.ANALYTICS_DB_PATH", temp_sync_db):
+            manager = SyncManager(config, mock_index, mock_backends)
+            try:
+                tools = [
+                    ToolInfo("read_secret", "backend1:read_secret", "Secret", "backend1", {}),
+                    ToolInfo("read_file", "backend1:read_file", "File", "backend1", {}),
+                ]
+                defs = manager._tool_infos_to_definitions(tools)
+            finally:
+                manager.close()
+
+        names = self._backend_names(defs)
+        assert "backend1:read_secret" not in names
+        assert "backend1:read_file" in names
+
+    def test_allow_glob_indexes_only_matching(self, mock_index, mock_backends, temp_sync_db):
+        """allow_tools=['read_*'] must index only read_* tools."""
+        config = CompassConfig(
+            backends={
+                "backend1": StdioBackend(
+                    command="python",
+                    args=[],
+                    allow_tools=["read_*"],
+                ),
+            }
+        )
+        with patch("sync_manager.ANALYTICS_DB_PATH", temp_sync_db):
+            manager = SyncManager(config, mock_index, mock_backends)
+            try:
+                tools = [
+                    ToolInfo("read_file", "backend1:read_file", "R", "backend1", {}),
+                    ToolInfo("read_dir", "backend1:read_dir", "R", "backend1", {}),
+                    ToolInfo("write_file", "backend1:write_file", "W", "backend1", {}),
+                ]
+                defs = manager._tool_infos_to_definitions(tools)
+            finally:
+                manager.close()
+
+        names = self._backend_names(defs)
+        assert names == {"backend1:read_file", "backend1:read_dir"}
+
+    def test_deny_wins_over_allow(self, mock_index, mock_backends, temp_sync_db):
+        """A tool matching BOTH allow and deny is denied (deny precedence)."""
+        config = CompassConfig(
+            backends={
+                "backend1": StdioBackend(
+                    command="python",
+                    args=[],
+                    allow_tools=["read_*"],
+                    deny_tools=["*secret*"],
+                ),
+            }
+        )
+        with patch("sync_manager.ANALYTICS_DB_PATH", temp_sync_db):
+            manager = SyncManager(config, mock_index, mock_backends)
+            try:
+                tools = [
+                    ToolInfo("read_secret", "backend1:read_secret", "S", "backend1", {}),
+                    ToolInfo("read_file", "backend1:read_file", "F", "backend1", {}),
+                ]
+                defs = manager._tool_infos_to_definitions(tools)
+            finally:
+                manager.close()
+
+        names = self._backend_names(defs)
+        assert "backend1:read_secret" not in names
+        assert "backend1:read_file" in names
+
+    def test_empty_lists_index_everything(self, sync_manager):
+        """Back-compat: empty allow_tools + empty deny_tools index everything.
+
+        (The default mock_config backends carry empty filter lists.)"""
+        tools = [
+            ToolInfo("read_secret", "backend1:read_secret", "S", "backend1", {}),
+            ToolInfo("anything", "backend1:anything", "A", "backend1", {}),
+        ]
+
+        defs = sync_manager._tool_infos_to_definitions(tools)
+
+        assert self._backend_names(defs) == {
+            "backend1:read_secret",
+            "backend1:anything",
+        }
+
+    def test_filter_uses_resolving_backend_config(self, mock_index, mock_backends, temp_sync_db):
+        """The filter is resolved from the tool's OWN backend config — a tool
+        whose qualified name resolves to backend2 uses backend2's deny list,
+        not backend1's."""
+        config = CompassConfig(
+            backends={
+                "backend1": StdioBackend(command="python", args=[], deny_tools=["*secret*"]),
+                "backend2": StdioBackend(command="python", args=[]),  # no filters
+            }
+        )
+        with patch("sync_manager.ANALYTICS_DB_PATH", temp_sync_db):
+            manager = SyncManager(config, mock_index, mock_backends)
+            try:
+                tools = [
+                    # backend2's secret tool is NOT denied (backend2 has no deny list).
+                    ToolInfo("read_secret", "backend2:read_secret", "S", "backend2", {}),
+                ]
+                defs = manager._tool_infos_to_definitions(tools)
+            finally:
+                manager.close()
+
+        assert self._backend_names(defs) == {"backend2:read_secret"}

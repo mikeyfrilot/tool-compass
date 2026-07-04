@@ -37,11 +37,39 @@ import os
 import subprocess
 import sys
 from typing import Dict, List, Optional, Any, Literal
+from contextlib import AsyncExitStack
 from dataclasses import dataclass, field
 from datetime import datetime
 
-from config import CompassConfig, StdioBackend, load_config
+from config import CompassConfig, StdioBackend, HttpBackend, load_config
 from _version import __version__
+
+# INT-01: the HTTP transport WRAPS the official MCP SDK's Streamable HTTP
+# client. This is deliberate and differs from the STDIO path, which hand-rolls
+# subprocess JSON-RPC to dodge the anyio task-group nesting hazard (a real
+# problem only for stdio_client: subprocess spawn + Proactor pipe under a
+# nested task group). HTTP has no subprocess and no Proactor pipe, so the SDK's
+# anyio task group is safe to nest here — see backend_client_mcp.py for the
+# reference AsyncExitStack + ClientSession pattern this mirrors. Imports are
+# module-level (mcp is a hard dependency; see backend_client_mcp.py), and were
+# VERIFIED against the installed mcp 1.28.0:
+#   - streamablehttp_client  (mcp.client.streamable_http) — NOTE the exact
+#     spelling: no underscores between "streamable" and "http" in the callable,
+#     unlike the module name. Yields (read, write, get_session_id).
+#   - create_mcp_http_client  (mcp.shared._httpx_utils, also re-exported from
+#     mcp.client.streamable_http) — builds the underlying httpx.AsyncClient
+#     with headers/timeout/auth; passed via the ``httpx_client_factory`` hook.
+#   - StreamableHTTPError  (mcp.client.streamable_http) — SDK-level transport
+#     wrapper error; grouped with httpx transport errors for OUTCOME_TRANSPORT.
+import httpx
+from mcp import ClientSession
+from mcp.client.streamable_http import (
+    streamablehttp_client,
+    create_mcp_http_client,
+    StreamableHTTPError,
+)
+from mcp.shared.exceptions import McpError
+from mcp.types import Implementation
 
 logger = logging.getLogger(__name__)
 
@@ -1275,6 +1303,407 @@ class SimpleBackendConnection:
         return self._stats
 
 
+class HttpBackendConnection:
+    """Per-backend MCP connection over Streamable HTTP.
+
+    INT-01: the HTTP transport for the gateway. Unlike
+    :class:`SimpleBackendConnection` (which hand-rolls subprocess JSON-RPC to
+    dodge the anyio task-group nesting hazard), this class WRAPS the official
+    MCP SDK's Streamable HTTP client. That hazard is subprocess/Proactor-pipe
+    specific and does not apply to HTTP, so nesting the SDK's anyio task group
+    under our own is safe here. The reference for the AsyncExitStack +
+    ClientSession pattern is ``backend_client_mcp.py``.
+
+    Duck-typed contract — this class exposes exactly the surface the
+    :class:`SimpleBackendManager` relies on, so the manager stays
+    transport-agnostic:
+
+    - ``connect(timeout=None) -> bool``
+    - ``disconnect()`` (idempotent)
+    - ``call_tool(tool_name, arguments) -> dict`` (same error envelope +
+      :class:`ConnectionStats` recording as the stdio path)
+    - ``get_tools() -> List[ToolInfo]`` (captures ``inputSchema`` so schema
+      fidelity flows downstream identically to stdio)
+    - ``active_probe(timeout=HEALTH_PROBE_TIMEOUT) -> dict`` (same probe dict
+      shape as :meth:`SimpleBackendConnection.active_probe`)
+    - properties ``is_connected`` / ``stats``
+    - ``_abandoned_pids`` — always an empty list; there is no subprocess to
+      abandon over HTTP, but ``get_stats`` reads ``conn._abandoned_pids``
+      unconditionally so we set it to ``[]`` to avoid an AttributeError there.
+
+    Outcome mapping mirrors the stdio path so health signals stay coherent
+    across transports:
+
+    - MCP ``isError`` result -> ``OUTCOME_TOOL_ERROR`` (LLM reasons about it;
+      NOT a backend-health failure).
+    - :class:`McpError` (structured JSON-RPC error over the session) ->
+      ``OUTCOME_PROTOCOL_ERROR`` carrying ``.error.code`` / ``.message`` /
+      ``.data``.
+    - httpx transport errors / HTTP status errors /
+      :class:`StreamableHTTPError` -> ``OUTCOME_TRANSPORT_ERROR``.
+    - :class:`asyncio.TimeoutError` -> ``OUTCOME_TIMEOUT``.
+    """
+
+    def __init__(self, name: str, backend: HttpBackend):
+        self.name = name
+        self.backend = backend
+        self._session: Optional[ClientSession] = None
+        # AsyncExitStack owns the lifecycle of both the streamable_http_client
+        # context and the ClientSession context; aclose()-ing it in
+        # disconnect() unwinds both in LIFO order.
+        self._exit_stack: Optional[AsyncExitStack] = None
+        self._tools: List[Dict[str, Any]] = []
+        self._connected = False
+        self._stats = ConnectionStats()
+        # INT-01: no subprocess over HTTP, so nothing is ever abandoned — but
+        # get_stats() reads conn._abandoned_pids unconditionally. Keep the
+        # attribute present (empty) so the stdio-shaped stats path does not
+        # AttributeError on an HTTP backend.
+        self._abandoned_pids: List[int] = []
+
+    async def connect(self, timeout: Optional[float] = None) -> bool:
+        """Establish the Streamable HTTP session and cache the tool list.
+
+        Enters ``streamablehttp_client`` then :class:`ClientSession` under a
+        single :class:`AsyncExitStack` stored on ``self`` so disconnect() can
+        unwind both. ``initialize`` and ``list_tools`` are bounded by
+        ``timeout`` (falls back to ``CONNECTION_TIMEOUT``). Any failure tears
+        the half-open session down via :meth:`disconnect` and returns ``False``
+        — never leaks a partially-entered exit stack.
+        """
+        if self._connected and self._session is not None:
+            return True
+
+        timeout = timeout or CONNECTION_TIMEOUT
+
+        try:
+            logger.info(
+                f"Connecting to HTTP backend: {self.name} "
+                f"(url={self.backend.url} timeout={timeout}s)"
+            )
+
+            # Build the underlying httpx client via the SDK's factory hook so
+            # our configured headers / connect timeout / (no) auth are applied
+            # to every request the transport makes. backend.headers is already
+            # redacted for logging by the config layer; the real values flow
+            # here into the transport only.
+            def _http_client_factory(
+                headers: Optional[Dict[str, str]] = None,
+                timeout: Optional[httpx.Timeout] = None,  # noqa: A002 - SDK hook name
+                auth: Optional[httpx.Auth] = None,
+            ) -> httpx.AsyncClient:
+                return create_mcp_http_client(
+                    headers=dict(self.backend.headers) if self.backend.headers else None,
+                    timeout=httpx.Timeout(self.backend.timeout),
+                    auth=None,
+                )
+
+            self._exit_stack = AsyncExitStack()
+            transport = await self._exit_stack.enter_async_context(
+                streamablehttp_client(
+                    self.backend.url,
+                    headers=dict(self.backend.headers) if self.backend.headers else None,
+                    timeout=httpx.Timeout(self.backend.timeout),
+                    auth=None,
+                    httpx_client_factory=_http_client_factory,
+                )
+            )
+            # streamablehttp_client yields (read, write, get_session_id). We
+            # only need the two streams for the session; the session-id getter
+            # is not used by this connection.
+            read_stream, write_stream, _get_sid = transport
+
+            self._session = await self._exit_stack.enter_async_context(
+                ClientSession(
+                    read_stream,
+                    write_stream,
+                    client_info=Implementation(
+                        name="tool-compass", version=__version__
+                    ),
+                )
+            )
+
+            await asyncio.wait_for(self._session.initialize(), timeout=timeout)
+
+            tools_result = await asyncio.wait_for(
+                self._session.list_tools(), timeout=timeout
+            )
+            # Normalize SDK Tool objects into the same dict shape the stdio
+            # path stores (name / description / inputSchema), so get_tools()
+            # can be identical and inputSchema fidelity is preserved.
+            self._tools = [
+                {
+                    "name": tool.name,
+                    "description": tool.description or "",
+                    "inputSchema": (
+                        tool.inputSchema
+                        if getattr(tool, "inputSchema", None) is not None
+                        else {}
+                    ),
+                }
+                for tool in tools_result.tools
+            ]
+
+            self._connected = True
+            self._stats.connected_at = datetime.now()
+            self._stats.last_used = datetime.now()
+            logger.info(
+                f"Connected to {self.name}: {len(self._tools)} tools available"
+            )
+            return True
+
+        except asyncio.TimeoutError:
+            logger.error(
+                f"HTTP connection to {self.name} timed out after {timeout}s"
+            )
+            await self.disconnect()
+            return False
+        except Exception as e:
+            logger.error(f"Failed to connect to HTTP backend {self.name}: {e}")
+            await self.disconnect()
+            return False
+
+    async def disconnect(self) -> None:
+        """Close the session by unwinding the AsyncExitStack. Idempotent.
+
+        Both the ClientSession and the streamable_http_client context were
+        entered on ``self._exit_stack``; a single ``aclose`` tears them down in
+        LIFO order. Safe to call repeatedly and from the failure path of
+        :meth:`connect` (half-open stack).
+        """
+        self._connected = False
+        if self._exit_stack is not None:
+            try:
+                await self._exit_stack.aclose()
+            except Exception as e:
+                logger.warning(
+                    f"Error closing HTTP connection to {self.name}: {e}"
+                )
+            self._exit_stack = None
+        self._session = None
+        self._tools = []
+
+    def get_tools(self) -> List[ToolInfo]:
+        """Get normalized tool info list.
+
+        Identical shape to :meth:`SimpleBackendConnection.get_tools` — the
+        cached ``self._tools`` dicts carry ``inputSchema`` so schema fidelity
+        flows downstream the same way for both transports.
+        """
+        tools = []
+        for tool in self._tools:
+            tools.append(ToolInfo(
+                name=tool.get("name", ""),
+                qualified_name=f"{self.name}:{tool.get('name', '')}",
+                description=tool.get("description", ""),
+                server=self.name,
+                input_schema=tool.get("inputSchema", {}),
+            ))
+        return tools
+
+    async def call_tool(self, tool_name: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
+        """Call a tool over the HTTP session.
+
+        Returns the SAME structured envelope as
+        :meth:`SimpleBackendConnection.call_tool` (BR-B-001 / BR-B-012), built
+        with :func:`make_error_envelope` and recording the SAME outcome
+        taxonomy into :class:`ConnectionStats`. Wrapped in ``asyncio.wait_for``
+        with ``PER_REQUEST_TIMEOUT`` so a hung session cannot pin the caller
+        indefinitely (the manager's outer deadline still applies on top).
+        """
+        if not self._connected or self._session is None:
+            raise BackendNotConnectedError(self.name)
+
+        start_time = asyncio.get_event_loop().time()
+        try:
+            res = await asyncio.wait_for(
+                self._session.call_tool(tool_name, arguments),
+                timeout=PER_REQUEST_TIMEOUT,
+            )
+
+            latency_ms = (asyncio.get_event_loop().time() - start_time) * 1000
+            content_list = list(res.content) if res.content else []
+
+            if res.isError:
+                # MCP-level tool error — the LLM should reason about this.
+                # Preserve the content array (dumped to plain dicts so the
+                # envelope stays JSON-serialisable). NOT a backend-health
+                # failure (BR-B-004).
+                dumped = _dump_content(content_list)
+                error_text = _join_text_content(content_list) or "Tool returned error"
+                self._stats.record_call(
+                    latency_ms=latency_ms, outcome=OUTCOME_TOOL_ERROR
+                )
+                return make_error_envelope(
+                    error_kind=OUTCOME_TOOL_ERROR,
+                    error=error_text,
+                    backend=self.name,
+                    retryable=True,
+                    content=dumped,
+                )
+
+            # Success — join TextContent parts for ``result`` and dump the
+            # full content array for ``content``.
+            text = _join_text_content(content_list)
+            self._stats.record_call(
+                latency_ms=latency_ms, outcome=OUTCOME_SUCCESS
+            )
+            return {
+                "success": True,
+                "result": text if text else "Tool executed successfully",
+                "content": _dump_content(content_list),
+            }
+
+        except McpError as e:
+            # Structured JSON-RPC error surfaced by the SDK session. Carries
+            # ``.error.code`` / ``.message`` / ``.data`` — map to protocol_error
+            # exactly as the stdio path maps a JSON-RPC ``error`` object.
+            latency_ms = (asyncio.get_event_loop().time() - start_time) * 1000
+            err = e.error
+            self._stats.record_call(
+                latency_ms=latency_ms, outcome=OUTCOME_PROTOCOL_ERROR
+            )
+            return make_error_envelope(
+                error_kind=OUTCOME_PROTOCOL_ERROR,
+                error=getattr(err, "message", str(e)),
+                backend=self.name,
+                code=getattr(err, "code", None),
+                data=getattr(err, "data", None),
+                retryable=False,
+            )
+        except asyncio.TimeoutError:
+            latency_ms = (asyncio.get_event_loop().time() - start_time) * 1000
+            self._stats.record_call(
+                latency_ms=latency_ms, outcome=OUTCOME_TIMEOUT
+            )
+            raise
+        except (
+            httpx.TransportError,
+            httpx.HTTPStatusError,
+            StreamableHTTPError,
+        ) as e:
+            # Pipe-equivalent for HTTP: the transport dropped / the server
+            # returned a hard error. Mark the connection unhealthy so the
+            # manager's transport-retry path reconnects. httpx.TransportError
+            # propagates so execute_tool's retry-except catches it.
+            latency_ms = (asyncio.get_event_loop().time() - start_time) * 1000
+            self._stats.record_call(
+                latency_ms=latency_ms, outcome=OUTCOME_TRANSPORT_ERROR
+            )
+            self._connected = False
+            logger.warning(
+                f"HTTP backend {self.name} transport error, will reconnect "
+                f"on next call: {e}"
+            )
+            raise
+        except BackendShuttingDownError:
+            latency_ms = (asyncio.get_event_loop().time() - start_time) * 1000
+            self._stats.record_call(
+                latency_ms=latency_ms, outcome=OUTCOME_SHUTDOWN_CANCELLED
+            )
+            raise
+        except Exception:
+            latency_ms = (asyncio.get_event_loop().time() - start_time) * 1000
+            # Genuinely-unknown failures default to transport_error — these are
+            # typically session / runtime issues, not tool failures.
+            self._stats.record_call(
+                latency_ms=latency_ms, outcome=OUTCOME_TRANSPORT_ERROR
+            )
+            self._connected = False
+            raise
+
+    async def active_probe(self, timeout: float = HEALTH_PROBE_TIMEOUT) -> Dict[str, Any]:
+        """Lightweight liveness check via ``send_ping``.
+
+        BR-B-007: returns the SAME probe dict shape as
+        :meth:`SimpleBackendConnection.active_probe`
+        (``{ok: True, latency_ms}`` / ``{ok: False, error_kind, error}``).
+        Stats are NOT recorded for probes so the tool-call health signal is
+        not corrupted.
+        """
+        if not self._connected or self._session is None:
+            return {
+                "ok": False,
+                "error_kind": OUTCOME_BACKEND_UNAVAILABLE,
+                "error": "backend not connected",
+            }
+
+        start_time = asyncio.get_event_loop().time()
+        try:
+            await asyncio.wait_for(self._session.send_ping(), timeout=timeout)
+        except asyncio.TimeoutError:
+            return {
+                "ok": False,
+                "error_kind": OUTCOME_TIMEOUT,
+                "error": f"probe timed out after {timeout}s",
+                "latency_ms": (asyncio.get_event_loop().time() - start_time) * 1000,
+            }
+        except McpError as e:
+            return {
+                "ok": False,
+                "error_kind": OUTCOME_PROTOCOL_ERROR,
+                "error": str(e),
+            }
+        except (
+            httpx.TransportError,
+            httpx.HTTPStatusError,
+            StreamableHTTPError,
+        ) as e:
+            return {
+                "ok": False,
+                "error_kind": OUTCOME_TRANSPORT_ERROR,
+                "error": str(e),
+            }
+        except Exception as e:
+            return {
+                "ok": False,
+                "error_kind": OUTCOME_TRANSPORT_ERROR,
+                "error": str(e),
+            }
+        latency_ms = (asyncio.get_event_loop().time() - start_time) * 1000
+        return {"ok": True, "latency_ms": latency_ms}
+
+    @property
+    def is_connected(self) -> bool:
+        return self._connected and self._session is not None
+
+    @property
+    def stats(self) -> ConnectionStats:
+        return self._stats
+
+
+def _join_text_content(content_list: List[Any]) -> str:
+    """Concatenate the ``text`` of every TextContent-like item.
+
+    INT-01: HTTP results come back as SDK content objects (TextContent, etc.),
+    NOT plain dicts like the stdio path. Duck-type on a ``.text`` attribute
+    with a ``.type == 'text'`` guard so image / audio / resource blocks are
+    skipped for the ``result`` string (they are still preserved in the dumped
+    ``content`` array).
+    """
+    parts: List[str] = []
+    for item in content_list:
+        if getattr(item, "type", None) == "text" and hasattr(item, "text"):
+            parts.append(item.text)
+    return "".join(parts)
+
+
+def _dump_content(content_list: List[Any]) -> List[Any]:
+    """Render SDK content objects into JSON-serialisable plain dicts.
+
+    INT-01: the envelope must stay JSON-serialisable for the gateway. SDK
+    content blocks are pydantic models exposing ``model_dump``; fall back to
+    the object itself if it is already a plain type.
+    """
+    dumped: List[Any] = []
+    for item in content_list:
+        if hasattr(item, "model_dump"):
+            dumped.append(item.model_dump(mode="json"))
+        else:
+            dumped.append(item)
+    return dumped
+
+
 class SimpleBackendManager:
     """
     Manages multiple MCP backend connections using simple subprocess approach.
@@ -1319,8 +1748,17 @@ class SimpleBackendManager:
                 logger.error(f"Unknown backend: {name}")
                 return False
 
-            if not isinstance(backend, StdioBackend):
-                logger.error(f"Unsupported backend type for {name}")
+            # INT-01: route by transport type. The old code hard-rejected
+            # anything that was not a StdioBackend; now StdioBackend spawns a
+            # subprocess connection and HttpBackend wraps the MCP SDK's
+            # Streamable HTTP client. ImportBackend (and any future type)
+            # still falls through to the reject. The connection factory runs
+            # OUTSIDE this lock (below); here we only validate the type so a
+            # misconfigured backend fails fast without touching the registry.
+            if not isinstance(backend, (StdioBackend, HttpBackend)):
+                logger.error(
+                    f"Unsupported backend type for {name}: {type(backend).__name__}"
+                )
                 return False
 
             # Pop the old broken connection out of the registry under lock
@@ -1342,7 +1780,18 @@ class SimpleBackendManager:
             except Exception as e:
                 logger.debug(f"Old-connection disconnect for {name}: {e}")
 
-        conn = SimpleBackendConnection(name, backend)
+        # INT-01: transport factory. Both connection classes expose the same
+        # duck-typed contract the manager relies on
+        # (connect / is_connected / get_tools / disconnect / call_tool /
+        # active_probe / stats / _abandoned_pids), so everything downstream of
+        # this line — the retry loop, the registry swap, execute_tool — is
+        # transport-agnostic.
+        if isinstance(backend, StdioBackend):
+            conn: Any = SimpleBackendConnection(name, backend)
+        else:
+            # isinstance(backend, HttpBackend) — guaranteed by the type gate
+            # under the lock above.
+            conn = HttpBackendConnection(name, backend)
         connected = False
         for attempt in range(MAX_RETRIES + 1):
             success = await conn.connect(timeout=timeout)
@@ -1517,9 +1966,13 @@ class SimpleBackendManager:
         BR-B-009: manager-layer timeouts are recorded in the connection
         stats via ``record_call(outcome=OUTCOME_TIMEOUT)`` so the
         ``success_rate`` gauge sees them.
-        """
-        timeout = timeout or TOOL_CALL_TIMEOUT
 
+        INT-02: the effective outer deadline is resolved by precedence
+        (most-specific wins) AFTER the server/tool split, just before the
+        try — see the ``resolved_timeout`` block below. The naive
+        ``timeout = timeout or TOOL_CALL_TIMEOUT`` used to live here; it is
+        deferred so per-backend / per-tool config can participate.
+        """
         # Parse qualified name. BR-A-018: prefer the tool-index match over a
         # naive split so a configured backend name containing ':' (which is
         # also a backend bug — the config layer should reject it, see
@@ -1566,6 +2019,28 @@ class SimpleBackendManager:
                 backend=server_name,
                 retryable=True,
             )
+
+        # INT-02: resolve the outer tool-call deadline by precedence, most-
+        # specific wins:
+        #   explicit ``timeout`` arg
+        #     > per-tool override (``tool_timeouts[bare_tool_name]``)
+        #     > per-backend default (``default_timeout``)
+        #     > TOOL_CALL_TIMEOUT (the process-wide floor; unchanged default).
+        # ``tool_timeouts`` is keyed by the BARE tool name (``tool_name``
+        # here, already stripped of the ``server:`` prefix above), matching
+        # the config-schema contract in config.py. An explicit non-None
+        # ``timeout`` short-circuits the whole lookup so callers can always
+        # override config. The wait_for and the retry path below both close
+        # over this local ``timeout`` and inherit the resolved value.
+        resolved_timeout = timeout
+        if resolved_timeout is None:
+            cfg_backend = self.config.backends.get(server_name)
+            if isinstance(cfg_backend, (StdioBackend, HttpBackend)):
+                resolved_timeout = (
+                    cfg_backend.tool_timeouts.get(tool_name)
+                    or cfg_backend.default_timeout
+                )
+        timeout = resolved_timeout or TOOL_CALL_TIMEOUT
 
         try:
             return await asyncio.wait_for(
@@ -1626,9 +2101,19 @@ class SimpleBackendManager:
                 data=e.data,
                 retryable=False,
             )
-        except (BrokenPipeError, ConnectionResetError) as transport_err:
+        except (
+            BrokenPipeError,
+            ConnectionResetError,
+            httpx.TransportError,
+        ) as transport_err:
             # BR-A-005: transport errors are the ONLY case we retry. The
             # backend's pipe broke — reconnect and try once more.
+            # INT-01: httpx.TransportError joins the retry set so a dropped
+            # HTTP connection (connection reset, read error, remote close)
+            # reconnects + retries once, exactly as a broken subprocess pipe
+            # does. HTTPStatusError is NOT a TransportError subclass, so a 4xx/
+            # 5xx does not trigger a blind retry — it surfaces as a
+            # transport_error envelope via the generic handler / call_tool.
             logger.error(
                 f"Transport error executing {qualified_name}: {transport_err}"
             )

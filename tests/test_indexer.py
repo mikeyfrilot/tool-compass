@@ -4,6 +4,7 @@ Tests for Tool Compass indexer module.
 Tests HNSW index building, searching, and metadata management.
 """
 
+import json
 from unittest.mock import patch
 
 import numpy as np
@@ -633,3 +634,200 @@ class TestCacheKeyIncorporatesProvider:
         h = idx._compute_text_hash("some text")
         assert isinstance(h, str)
         assert len(h) == 64
+
+
+class TestRawSchemaColumnFEAT01:
+    """v2.5.0 FEAT-01: the tools table gains a nullable `raw_schema TEXT`
+    column that round-trips the full JSON inputSchema (ToolDefinition.raw_schema
+    from Wave A). build_index stores json.dumps(tool.raw_schema) (or NULL when
+    None); the collapsed `parameters` column is kept exactly as before. An
+    idempotent migration ALTERs the column onto pre-existing DBs so old on-disk
+    DBs upgrade without a rebuild. Downstream gateway.describe() reads this
+    exact column name: `raw_schema`.
+    """
+
+    _RICH_SCHEMA = {
+        "type": "object",
+        "properties": {
+            "path": {"type": "string", "description": "File path"},
+            "mode": {"type": "string", "enum": ["r", "rb"]},
+        },
+        "required": ["path"],
+    }
+
+    def test_table_has_raw_schema_column(
+        self, temp_index_path, temp_db_path, mock_embedder
+    ):
+        """A freshly-created tools table must expose a `raw_schema` column."""
+        index = CompassIndex(
+            index_path=temp_index_path,
+            db_path=temp_db_path,
+            embedder=mock_embedder,
+        )
+        index._init_db()
+
+        cursor = index.db.execute("PRAGMA table_info(tools)")
+        columns = {row[1] for row in cursor.fetchall()}
+        assert "raw_schema" in columns
+
+    @pytest.mark.asyncio
+    async def test_build_index_round_trips_raw_schema(
+        self, temp_index_path, temp_db_path, mock_embedder
+    ):
+        """A tool with raw_schema set -> after build_index,
+        SELECT raw_schema returns the round-tripped JSON."""
+        index = CompassIndex(
+            index_path=temp_index_path,
+            db_path=temp_db_path,
+            embedder=mock_embedder,
+        )
+        tools = [
+            ToolDefinition(
+                name="test:read_file",
+                description="Read a file",
+                category="file",
+                server="test",
+                parameters={"path": "string", "mode": "string"},
+                examples=["read file"],
+                is_core=True,
+                raw_schema=self._RICH_SCHEMA,
+            ),
+        ]
+
+        await index.build_index(tools)
+
+        row = index.db.execute(
+            "SELECT raw_schema FROM tools WHERE name = ?", ("test:read_file",)
+        ).fetchone()
+        assert row["raw_schema"] is not None
+        assert json.loads(row["raw_schema"]) == self._RICH_SCHEMA
+
+        await index.close()
+
+    @pytest.mark.asyncio
+    async def test_build_index_stores_null_when_no_raw_schema(
+        self, temp_index_path, temp_db_path, mock_embedder, sample_tools
+    ):
+        """A tool with raw_schema=None (default) stores SQL NULL, not the
+        string 'null'."""
+        index = CompassIndex(
+            index_path=temp_index_path,
+            db_path=temp_db_path,
+            embedder=mock_embedder,
+        )
+        await index.build_index(sample_tools)
+
+        row = index.db.execute(
+            "SELECT raw_schema FROM tools WHERE name = ?", ("test:read_file",)
+        ).fetchone()
+        assert row["raw_schema"] is None
+
+        await index.close()
+
+    @pytest.mark.asyncio
+    async def test_add_single_tool_persists_raw_schema(
+        self, temp_index_path, temp_db_path, mock_embedder, sample_tools
+    ):
+        """The incremental add path (add_single_tool) also persists
+        raw_schema so sync's incremental branch keeps schema fidelity."""
+        index = CompassIndex(
+            index_path=temp_index_path,
+            db_path=temp_db_path,
+            embedder=mock_embedder,
+        )
+        await index.build_index(sample_tools)
+
+        new_tool = ToolDefinition(
+            name="test:schema_tool",
+            description="Has a rich schema",
+            category="other",
+            server="test",
+            parameters={"path": "string"},
+            examples=["x"],
+            raw_schema=self._RICH_SCHEMA,
+        )
+        assert await index.add_single_tool(new_tool) is True
+
+        row = index.db.execute(
+            "SELECT raw_schema FROM tools WHERE name = ?", ("test:schema_tool",)
+        ).fetchone()
+        assert json.loads(row["raw_schema"]) == self._RICH_SCHEMA
+
+        await index.close()
+
+    def test_migration_adds_column_to_legacy_db(
+        self, temp_index_path, temp_db_path, mock_embedder
+    ):
+        """Idempotent migration: a tools table created WITHOUT raw_schema
+        (simulating an old on-disk DB) must gain the column on _init_db, and
+        an existing row reads NULL for raw_schema.
+        """
+        import sqlite3
+
+        # Hand-build the OLD schema (no raw_schema column) + seed a row.
+        legacy = sqlite3.connect(str(temp_db_path))
+        legacy.execute(
+            """
+            CREATE TABLE tools (
+                id INTEGER PRIMARY KEY,
+                name TEXT UNIQUE NOT NULL,
+                description TEXT NOT NULL,
+                category TEXT NOT NULL,
+                server TEXT NOT NULL,
+                parameters TEXT,
+                examples TEXT,
+                is_core INTEGER DEFAULT 0,
+                embedding_text TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+        legacy.execute(
+            "INSERT INTO tools (name, description, category, server, parameters, "
+            "examples, is_core, embedding_text) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            ("old:tool", "legacy", "other", "old", "{}", "[]", 0, "x"),
+        )
+        legacy.commit()
+        legacy.close()
+
+        # Opening via CompassIndex must ALTER the column in (migration).
+        index = CompassIndex(
+            index_path=temp_index_path,
+            db_path=temp_db_path,
+            embedder=mock_embedder,
+        )
+        index._init_db()
+
+        columns = {
+            row[1] for row in index.db.execute("PRAGMA table_info(tools)").fetchall()
+        }
+        assert "raw_schema" in columns, "migration must add raw_schema to legacy DB"
+
+        # The pre-existing row reads NULL for the new column.
+        row = index.db.execute(
+            "SELECT raw_schema FROM tools WHERE name = ?", ("old:tool",)
+        ).fetchone()
+        assert row["raw_schema"] is None
+
+        index.db.close()
+
+    def test_migration_is_idempotent(
+        self, temp_index_path, temp_db_path, mock_embedder
+    ):
+        """Calling _init_db twice must not raise (duplicate-column ALTER is
+        swallowed)."""
+        index = CompassIndex(
+            index_path=temp_index_path,
+            db_path=temp_db_path,
+            embedder=mock_embedder,
+        )
+        index._init_db()
+        # Second init on the already-migrated DB must be a no-op, not a raise.
+        index._init_db()
+
+        columns = {
+            row[1] for row in index.db.execute("PRAGMA table_info(tools)").fetchall()
+        }
+        assert "raw_schema" in columns
+
+        index.db.close()

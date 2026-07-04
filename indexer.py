@@ -304,10 +304,11 @@ class CompassIndex:
                     description TEXT NOT NULL,
                     category TEXT NOT NULL,
                     server TEXT NOT NULL,
-                    parameters TEXT,  -- JSON
+                    parameters TEXT,  -- JSON (collapsed {param:type} view)
                     examples TEXT,    -- JSON
                     is_core INTEGER DEFAULT 0,
                     embedding_text TEXT,
+                    raw_schema TEXT,  -- FEAT-01: full JSON inputSchema (nullable)
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 );
 
@@ -328,6 +329,19 @@ class CompassIndex:
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 );
             """)
+
+            # FEAT-01: idempotent migration for pre-existing DBs. A tools table
+            # created by an older build (before the raw_schema column existed)
+            # is created by CREATE TABLE IF NOT EXISTS above WITHOUT the new
+            # column, so a bare ALTER upgrades it in place — no rebuild needed.
+            # On a fresh DB the column already exists and the ALTER raises
+            # "duplicate column name", which we swallow (mirrors the
+            # backend_sync_state forward-compat pattern in sync_manager).
+            try:
+                self.db.execute("ALTER TABLE tools ADD COLUMN raw_schema TEXT")
+            except sqlite3.OperationalError:
+                pass  # column already exists
+
             self.db.commit()
 
         # Runtime cache hit/miss counters (IDX-FT-003). Reset only on process
@@ -436,11 +450,18 @@ class CompassIndex:
                 embedding_text = tool.embedding_text()
                 embedding_texts.append(embedding_text)
 
-                # Insert into SQLite (still inside the open transaction)
+                # Insert into SQLite (still inside the open transaction).
+                # FEAT-01: persist the full inputSchema as JSON in raw_schema,
+                # or SQL NULL when the tool carries no schema. The collapsed
+                # `parameters` column is kept exactly as before.
+                raw_schema = getattr(tool, "raw_schema", None)
+                raw_schema_json = (
+                    json.dumps(raw_schema) if raw_schema is not None else None
+                )
                 cursor = self.db.execute(
                     """
-                    INSERT INTO tools (name, description, category, server, parameters, examples, is_core, embedding_text)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    INSERT INTO tools (name, description, category, server, parameters, examples, is_core, embedding_text, raw_schema)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                     (
                         tool.name,
@@ -451,6 +472,7 @@ class CompassIndex:
                         json.dumps(tool.examples),
                         1 if tool.is_core else 0,
                         embedding_text,
+                        raw_schema_json,
                     ),
                 )
                 tool_ids.append(cursor.lastrowid)
@@ -972,6 +994,14 @@ class CompassIndex:
             )
             existing = cursor.fetchone()
 
+            # FEAT-01: preserve the full inputSchema on the incremental path too
+            # (as JSON, or SQL NULL when absent) so sync's add-based branch keeps
+            # schema fidelity alongside the full-rebuild branch.
+            raw_schema = getattr(tool, "raw_schema", None)
+            raw_schema_json = (
+                json.dumps(raw_schema) if raw_schema is not None else None
+            )
+
             with self._db_write_lock:
                 self.db.execute("BEGIN IMMEDIATE")
                 try:
@@ -984,7 +1014,7 @@ class CompassIndex:
                             UPDATE tools SET
                                 description = ?, category = ?, server = ?,
                                 parameters = ?, examples = ?, is_core = ?,
-                                embedding_text = ?
+                                embedding_text = ?, raw_schema = ?
                             WHERE id = ?
                         """,
                             (
@@ -995,6 +1025,7 @@ class CompassIndex:
                                 json.dumps(tool.examples),
                                 1 if tool.is_core else 0,
                                 embedding_text,
+                                raw_schema_json,
                                 tool_id,
                             ),
                         )
@@ -1002,8 +1033,8 @@ class CompassIndex:
                         # Insert new tool
                         cursor = self.db.execute(
                             """
-                            INSERT INTO tools (name, description, category, server, parameters, examples, is_core, embedding_text)
-                            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                            INSERT INTO tools (name, description, category, server, parameters, examples, is_core, embedding_text, raw_schema)
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                         """,
                             (
                                 tool.name,
@@ -1014,6 +1045,7 @@ class CompassIndex:
                                 json.dumps(tool.examples),
                                 1 if tool.is_core else 0,
                                 embedding_text,
+                                raw_schema_json,
                             ),
                         )
                         tool_id = cursor.lastrowid

@@ -574,6 +574,85 @@ class CompassAnalytics:
             # MCC-B-005: chain pattern save failure degrades analytics only.
             self._note_degraded("_save_chain_pattern", e)
 
+    async def prune_old_records(self, retention_days: int) -> int:
+        """Delete analytics rows older than the retention window (FEAT-04).
+
+        DELETEs from BOTH append-only tables — tool_calls and search_queries —
+        whose created_at is older than `retention_days` days, and returns the
+        total number of rows removed. A sibling gateway agent calls this as
+        ``await analytics.prune_old_records(config.analytics_retention_days)``.
+
+        retention_days <= 0 -> NO-OP (keep forever), returns 0.
+
+        CA-001 discipline: created_at is stamped by SQLite CURRENT_TIMESTAMP,
+        which is UTC. We compute the cutoff INSIDE SQLite via
+        ``datetime('now', '-N days')`` so BOTH sides of the comparison are UTC
+        — never datetime.now() naive local wall-clock, which would skew the
+        cutoff by the host's UTC offset (the exact bug fixed in
+        get_analytics_summary).
+
+        MCC-B-005 discipline: wrapped in the same _degraded / try-except the
+        other write methods use — a prune failure must degrade analytics, not
+        raise up through the caller. Respects the thread-safe lazy connection
+        and the write lock (self._lock) the rest of the module uses.
+        """
+        if self._degraded:
+            return 0
+        # retention_days <= 0 means "keep forever" — nothing to prune.
+        if retention_days <= 0:
+            return 0
+
+        total_deleted = 0
+        try:
+            db = self._get_db()
+
+            # Push the cutoff into SQL so it is evaluated in UTC by SQLite,
+            # matching how created_at was written. datetime('now', ?) with a
+            # '-N days' modifier yields a UTC 'YYYY-MM-DD HH:MM:SS' bound.
+            modifier = f"-{int(retention_days)} days"
+
+            with self._lock:
+                cur = db.execute(
+                    "DELETE FROM tool_calls "
+                    "WHERE created_at < datetime('now', ?)",
+                    (modifier,),
+                )
+                total_deleted += cur.rowcount or 0
+
+                cur = db.execute(
+                    "DELETE FROM search_queries "
+                    "WHERE created_at < datetime('now', ?)",
+                    (modifier,),
+                )
+                total_deleted += cur.rowcount or 0
+
+                db.commit()
+        except sqlite3.Error as e:
+            # MCC-B-005: a prune failure degrades analytics; it must never
+            # break the caller (the gateway prunes as housekeeping).
+            self._note_degraded("prune_old_records", e)
+            return 0
+
+        # VACUUM reclaims the pages freed by a large delete. It CANNOT run
+        # inside a transaction and takes its own file lock, so run it
+        # best-effort AFTER the committed delete and swallow any failure —
+        # reclaiming space is a nice-to-have, never worth raising for. Guard on
+        # a non-trivial delete so we don't VACUUM the whole DB on every no-op
+        # prune. Held under the write lock so it doesn't race another writer.
+        if total_deleted > 0:
+            try:
+                with self._lock:
+                    db.execute("VACUUM")
+            except sqlite3.Error as e:
+                logger.debug(f"VACUUM after prune skipped (non-fatal): {e}")
+
+        if total_deleted:
+            logger.info(
+                f"Pruned {total_deleted} analytics row(s) older than "
+                f"{retention_days} day(s)."
+            )
+        return total_deleted
+
     async def refresh_hot_cache(self, embedder=None, index=None):
         """
         Update the hot cache with top N most used tools.

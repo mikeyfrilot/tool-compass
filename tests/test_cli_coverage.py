@@ -2788,3 +2788,254 @@ class TestInitHelpers:
         assert located is not None
         assert located.name == "compass_config.example.json"
         assert located.is_file()
+
+
+# =============================================================================
+# cmd_execute — FEAT-05: proxy a tool call from the terminal
+# =============================================================================
+#
+# The subcommand obtains the backend-manager singleton the same way the
+# gateway does (``gateway.get_backends()``) and calls the manager's
+# ``execute_tool(tool, arguments, timeout=...)`` path, which returns the
+# structured envelope (BR-B-001/012): success -> ``{success: True, result,
+# content}``; failure -> ``{success: False, error_kind, error, ...}``.
+#
+# Tests patch ``gateway.get_backends`` with a stub manager whose
+# ``execute_tool`` returns a canned envelope, so no live backend / Ollama is
+# required. ``disconnect_all`` is a no-op async on the stub so the CLI's
+# clean-shutdown ``finally`` doesn't explode.
+
+
+class _StubManager:
+    """Fake SimpleBackendManager for exercising cli._cmd_execute.
+
+    Records the (tool, arguments, timeout) it was called with so tests can
+    assert the CLI forwarded them correctly, and returns a canned envelope.
+    """
+
+    def __init__(self, envelope, *, raises=None):
+        self._envelope = envelope
+        self._raises = raises
+        self.calls: list[tuple] = []
+        self.disconnected = False
+
+    async def execute_tool(self, qualified_name, arguments, timeout=None):
+        self.calls.append((qualified_name, arguments, timeout))
+        if self._raises is not None:
+            raise self._raises
+        return self._envelope
+
+    async def disconnect_all(self, *args, **kwargs):
+        self.disconnected = True
+        return {}
+
+
+def _patch_manager(monkeypatch, manager):
+    """Patch gateway.get_backends to return ``manager`` (an async singleton)."""
+    import gateway
+
+    async def fake_get_backends():
+        return manager
+
+    monkeypatch.setattr(gateway, "get_backends", fake_get_backends)
+    return manager
+
+
+_SUCCESS_ENVELOPE = {
+    "success": True,
+    "result": "file contents here",
+    "content": [{"type": "text", "text": "file contents here"}],
+}
+
+_TOOL_ERROR_ENVELOPE = {
+    "success": False,
+    "error_kind": "tool_error",
+    "error": "path does not exist: /nope",
+    "backend": "bridge",
+    "retryable": True,
+    "content": [{"type": "text", "text": "path does not exist: /nope"}],
+}
+
+
+class TestParseExecute:
+    """Parser-level shape for the execute subcommand."""
+
+    def test_parser_execute_positional_tool_and_args(self):
+        parser = cli._build_parser()
+        args = parser.parse_args(
+            ["execute", "bridge:read_file", '{"path": "/tmp/x"}']
+        )
+        assert args.command == "execute"
+        assert args.tool == "bridge:read_file"
+        assert args.args == '{"path": "/tmp/x"}'
+
+    def test_parser_execute_args_optional(self):
+        """A tool with no required args can be invoked without the JSON blob."""
+        parser = cli._build_parser()
+        args = parser.parse_args(["execute", "bridge:list_dir"])
+        assert args.tool == "bridge:list_dir"
+        # Default is None so the handler treats it as empty-args.
+        assert args.args is None
+
+    def test_parser_execute_timeout_and_json_flags(self):
+        parser = cli._build_parser()
+        args = parser.parse_args(
+            ["execute", "bridge:read_file", "{}", "--timeout", "12.5", "--json"]
+        )
+        assert args.timeout == 12.5
+        assert args.json is True
+
+
+class TestCmdExecute:
+    def test_execute_success_prints_result_exit_0(self, monkeypatch, capsys):
+        mgr = _patch_manager(monkeypatch, _StubManager(_SUCCESS_ENVELOPE))
+        rc = cli.main(["execute", "bridge:read_file", '{"path": "/tmp/x"}'])
+        out = capsys.readouterr().out
+        assert rc == 0
+        assert "file contents here" in out
+        # Arguments were parsed from JSON and forwarded to the manager.
+        assert mgr.calls[0][0] == "bridge:read_file"
+        assert mgr.calls[0][1] == {"path": "/tmp/x"}
+
+    def test_execute_no_args_defaults_to_empty_dict(self, monkeypatch, capsys):
+        mgr = _patch_manager(monkeypatch, _StubManager(_SUCCESS_ENVELOPE))
+        rc = cli.main(["execute", "bridge:list_dir"])
+        assert rc == 0
+        # Omitted args -> empty dict handed to the manager.
+        assert mgr.calls[0][1] == {}
+
+    def test_execute_json_emits_raw_envelope(self, monkeypatch, capsys):
+        _patch_manager(monkeypatch, _StubManager(_SUCCESS_ENVELOPE))
+        rc = cli.main(["execute", "bridge:read_file", "{}", "--json"])
+        out = capsys.readouterr().out.strip()
+        assert rc == 0
+        parsed = json.loads(out)
+        # The raw envelope is dumped verbatim (success + result + content).
+        assert parsed["success"] is True
+        assert parsed["result"] == "file contents here"
+        assert parsed["content"][0]["text"] == "file contents here"
+
+    def test_execute_tool_error_nonzero_exit(self, monkeypatch, capsys):
+        _patch_manager(monkeypatch, _StubManager(_TOOL_ERROR_ENVELOPE))
+        rc = cli.main(["execute", "bridge:read_file", '{"path": "/nope"}'])
+        err = capsys.readouterr().err
+        # Failure envelope -> error line on stderr + nonzero exit.
+        assert rc != 0
+        assert "path does not exist" in err
+
+    def test_execute_tool_error_shows_error_kind_as_hint(self, monkeypatch, capsys):
+        _patch_manager(monkeypatch, _StubManager(_TOOL_ERROR_ENVELOPE))
+        cli.main(["execute", "bridge:read_file", '{"path": "/nope"}'])
+        err = capsys.readouterr().err
+        # The error_kind is surfaced so the user knows it's a tool_error
+        # (not a transport/timeout failure).
+        assert "tool_error" in err
+
+    def test_execute_json_error_envelope_still_exit_nonzero(self, monkeypatch, capsys):
+        """--json on a failing call dumps the raw envelope but still exits nonzero."""
+        _patch_manager(monkeypatch, _StubManager(_TOOL_ERROR_ENVELOPE))
+        rc = cli.main(
+            ["execute", "bridge:read_file", '{"path": "/nope"}', "--json"]
+        )
+        out = capsys.readouterr().out.strip()
+        assert rc != 0
+        parsed = json.loads(out)
+        assert parsed["success"] is False
+        assert parsed["error_kind"] == "tool_error"
+
+    def test_execute_malformed_json_exit_2_with_hint(self, monkeypatch, capsys):
+        """Malformed args JSON is a usage error -> exit 2 + actionable hint,
+        and the backend is never consulted."""
+        mgr = _patch_manager(monkeypatch, _StubManager(_SUCCESS_ENVELOPE))
+        rc = cli.main(["execute", "bridge:read_file", "{not valid json"])
+        err = capsys.readouterr().err
+        assert rc == 2
+        # A hint pointing at valid JSON is emitted.
+        assert "json" in err.lower()
+        # The manager was never called — validation happens before execute.
+        assert mgr.calls == []
+
+    def test_execute_non_object_json_rejected(self, monkeypatch, capsys):
+        """Args must decode to a JSON object (dict), not a list/scalar."""
+        mgr = _patch_manager(monkeypatch, _StubManager(_SUCCESS_ENVELOPE))
+        rc = cli.main(["execute", "bridge:read_file", "[1, 2, 3]"])
+        err = capsys.readouterr().err
+        assert rc == 2
+        assert "object" in err.lower() or "json" in err.lower()
+        assert mgr.calls == []
+
+    def test_execute_timeout_forwarded_to_manager(self, monkeypatch, capsys):
+        mgr = _patch_manager(monkeypatch, _StubManager(_SUCCESS_ENVELOPE))
+        rc = cli.main(
+            ["execute", "bridge:read_file", "{}", "--timeout", "7.5"]
+        )
+        assert rc == 0
+        # The --timeout value reaches manager.execute_tool(timeout=...).
+        assert mgr.calls[0][2] == 7.5
+
+    def test_execute_no_timeout_passes_none(self, monkeypatch, capsys):
+        mgr = _patch_manager(monkeypatch, _StubManager(_SUCCESS_ENVELOPE))
+        cli.main(["execute", "bridge:read_file", "{}"])
+        # No --timeout -> None handed through (manager applies its default).
+        assert mgr.calls[0][2] is None
+
+    def test_execute_unknown_tool_actionable_message(self, monkeypatch, capsys):
+        """A backend_unavailable / not-found envelope surfaces an actionable
+        message (mirrors the manager's 'Tool not found' envelope)."""
+        envelope = {
+            "success": False,
+            "error_kind": "backend_unavailable",
+            "error": "Tool not found: bogus:nope. Use format 'server:tool_name'.",
+            "retryable": False,
+        }
+        _patch_manager(monkeypatch, _StubManager(envelope))
+        rc = cli.main(["execute", "bogus:nope", "{}"])
+        err = capsys.readouterr().err
+        assert rc != 0
+        assert "Tool not found" in err
+
+    def test_execute_manager_raises_is_handled(self, monkeypatch, capsys):
+        """An unhandled raise from the manager degrades to a single error line,
+        not a traceback (exit nonzero)."""
+        _patch_manager(
+            monkeypatch,
+            _StubManager(None, raises=RuntimeError("backend exploded")),
+        )
+        rc = cli.main(["execute", "bridge:read_file", "{}"])
+        err = capsys.readouterr().err
+        assert rc != 0
+        assert "backend exploded" in err or "failed" in err.lower()
+
+    def test_execute_disconnects_after_run(self, monkeypatch, capsys):
+        """The one-shot CLI cleanly disconnects the backend after execution so
+        child processes don't linger."""
+        mgr = _patch_manager(monkeypatch, _StubManager(_SUCCESS_ENVELOPE))
+        cli.main(["execute", "bridge:read_file", "{}"])
+        assert mgr.disconnected is True
+
+    def test_execute_no_color(self, monkeypatch, capsys):
+        _patch_manager(monkeypatch, _StubManager(_SUCCESS_ENVELOPE))
+        rc = cli.main(["--no-color", "execute", "bridge:read_file", "{}"])
+        out = capsys.readouterr().out
+        assert "\x1b[" not in out
+        assert rc == 0
+
+    def test_execute_emits_sync_hint_on_cold_install(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        """On a cold install (no index DB), a not-found result should nudge the
+        user to run sync, matching the other commands."""
+        import indexer
+
+        monkeypatch.setattr(indexer, "SQLITE_DB_PATH", tmp_path / "nope.db")
+        envelope = {
+            "success": False,
+            "error_kind": "backend_unavailable",
+            "error": "Tool not found: bogus:nope.",
+            "retryable": False,
+        }
+        _patch_manager(monkeypatch, _StubManager(envelope))
+        rc = cli.main(["execute", "bogus:nope", "{}"])
+        err = capsys.readouterr().err
+        assert rc != 0
+        assert "sync" in err.lower()

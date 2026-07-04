@@ -36,6 +36,12 @@ class ToolDefinition:
     # this tool itself was deprecated (None = not deprecated).
     deprecated_aliases: List[str] = field(default_factory=list)
     deprecated_since: Optional[str] = None
+    # FEAT-01: the full JSON inputSchema, preserved verbatim through sync. The
+    # collapsed `parameters` view stays the embedding/display summary; this is
+    # the lossless original for callers that need full type/enum/required info.
+    # None = no schema captured (e.g. static manifest entries). Deliberately
+    # NOT folded into embedding_text() — embedding stays description-based.
+    raw_schema: Optional[dict] = None
 
     def embedding_text(self) -> str:
         """
@@ -69,6 +75,7 @@ class ToolDefinition:
             "is_core": self.is_core,
             "deprecated_aliases": self.deprecated_aliases,
             "deprecated_since": self.deprecated_since,
+            "raw_schema": self.raw_schema,
         }
 
     @classmethod

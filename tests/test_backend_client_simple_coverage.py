@@ -33,11 +33,13 @@ import json
 from typing import Any, Dict, List, Optional, Tuple
 from unittest.mock import AsyncMock, Mock, patch
 
+import httpx
 import pytest
 
 from backend_client_simple import (
     SimpleBackendConnection,
     SimpleBackendManager,
+    HttpBackendConnection,
     BackendNotConnectedError,
     BackendOverloadedError,
     BackendProtocolError,
@@ -51,8 +53,9 @@ from backend_client_simple import (
     OUTCOME_TOOL_ERROR,
     OUTCOME_TRANSPORT_ERROR,
     MAX_INFLIGHT_REQUESTS_PER_BACKEND,
+    TOOL_CALL_TIMEOUT,
 )
-from config import CompassConfig, StdioBackend
+from config import CompassConfig, StdioBackend, HttpBackend
 
 
 # =============================================================================
@@ -1990,3 +1993,604 @@ class TestManagerToolLookup:
         assert mgr.get_tool_schema("bareword") is None
         # Colon but unknown server -> None.
         assert mgr.get_tool_schema("nope:tool") is None
+
+
+# =============================================================================
+# INT-01 — HTTP / streamable-http backend transport (HttpBackendConnection).
+#
+# Everything here mocks the MCP SDK entry points (streamablehttp_client +
+# ClientSession); no live server is required. We patch the symbols where
+# backend_client_simple imported them so the connection wires up a fake session.
+# =============================================================================
+
+import backend_client_simple as bcs  # noqa: E402
+from mcp.types import (  # noqa: E402
+    TextContent,
+    CallToolResult,
+    ListToolsResult,
+    Tool,
+    ErrorData,
+)
+from mcp.shared.exceptions import McpError  # noqa: E402
+from mcp.client.streamable_http import StreamableHTTPError  # noqa: E402
+
+
+class FakeClientSession:
+    """Stand-in for mcp.ClientSession.
+
+    Is its own async context manager (``__aenter__`` returns self), matching
+    the real ClientSession which ``HttpBackendConnection.connect`` enters via
+    ``AsyncExitStack.enter_async_context(ClientSession(...))``.
+
+    initialize / list_tools / call_tool / send_ping are AsyncMocks the test
+    seeds with return values or side effects.
+    """
+
+    def __init__(self, *args, **kwargs):
+        self.initialize = AsyncMock(return_value=Mock())
+        self.list_tools = AsyncMock(
+            return_value=ListToolsResult(tools=[])
+        )
+        self.call_tool = AsyncMock()
+        self.send_ping = AsyncMock(return_value=Mock())
+        self.entered = False
+        self.aexited = False
+
+    async def __aenter__(self):
+        self.entered = True
+        return self
+
+    async def __aexit__(self, *exc):
+        self.aexited = True
+        return False
+
+
+class FakeStreamableHTTPClient:
+    """Async CM stand-in for streamablehttp_client(...).
+
+    Yields the (read, write, get_session_id) tuple the real client yields.
+    The two streams are throwaway sentinels — the FakeClientSession ignores
+    them. ``connect_error`` lets a test make entering the transport blow up.
+    """
+
+    def __init__(self, connect_error: Optional[BaseException] = None):
+        self._connect_error = connect_error
+        self.aexited = False
+
+    async def __aenter__(self):
+        if self._connect_error is not None:
+            raise self._connect_error
+        read = Mock(name="read_stream")
+        write = Mock(name="write_stream")
+        get_sid = Mock(name="get_session_id", return_value="sid-123")
+        return (read, write, get_sid)
+
+    async def __aexit__(self, *exc):
+        self.aexited = True
+        return False
+
+
+def make_http_backend(**overrides) -> HttpBackend:
+    defaults = dict(
+        url="http://localhost:9000/mcp",
+        headers={"Authorization": "Bearer super-secret-token"},
+        timeout=5.0,
+    )
+    defaults.update(overrides)
+    return HttpBackend(**defaults)
+
+
+def _tool(name: str, schema: Optional[Dict[str, Any]] = None) -> Tool:
+    return Tool(
+        name=name,
+        description=f"{name} tool",
+        inputSchema=schema if schema is not None else {"type": "object"},
+    )
+
+
+def patch_sdk(
+    *,
+    session: FakeClientSession,
+    transport: Optional[FakeStreamableHTTPClient] = None,
+):
+    """Patch streamablehttp_client + ClientSession in backend_client_simple.
+
+    Returns a context-manager-yielding contextlib.ExitStack-like tuple of the
+    two patches so a test can ``with patch_sdk(...):``.
+    """
+    transport = transport or FakeStreamableHTTPClient()
+
+    def _fake_streamable(*args, **kwargs):
+        return transport
+
+    def _fake_session_ctor(*args, **kwargs):
+        return session
+
+    from contextlib import ExitStack
+
+    stack = ExitStack()
+    stack.enter_context(
+        patch.object(bcs, "streamablehttp_client", _fake_streamable)
+    )
+    stack.enter_context(patch.object(bcs, "ClientSession", _fake_session_ctor))
+    return stack
+
+
+class TestHttpBackendConnectionConnect:
+    """INT-01: connect() wires the SDK session and caches tools."""
+
+    async def test_connect_success_lists_tools_with_schema(self):
+        session = FakeClientSession()
+        session.list_tools = AsyncMock(
+            return_value=ListToolsResult(
+                tools=[
+                    _tool("echo", {"type": "object", "properties": {"x": {}}}),
+                    _tool("ping", {"type": "object"}),
+                ]
+            )
+        )
+        conn = HttpBackendConnection("http", make_http_backend())
+        with patch_sdk(session=session):
+            ok = await conn.connect(timeout=5.0)
+        assert ok is True
+        assert conn.is_connected is True
+        session.initialize.assert_awaited_once()
+        session.list_tools.assert_awaited_once()
+        tools = conn.get_tools()
+        assert [t.name for t in tools] == ["echo", "ping"]
+        # INT-01: inputSchema fidelity flows into ToolInfo the same way stdio
+        # does.
+        echo = next(t for t in tools if t.name == "echo")
+        assert echo.input_schema == {
+            "type": "object",
+            "properties": {"x": {}},
+        }
+        assert echo.qualified_name == "http:echo"
+
+    async def test_connect_idempotent_when_already_connected(self):
+        session = FakeClientSession()
+        conn = HttpBackendConnection("http", make_http_backend())
+        with patch_sdk(session=session):
+            assert await conn.connect() is True
+            # Second call short-circuits: initialize NOT awaited again.
+            assert await conn.connect() is True
+        session.initialize.assert_awaited_once()
+
+    async def test_connect_transport_failure_returns_false_and_cleans_up(self):
+        session = FakeClientSession()
+        transport = FakeStreamableHTTPClient(
+            connect_error=httpx.ConnectError("refused")
+        )
+        conn = HttpBackendConnection("http", make_http_backend())
+        with patch_sdk(session=session, transport=transport):
+            ok = await conn.connect(timeout=5.0)
+        assert ok is False
+        assert conn.is_connected is False
+        # disconnect() ran on the failure path — exit stack cleared.
+        assert conn._exit_stack is None
+
+    async def test_connect_initialize_timeout_returns_false(self):
+        session = FakeClientSession()
+
+        async def slow_init():
+            await asyncio.sleep(5)
+
+        session.initialize = AsyncMock(side_effect=slow_init)
+        conn = HttpBackendConnection("http", make_http_backend())
+        with patch_sdk(session=session):
+            ok = await conn.connect(timeout=0.05)
+        assert ok is False
+        assert conn.is_connected is False
+
+
+class TestHttpBackendConnectionCallTool:
+    """INT-01: call_tool envelope shapes + outcome taxonomy per error class."""
+
+    async def _connected(self, session: FakeClientSession) -> HttpBackendConnection:
+        conn = HttpBackendConnection("http", make_http_backend())
+        with patch_sdk(session=session):
+            assert await conn.connect() is True
+        # Keep the fake session live after the patch context exits so
+        # call_tool exercises it (connect already stored it on the conn).
+        return conn
+
+    async def test_call_tool_success_joins_text_content(self):
+        session = FakeClientSession()
+        session.call_tool = AsyncMock(
+            return_value=CallToolResult(
+                content=[
+                    TextContent(type="text", text="hello "),
+                    TextContent(type="text", text="world"),
+                ],
+                isError=False,
+            )
+        )
+        conn = await self._connected(session)
+        env = await conn.call_tool("echo", {"x": 1})
+        assert env["success"] is True
+        assert env["result"] == "hello world"
+        # content dumped to JSON-serialisable dicts.
+        assert isinstance(env["content"], list)
+        assert env["content"][0]["text"] == "hello "
+        assert conn.stats.outcomes[OUTCOME_SUCCESS] == 1
+        session.call_tool.assert_awaited_once_with("echo", {"x": 1})
+
+    async def test_call_tool_is_error_maps_tool_error(self):
+        session = FakeClientSession()
+        session.call_tool = AsyncMock(
+            return_value=CallToolResult(
+                content=[TextContent(type="text", text="boom")],
+                isError=True,
+            )
+        )
+        conn = await self._connected(session)
+        env = await conn.call_tool("echo", {})
+        assert env["success"] is False
+        assert env["error_kind"] == OUTCOME_TOOL_ERROR
+        assert env["error"] == "boom"
+        assert env["retryable"] is True
+        assert env["content"][0]["text"] == "boom"
+        # Tool error is NOT a backend-health failure.
+        assert conn.stats.failed_calls == 0
+        assert conn.stats.outcomes[OUTCOME_TOOL_ERROR] == 1
+
+    async def test_call_tool_mcp_error_maps_protocol_error(self):
+        session = FakeClientSession()
+        session.call_tool = AsyncMock(
+            side_effect=McpError(
+                ErrorData(code=-32601, message="Method not found", data={"k": 1})
+            )
+        )
+        conn = await self._connected(session)
+        env = await conn.call_tool("echo", {})
+        assert env["error_kind"] == OUTCOME_PROTOCOL_ERROR
+        assert env["code"] == -32601
+        assert env["error"] == "Method not found"
+        assert env["data"] == {"k": 1}
+        assert env["retryable"] is False
+        assert conn.stats.outcomes[OUTCOME_PROTOCOL_ERROR] == 1
+
+    async def test_call_tool_transport_error_raises_and_marks_disconnected(self):
+        session = FakeClientSession()
+        session.call_tool = AsyncMock(
+            side_effect=httpx.ReadError("connection dropped")
+        )
+        conn = await self._connected(session)
+        with pytest.raises(httpx.TransportError):
+            await conn.call_tool("echo", {})
+        # Transport error marks the connection unhealthy so the manager
+        # reconnects, and records the transport_error outcome.
+        assert conn.is_connected is False
+        assert conn.stats.outcomes[OUTCOME_TRANSPORT_ERROR] == 1
+
+    async def test_call_tool_streamable_http_error_maps_transport(self):
+        session = FakeClientSession()
+        session.call_tool = AsyncMock(
+            side_effect=StreamableHTTPError("bad stream")
+        )
+        conn = await self._connected(session)
+        with pytest.raises(StreamableHTTPError):
+            await conn.call_tool("echo", {})
+        assert conn.stats.outcomes[OUTCOME_TRANSPORT_ERROR] == 1
+
+    async def test_call_tool_timeout_records_timeout_outcome(self):
+        session = FakeClientSession()
+
+        async def slow_call(*_a, **_k):
+            await asyncio.sleep(5)
+
+        session.call_tool = AsyncMock(side_effect=slow_call)
+        conn = await self._connected(session)
+        with patch("backend_client_simple.PER_REQUEST_TIMEOUT", 0.05):
+            with pytest.raises(asyncio.TimeoutError):
+                await conn.call_tool("echo", {})
+        assert conn.stats.outcomes[OUTCOME_TIMEOUT] == 1
+
+    async def test_call_tool_raises_when_not_connected(self):
+        conn = HttpBackendConnection("http", make_http_backend())
+        with pytest.raises(BackendNotConnectedError):
+            await conn.call_tool("echo", {})
+
+    async def test_call_tool_redaction_header_not_in_envelope(self):
+        """Header redaction still holds: the secret bearer token never appears
+        in any error envelope produced by call_tool."""
+        session = FakeClientSession()
+        session.call_tool = AsyncMock(
+            side_effect=McpError(
+                ErrorData(code=-32000, message="upstream failed", data=None)
+            )
+        )
+        conn = await self._connected(session)
+        env = await conn.call_tool("echo", {})
+        blob = json.dumps(env)
+        assert "super-secret-token" not in blob
+        assert "Authorization" not in blob
+
+
+class TestHttpBackendConnectionProbeAndDisconnect:
+    """INT-01: active_probe shape + idempotent disconnect."""
+
+    async def _connected(self, session: FakeClientSession) -> HttpBackendConnection:
+        conn = HttpBackendConnection("http", make_http_backend())
+        with patch_sdk(session=session):
+            assert await conn.connect() is True
+        return conn
+
+    async def test_probe_success_returns_latency(self):
+        session = FakeClientSession()
+        conn = await self._connected(session)
+        result = await conn.active_probe(timeout=2.0)
+        assert result["ok"] is True
+        assert "latency_ms" in result
+        session.send_ping.assert_awaited_once()
+
+    async def test_probe_when_not_connected(self):
+        conn = HttpBackendConnection("http", make_http_backend())
+        result = await conn.active_probe(timeout=1.0)
+        assert result["ok"] is False
+        assert result["error_kind"] == OUTCOME_BACKEND_UNAVAILABLE
+
+    async def test_probe_timeout_returns_timeout_kind(self):
+        session = FakeClientSession()
+
+        async def slow_ping():
+            await asyncio.sleep(5)
+
+        session.send_ping = AsyncMock(side_effect=slow_ping)
+        conn = await self._connected(session)
+        result = await conn.active_probe(timeout=0.05)
+        assert result["ok"] is False
+        assert result["error_kind"] == OUTCOME_TIMEOUT
+
+    async def test_probe_transport_error_returns_transport_kind(self):
+        session = FakeClientSession()
+        session.send_ping = AsyncMock(
+            side_effect=httpx.ReadError("dropped")
+        )
+        conn = await self._connected(session)
+        result = await conn.active_probe(timeout=1.0)
+        assert result["ok"] is False
+        assert result["error_kind"] == OUTCOME_TRANSPORT_ERROR
+
+    async def test_disconnect_is_idempotent(self):
+        session = FakeClientSession()
+        conn = await self._connected(session)
+        assert conn.is_connected is True
+        await conn.disconnect()
+        assert conn.is_connected is False
+        # Second disconnect must not raise.
+        await conn.disconnect()
+        assert conn.is_connected is False
+
+
+class TestManagerHttpRouting:
+    """INT-01: connect_backend routes an HttpBackend to HttpBackendConnection
+    (no reject) and the type gate still rejects unsupported types."""
+
+    def _http_config(self) -> CompassConfig:
+        return CompassConfig(
+            backends={"web": make_http_backend()},
+            auto_sync=False,
+        )
+
+    async def test_connect_backend_builds_http_connection(self):
+        cfg = self._http_config()
+        mgr = SimpleBackendManager(cfg)
+        session = FakeClientSession()
+        session.list_tools = AsyncMock(
+            return_value=ListToolsResult(tools=[_tool("fetch")])
+        )
+        with patch_sdk(session=session):
+            ok = await mgr.connect_backend("web")
+        assert ok is True
+        conn = mgr._backends["web"]
+        assert isinstance(conn, HttpBackendConnection)
+        # Tool index was populated from the HTTP backend's tools.
+        assert mgr._tool_index.get("web:fetch") == "web"
+
+    async def test_connect_backend_rejects_import_backend(self):
+        from config import ImportBackend
+
+        cfg = CompassConfig(
+            backends={"mod": ImportBackend(module="some.mod")},
+            auto_sync=False,
+        )
+        mgr = SimpleBackendManager(cfg)
+        assert await mgr.connect_backend("mod") is False
+
+    async def test_execute_tool_over_http_end_to_end(self):
+        cfg = self._http_config()
+        mgr = SimpleBackendManager(cfg)
+        session = FakeClientSession()
+        session.list_tools = AsyncMock(
+            return_value=ListToolsResult(tools=[_tool("fetch")])
+        )
+        session.call_tool = AsyncMock(
+            return_value=CallToolResult(
+                content=[TextContent(type="text", text="payload")],
+                isError=False,
+            )
+        )
+        with patch_sdk(session=session):
+            assert await mgr.connect_backend("web") is True
+            env = await mgr.execute_tool("web:fetch", {"q": "x"})
+        assert env["success"] is True
+        assert env["result"] == "payload"
+        session.call_tool.assert_awaited_once_with("fetch", {"q": "x"})
+
+
+class TestExecuteToolHttpTransportRetry:
+    """INT-01: a dropped HTTP connection (httpx.TransportError) reconnects +
+    retries once, exactly like a broken subprocess pipe."""
+
+    async def test_httpx_transport_error_retries_once(self):
+        cfg = CompassConfig(
+            backends={"web": make_http_backend()}, auto_sync=False
+        )
+        first = Mock()
+        first.is_connected = True
+        first.call_tool = AsyncMock(
+            side_effect=httpx.ReadError("connection dropped")
+        )
+
+        second = Mock()
+        second.is_connected = True
+        second.call_tool = AsyncMock(
+            return_value={"success": True, "result": "retry ok", "content": []}
+        )
+
+        mgr = SimpleBackendManager(cfg)
+        mgr._backends["web"] = first
+        mgr._tool_index["web:fetch"] = "web"
+
+        async def fake_reconnect(name, timeout=None):
+            mgr._backends[name] = second
+            return True
+
+        mgr.connect_backend = AsyncMock(side_effect=fake_reconnect)
+
+        env = await mgr.execute_tool("web:fetch", {})
+        assert env["success"] is True
+        assert env["result"] == "retry ok"
+        second.call_tool.assert_awaited_once()
+
+    async def test_httpx_transport_error_retry_fails(self):
+        cfg = CompassConfig(
+            backends={"web": make_http_backend()}, auto_sync=False
+        )
+        mock_conn = Mock()
+        mock_conn.is_connected = True
+        mock_conn.call_tool = AsyncMock(
+            side_effect=httpx.ConnectError("down")
+        )
+        mgr = SimpleBackendManager(cfg)
+        mgr._backends["web"] = mock_conn
+        mgr._tool_index["web:fetch"] = "web"
+        mgr.connect_backend = AsyncMock(return_value=False)
+
+        env = await mgr.execute_tool("web:fetch", {})
+        assert env["error_kind"] == OUTCOME_TRANSPORT_ERROR
+        assert env["retryable"] is False
+
+
+# =============================================================================
+# INT-02 — per-backend / per-tool timeout resolution in execute_tool.
+#
+# Precedence (most-specific wins):
+#   explicit timeout arg
+#     > tool_timeouts[bare_tool_name]
+#     > default_timeout
+#     > TOOL_CALL_TIMEOUT
+# We capture the effective outer deadline by making call_tool sleep and
+# reading the timeout back out of the resulting timeout envelope / by
+# intercepting asyncio.wait_for. The cleanest capture: patch call_tool to a
+# fast success and spy on asyncio.wait_for's timeout kwarg.
+# =============================================================================
+
+
+class _TimeoutCapturingConn:
+    """A fake connection whose call_tool records the outer deadline it is
+    invoked under. We can't read execute_tool's local ``timeout`` directly, so
+    the manager wraps call_tool in ``asyncio.wait_for(..., timeout=T)``; we
+    intercept that by patching asyncio.wait_for for the duration of the call.
+    """
+
+    def __init__(self):
+        self.is_connected = True
+        self.stats = Mock()
+        self.stats.record_call = Mock()
+
+    async def call_tool(self, tool_name, arguments):
+        return {"success": True, "result": "ok", "content": []}
+
+
+async def _run_capture_timeout(mgr, qualified_name, arguments, **kwargs):
+    """Run execute_tool while capturing the ``timeout`` passed to the outer
+    asyncio.wait_for around conn.call_tool. Returns (envelope, captured_timeout).
+    """
+    captured = {}
+    real_wait_for = asyncio.wait_for
+
+    async def spy_wait_for(aw, timeout):
+        captured["timeout"] = timeout
+        return await real_wait_for(aw, timeout)
+
+    with patch("backend_client_simple.asyncio.wait_for", spy_wait_for):
+        env = await mgr.execute_tool(qualified_name, arguments, **kwargs)
+    return env, captured.get("timeout")
+
+
+class TestTimeoutResolution:
+    """INT-02: precedence keyed by BARE tool name."""
+
+    def _mgr(self, backend) -> SimpleBackendManager:
+        cfg = CompassConfig(backends={"srv": backend}, auto_sync=False)
+        mgr = SimpleBackendManager(cfg)
+        conn = _TimeoutCapturingConn()
+        mgr._backends["srv"] = conn
+        mgr._tool_index["srv:do"] = "srv"
+        return mgr
+
+    async def test_explicit_timeout_wins_over_everything(self):
+        backend = StdioBackend(
+            command="x",
+            default_timeout=120.0,
+            tool_timeouts={"do": 45.0},
+        )
+        mgr = self._mgr(backend)
+        env, t = await _run_capture_timeout(
+            mgr, "srv:do", {}, timeout=7.5
+        )
+        assert env["success"] is True
+        assert t == 7.5
+
+    async def test_per_tool_overrides_backend_default(self):
+        backend = StdioBackend(
+            command="x",
+            default_timeout=120.0,
+            tool_timeouts={"do": 45.0},
+        )
+        mgr = self._mgr(backend)
+        env, t = await _run_capture_timeout(mgr, "srv:do", {})
+        assert t == 45.0
+
+    async def test_backend_default_used_when_no_per_tool_entry(self):
+        backend = StdioBackend(
+            command="x",
+            default_timeout=120.0,
+            tool_timeouts={"other": 45.0},  # not our tool
+        )
+        mgr = self._mgr(backend)
+        env, t = await _run_capture_timeout(mgr, "srv:do", {})
+        assert t == 120.0
+
+    async def test_unset_preserves_tool_call_timeout_exactly(self):
+        # No default_timeout, no tool_timeouts -> TOOL_CALL_TIMEOUT (15).
+        backend = StdioBackend(command="x")
+        mgr = self._mgr(backend)
+        env, t = await _run_capture_timeout(mgr, "srv:do", {})
+        assert t == TOOL_CALL_TIMEOUT
+        assert t == 15  # No behaviour change from the pre-INT-02 default.
+
+    async def test_http_backend_default_timeout_resolves(self):
+        backend = make_http_backend()
+        backend.default_timeout = 90.0
+        cfg = CompassConfig(backends={"srv": backend}, auto_sync=False)
+        mgr = SimpleBackendManager(cfg)
+        conn = _TimeoutCapturingConn()
+        mgr._backends["srv"] = conn
+        mgr._tool_index["srv:do"] = "srv"
+        env, t = await _run_capture_timeout(mgr, "srv:do", {})
+        assert t == 90.0
+
+    async def test_http_backend_per_tool_timeout_resolves(self):
+        backend = make_http_backend()
+        backend.default_timeout = 90.0
+        backend.tool_timeouts = {"do": 30.0}
+        cfg = CompassConfig(backends={"srv": backend}, auto_sync=False)
+        mgr = SimpleBackendManager(cfg)
+        conn = _TimeoutCapturingConn()
+        mgr._backends["srv"] = conn
+        mgr._tool_index["srv:do"] = "srv"
+        env, t = await _run_capture_timeout(mgr, "srv:do", {})
+        assert t == 30.0

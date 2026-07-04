@@ -36,7 +36,7 @@ import os
 import sqlite3
 import sys
 from pathlib import Path
-from typing import Any, List, Optional
+from typing import Any, Dict, List, Optional
 
 
 # =============================================================================
@@ -216,8 +216,9 @@ def _build_parser() -> argparse.ArgumentParser:
             "Tool Compass — semantic MCP tool discovery gateway.\n"
             "\n"
             "With no subcommand, runs the gateway server (default).\n"
-            "Subcommands: init, serve, search, describe, sync, doctor, ui,\n"
-            "             status, categories, audit, analytics, chains.\n"
+            "Subcommands: init, serve, search, describe, execute, sync,\n"
+            "             doctor, ui, status, categories, audit, analytics,\n"
+            "             chains.\n"
             "First run: `tool-compass init` scaffolds a config + prints setup.\n"
             "Web UI: install `tool-compass[ui]` and run `tool-compass ui`."
         ),
@@ -228,6 +229,7 @@ def _build_parser() -> argparse.ArgumentParser:
             "  tool-compass                       # run the MCP gateway\n"
             "  tool-compass search 'read a file'  # one-shot search\n"
             "  tool-compass describe bridge:read_file\n"
+            "  tool-compass execute bridge:read_file '{\"path\": \"README.md\"}'\n"
             "  tool-compass sync                  # rebuild the index\n"
             "  tool-compass doctor                # diagnostics JSON\n"
             "  tool-compass ui                    # launch Gradio web UI\n"
@@ -349,6 +351,57 @@ def _build_parser() -> argparse.ArgumentParser:
     p_describe.add_argument(
         "--json", action="store_true",
         help="JSON output (default emits Markdown).",
+    )
+
+    # execute — proxy a single tool call to its backend and print the result.
+    # The terminal counterpart to the MCP `execute` tool: search/describe let
+    # you FIND a tool from the shell; execute lets you SMOKE-TEST it without
+    # wiring up an MCP client. Arguments are passed as one positional JSON
+    # object (kept simple + copy-pasteable from `describe`'s example blocks).
+    p_execute = sub.add_parser(
+        "execute",
+        help="Run a tool on its backend and print the result",
+        epilog=(
+            "Examples:\n"
+            "  tool-compass execute bridge:read_file '{\"path\": \"README.md\"}'\n"
+            "  tool-compass execute bridge:list_dir            # no-arg tool\n"
+            "  tool-compass execute comfy:comfy_generate '{\"prompt\": \"a cat\"}' \\\n"
+            "      --timeout 120 --json | jq .result\n"
+            "\n"
+            "TOOL is a qualified name (server:tool_name) — see `tool-compass\n"
+            "describe <tool>` for its parameters. ARGS is a single JSON object;\n"
+            "omit it for tools that take no arguments. On a tool/transport/\n"
+            "timeout failure the error is printed and the exit code is nonzero."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p_execute.add_argument(
+        "tool",
+        type=str,
+        help="Qualified tool name to run (e.g., bridge:read_file).",
+    )
+    p_execute.add_argument(
+        "args",
+        type=str,
+        nargs="?",
+        default=None,
+        help=(
+            "Tool arguments as a single JSON object "
+            "(e.g. '{\"path\": \"README.md\"}'). Omit for a no-arg tool."
+        ),
+    )
+    p_execute.add_argument(
+        "--timeout",
+        type=float,
+        default=None,
+        help=(
+            "Per-call timeout in seconds (float). Defaults to the backend "
+            "manager's built-in tool-call timeout when omitted."
+        ),
+    )
+    p_execute.add_argument(
+        "--json", action="store_true",
+        help="Dump the raw result envelope (success/result/error) as JSON.",
     )
 
     # sync — rebuild the index from configured backends.
@@ -895,6 +948,148 @@ def _cmd_describe(args: argparse.Namespace) -> int:
         for ex in examples:
             out_console.print(f"- {ex}")
     return 0
+
+
+def _cmd_execute(args: argparse.Namespace) -> int:
+    """Proxy a single tool call to its backend and print the result.
+
+    FEAT-05: the terminal counterpart to the MCP ``execute`` tool. Adopters
+    can already ``search`` / ``describe`` from the shell; this lets them
+    smoke-test a proxied call without standing up an MCP client.
+
+    Design — argument passing:
+        A single positional JSON object (``args``) rather than repeatable
+        ``--arg key=value``. Rationale: (1) MCP tool arguments are already
+        JSON with nested/typed values (numbers, booleans, arrays, objects);
+        a flat ``key=value`` surface can't express those without a bespoke
+        mini-DSL, whereas one JSON blob is lossless. (2) ``describe`` already
+        prints example JSON the user can paste verbatim. (3) It mirrors the
+        MCP ``execute(tool_name, arguments)`` contract 1:1, so behavior is
+        identical whether the caller is the LLM or the terminal — no second
+        code path to drift. Malformed JSON is a usage error (exit 2), not a
+        crash.
+
+    Execution path:
+        Obtains the backend-manager SINGLETON the same way the gateway does
+        (``gateway.get_backends()`` — no reimplementation) and calls the
+        manager's ``execute_tool(tool, arguments, timeout=...)``. That method
+        handles connect/reconnect internally (``ensure_connected``) and returns
+        the structured envelope (BR-B-001/012): success is
+        ``{success: True, result, content}``; failure is
+        ``{success: False, error_kind, error, ...}``. We render success to
+        stdout and route any failure through ``_print_error`` with the
+        ``error_kind`` as the hint, exiting nonzero. ``--json`` dumps the raw
+        envelope verbatim (still nonzero on failure so scripts can branch on
+        the exit code without parsing).
+
+    Exit codes (consistent with the SD-CLI-006 audit):
+        0   tool ran and returned success
+        1   tool/transport/timeout/backend failure (an expected runtime outcome)
+        2   usage error (malformed / non-object args JSON)
+    """
+    err_console = _make_console(stderr=True, no_color_flag=_no_color(args))
+    out_console = _make_console(no_color_flag=_no_color(args))
+    json_mode = bool(getattr(args, "json", False))
+
+    # Parse the args JSON up front — a usage error (exit 2) before we touch a
+    # backend, mirroring _cmd_search's early --top validation. ``None`` (the
+    # positional was omitted) means "no arguments" -> empty dict.
+    raw_args = getattr(args, "args", None)
+    if raw_args is None:
+        arguments: Dict[str, Any] = {}
+    else:
+        try:
+            arguments = json.loads(raw_args)
+        except json.JSONDecodeError as e:
+            return _print_error(
+                err_console,
+                f"Could not parse ARGS as JSON: {e}",
+                hint=(
+                    "Pass a single JSON object, e.g. "
+                    "'{\"path\": \"README.md\"}'. Quote it so the shell "
+                    "keeps it as one argument."
+                ),
+                exit_code=2,
+            )
+        # MCP tool arguments are always an object. A list/scalar would be
+        # rejected by the backend anyway — catch it here with a clearer message.
+        if not isinstance(arguments, dict):
+            return _print_error(
+                err_console,
+                f"ARGS must be a JSON object, got {type(arguments).__name__}.",
+                hint="Wrap the arguments in braces: '{\"key\": \"value\"}'.",
+                exit_code=2,
+            )
+
+    try:
+        from gateway import get_backends
+    except Exception as e:  # pragma: no cover — gateway import is exercised elsewhere
+        return _print_error(
+            err_console,
+            f"Could not import gateway: {type(e).__name__}: {e}",
+            exit_code=2,
+        )
+
+    async def _run() -> Dict[str, Any]:
+        # Reuse the gateway's backend-manager singleton (do NOT construct a
+        # second one — that would spawn a duplicate set of child processes).
+        manager = await get_backends()
+        try:
+            return await manager.execute_tool(
+                args.tool, arguments, timeout=args.timeout
+            )
+        finally:
+            # One-shot CLI: shut the backend children down cleanly so we don't
+            # leak processes on exit. Same disconnect discipline as _cmd_sync.
+            try:
+                await manager.disconnect_all()
+            except Exception:  # pragma: no cover — best-effort cleanup
+                pass
+
+    try:
+        envelope = asyncio.run(_run())
+    except Exception as e:
+        # An unhandled raise from the manager (rare — execute_tool is designed
+        # to return envelopes, not raise) degrades to one line, never a stack.
+        return _print_error(
+            err_console,
+            f"Tool execution failed: {type(e).__name__}: {e}",
+            hint="Run `tool-compass status` to inspect backend health.",
+            exit_code=1,
+        )
+
+    success = bool(envelope.get("success")) if isinstance(envelope, dict) else False
+
+    if json_mode:
+        # Raw envelope verbatim on stdout. Exit code still reflects success so
+        # `... --json && ...` composition works without parsing the payload.
+        print(json.dumps(envelope, indent=2, default=str))
+        return 0 if success else 1
+
+    if success:
+        # Print the tool result. ``result`` is the concatenated text the
+        # backend emitted; fall back to the full envelope if it's absent.
+        result = envelope.get("result") if isinstance(envelope, dict) else None
+        if result is None:
+            result = json.dumps(envelope, indent=2, default=str)
+        _print_success(out_console, f"{args.tool} executed.")
+        # Print the payload via a plain print so Rich never reflows/styles it —
+        # the user may be piping the tool's output somewhere.
+        print(result)
+        return 0
+
+    # Failure envelope — surface the message + the error_kind (so the user can
+    # tell a tool_error from a transport/timeout failure) and exit nonzero.
+    error_msg = (
+        envelope.get("error") if isinstance(envelope, dict) else None
+    ) or "Tool execution failed."
+    error_kind = envelope.get("error_kind") if isinstance(envelope, dict) else None
+    hint = f"error_kind: {error_kind}" if error_kind else None
+    rc = _print_error(err_console, error_msg, hint=hint, exit_code=1)
+    # On a cold install a not-found routes here; nudge toward sync like the
+    # other index-aware commands.
+    _maybe_suggest_sync(err_console)
+    return rc
 
 
 def _cmd_sync(args: argparse.Namespace) -> int:
@@ -1913,6 +2108,8 @@ def main(argv: Optional[List[str]] = None) -> int:
             return _cmd_search(args)
         if args.command == "describe":
             return _cmd_describe(args)
+        if args.command == "execute":
+            return _cmd_execute(args)
         if args.command == "sync":
             return _cmd_sync(args)
         if args.command == "ui":

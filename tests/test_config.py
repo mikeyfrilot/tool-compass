@@ -808,3 +808,409 @@ class TestDoctorAnalyticsHealth:
             assert report["analytics_health"]["reason"] is not None
         finally:
             analytics_mod._analytics_instance = original
+
+
+class TestPerBackendTimeouts:
+    """INT-02: StdioBackend and HttpBackend carry a per-backend
+    default_timeout (outer tool-call deadline in seconds) and a tool_timeouts
+    map keyed by BARE tool name. Both round-trip through to_dict/from_dict and
+    are clamped to [1.0, 600.0] with a warning; non-numeric values reset/drop.
+    """
+
+    def test_defaults(self):
+        """Absent timeout fields take documented defaults (back-compat)."""
+        stdio = StdioBackend()
+        assert stdio.default_timeout is None
+        assert stdio.tool_timeouts == {}
+        http = HttpBackend()
+        assert http.default_timeout is None
+        assert http.tool_timeouts == {}
+
+    def test_stdio_timeout_roundtrip(self):
+        data = {
+            "backends": {
+                "srv": {
+                    "type": "stdio",
+                    "command": "python",
+                    "default_timeout": 45.0,
+                    "tool_timeouts": {"slow_tool": 120.0},
+                }
+            }
+        }
+        config = CompassConfig.from_dict(data)
+        backend = config.backends["srv"]
+        assert backend.default_timeout == 45.0
+        assert backend.tool_timeouts == {"slow_tool": 120.0}
+        # Round-trip out and back.
+        restored = CompassConfig.from_dict(config.to_dict())
+        rb = restored.backends["srv"]
+        assert rb.default_timeout == 45.0
+        assert rb.tool_timeouts == {"slow_tool": 120.0}
+
+    def test_http_timeout_roundtrip(self):
+        data = {
+            "backends": {
+                "api": {
+                    "type": "http",
+                    "url": "http://x:1",
+                    "default_timeout": 30.0,
+                    "tool_timeouts": {"heavy": 300.0},
+                }
+            }
+        }
+        config = CompassConfig.from_dict(data)
+        backend = config.backends["api"]
+        assert backend.default_timeout == 30.0
+        assert backend.tool_timeouts == {"heavy": 300.0}
+        restored = CompassConfig.from_dict(config.to_dict())
+        rb = restored.backends["api"]
+        assert rb.default_timeout == 30.0
+        assert rb.tool_timeouts == {"heavy": 300.0}
+
+    def test_default_timeout_non_numeric_resets_to_none(self):
+        """A non-numeric default_timeout resets to None with a warning."""
+        data = {
+            "backends": {
+                "srv": {
+                    "type": "stdio",
+                    "command": "python",
+                    "default_timeout": "soon",
+                }
+            }
+        }
+        config = CompassConfig.from_dict(data)
+        assert config.backends["srv"].default_timeout is None
+
+    def test_default_timeout_out_of_range_clamped(self):
+        """default_timeout clamps to [1.0, 600.0]."""
+        low = CompassConfig.from_dict(
+            {"backends": {"a": {"type": "stdio", "default_timeout": 0.1}}}
+        )
+        assert low.backends["a"].default_timeout == 1.0
+        high = CompassConfig.from_dict(
+            {"backends": {"b": {"type": "stdio", "default_timeout": 9999}}}
+        )
+        assert high.backends["b"].default_timeout == 600.0
+
+    def test_tool_timeouts_values_clamped(self):
+        """Each tool_timeouts value clamps to [1.0, 600.0]."""
+        config = CompassConfig.from_dict(
+            {
+                "backends": {
+                    "a": {
+                        "type": "stdio",
+                        "tool_timeouts": {"fast": 0.5, "slow": 5000},
+                    }
+                }
+            }
+        )
+        tt = config.backends["a"].tool_timeouts
+        assert tt["fast"] == 1.0
+        assert tt["slow"] == 600.0
+
+    def test_tool_timeouts_non_numeric_entry_dropped(self):
+        """A non-numeric tool_timeouts entry is dropped with a warning."""
+        config = CompassConfig.from_dict(
+            {
+                "backends": {
+                    "a": {
+                        "type": "stdio",
+                        "tool_timeouts": {"good": 10.0, "bad": "forever"},
+                    }
+                }
+            }
+        )
+        tt = config.backends["a"].tool_timeouts
+        assert tt == {"good": 10.0}
+
+
+class TestBackendToolFilters:
+    """FEAT-06: StdioBackend, HttpBackend, and ImportBackend each carry
+    allow_tools / deny_tools glob lists. Empty allow = allow all; deny takes
+    precedence. Both round-trip and are coerced to list-of-str.
+    """
+
+    def test_defaults_empty(self):
+        for backend in (StdioBackend(), HttpBackend(), ImportBackend()):
+            assert backend.allow_tools == []
+            assert backend.deny_tools == []
+
+    def test_stdio_filters_roundtrip(self):
+        data = {
+            "backends": {
+                "srv": {
+                    "type": "stdio",
+                    "command": "python",
+                    "allow_tools": ["read_*", "list_*"],
+                    "deny_tools": ["delete_*"],
+                }
+            }
+        }
+        config = CompassConfig.from_dict(data)
+        backend = config.backends["srv"]
+        assert backend.allow_tools == ["read_*", "list_*"]
+        assert backend.deny_tools == ["delete_*"]
+        restored = CompassConfig.from_dict(config.to_dict())
+        rb = restored.backends["srv"]
+        assert rb.allow_tools == ["read_*", "list_*"]
+        assert rb.deny_tools == ["delete_*"]
+
+    def test_http_filters_roundtrip(self):
+        data = {
+            "backends": {
+                "api": {
+                    "type": "http",
+                    "url": "http://x:1",
+                    "allow_tools": ["search_*"],
+                    "deny_tools": ["admin_*"],
+                }
+            }
+        }
+        config = CompassConfig.from_dict(data)
+        backend = config.backends["api"]
+        assert backend.allow_tools == ["search_*"]
+        assert backend.deny_tools == ["admin_*"]
+        restored = CompassConfig.from_dict(config.to_dict())
+        rb = restored.backends["api"]
+        assert rb.allow_tools == ["search_*"]
+        assert rb.deny_tools == ["admin_*"]
+
+    def test_import_filters_roundtrip(self):
+        data = {
+            "backends": {
+                "local": {
+                    "type": "import",
+                    "module": "my_server",
+                    "allow_tools": ["*"],
+                    "deny_tools": ["dangerous_*"],
+                }
+            }
+        }
+        config = CompassConfig.from_dict(data)
+        backend = config.backends["local"]
+        assert backend.allow_tools == ["*"]
+        assert backend.deny_tools == ["dangerous_*"]
+        restored = CompassConfig.from_dict(config.to_dict())
+        rb = restored.backends["local"]
+        assert rb.allow_tools == ["*"]
+        assert rb.deny_tools == ["dangerous_*"]
+
+    def test_filters_coerced_to_list_of_str(self):
+        """Non-string entries are coerced; a non-list resets to empty."""
+        config = CompassConfig.from_dict(
+            {
+                "backends": {
+                    "a": {
+                        "type": "stdio",
+                        "allow_tools": ["ok", 123],
+                        "deny_tools": "not-a-list",
+                    }
+                }
+            }
+        )
+        backend = config.backends["a"]
+        assert backend.allow_tools == ["ok", "123"]
+        assert backend.deny_tools == []
+
+
+class TestSearchAndRetentionConfig:
+    """DISC-01/DISC-02/FEAT-04: hybrid_search, exact_name_boost,
+    exact_match_confidence, and analytics_retention_days round-trip, take
+    documented defaults, and clamp (retention >= 0)."""
+
+    def test_defaults(self):
+        config = CompassConfig()
+        assert config.hybrid_search is True
+        assert config.exact_name_boost is True
+        assert config.exact_match_confidence == 1.0
+        assert config.analytics_retention_days == 30
+
+    def test_roundtrip(self):
+        original = CompassConfig(
+            hybrid_search=False,
+            exact_name_boost=False,
+            exact_match_confidence=0.75,
+            analytics_retention_days=7,
+        )
+        data = original.to_dict()
+        assert data["hybrid_search"] is False
+        assert data["exact_name_boost"] is False
+        assert data["exact_match_confidence"] == 0.75
+        assert data["analytics_retention_days"] == 7
+        restored = CompassConfig.from_dict(data)
+        assert restored.hybrid_search is False
+        assert restored.exact_name_boost is False
+        assert restored.exact_match_confidence == 0.75
+        assert restored.analytics_retention_days == 7
+
+    def test_negative_retention_clamped_to_zero(self):
+        """A negative analytics_retention_days clamps to 0 (keep forever)."""
+        config = CompassConfig.from_dict(
+            {"backends": {}, "analytics_retention_days": -5}
+        )
+        assert config.analytics_retention_days == 0
+
+    def test_zero_retention_preserved(self):
+        """0 is allowed (keep forever) and not bumped."""
+        config = CompassConfig.from_dict(
+            {"backends": {}, "analytics_retention_days": 0}
+        )
+        assert config.analytics_retention_days == 0
+
+    def test_non_numeric_retention_resets_to_default(self):
+        config = CompassConfig.from_dict(
+            {"backends": {}, "analytics_retention_days": "forever"}
+        )
+        assert (
+            config.analytics_retention_days
+            == CompassConfig().analytics_retention_days
+        )
+
+
+class TestGatewayAuthToken:
+    """OPS-1: gateway_auth_token is an opt-in bearer token for the HTTP
+    transport. It round-trips, resolves ${VAR} like other secrets, falls back
+    to TOOL_COMPASS_GATEWAY_AUTH_TOKEN when unset, and is redacted in the
+    doctor()/show_config path (its name ends in _token)."""
+
+    def test_default_is_none(self):
+        assert CompassConfig().gateway_auth_token is None
+
+    def test_roundtrip(self):
+        original = CompassConfig(gateway_auth_token="secret-bearer-123")
+        data = original.to_dict()
+        assert data["gateway_auth_token"] == "secret-bearer-123"
+        restored = CompassConfig.from_dict(data)
+        assert restored.gateway_auth_token == "secret-bearer-123"
+
+    def test_redacted_in_redact_config(self):
+        cfg = CompassConfig(gateway_auth_token="super-secret-token-999")
+        redacted = _redact_config(cfg.to_dict())
+        blob = json.dumps(redacted)
+        assert "super-secret-token-999" not in blob
+        assert redacted["gateway_auth_token"] == "[REDACTED]"
+
+    def test_doctor_does_not_leak_gateway_auth_token(self, tmp_path):
+        """End-to-end: a ${VAR}-resolved token must not surface from doctor()."""
+        config_file = tmp_path / "compass_config.json"
+        config_file.write_text(json.dumps({
+            "backends": {},
+            "gateway_auth_token": "${MY_GATEWAY_TOKEN}",
+        }))
+        env = {
+            "TOOL_COMPASS_CONFIG": str(config_file),
+            "MY_GATEWAY_TOKEN": "live_gateway_secret_444",
+        }
+        with patch.dict(os.environ, env):
+            report = doctor()
+        blob = json.dumps(report, default=str)
+        assert "live_gateway_secret_444" not in blob
+        assert report["config"]["gateway_auth_token"] == "[REDACTED]"
+
+    def test_env_var_fallback_when_unset(self, tmp_path):
+        """TOOL_COMPASS_GATEWAY_AUTH_TOKEN populates an unset config field."""
+        config_file = tmp_path / "compass_config.json"
+        config_file.write_text(json.dumps({"backends": {}}))
+        env = {
+            "TOOL_COMPASS_CONFIG": str(config_file),
+            "TOOL_COMPASS_GATEWAY_AUTH_TOKEN": "env-gateway-token",
+        }
+        with patch.dict(os.environ, env):
+            config = load_config()
+        assert config.gateway_auth_token == "env-gateway-token"
+
+    def test_env_var_overrides_file_value(self, tmp_path):
+        """The env var wins over a file value (operator-intent signal)."""
+        config_file = tmp_path / "compass_config.json"
+        config_file.write_text(json.dumps({
+            "backends": {},
+            "gateway_auth_token": "file-token",
+        }))
+        env = {
+            "TOOL_COMPASS_CONFIG": str(config_file),
+            "TOOL_COMPASS_GATEWAY_AUTH_TOKEN": "env-token",
+        }
+        with patch.dict(os.environ, env):
+            config = load_config()
+        assert config.gateway_auth_token == "env-token"
+
+    def test_empty_env_does_not_blank_file_value(self, tmp_path):
+        config_file = tmp_path / "compass_config.json"
+        config_file.write_text(json.dumps({
+            "backends": {},
+            "gateway_auth_token": "file-token",
+        }))
+        env = {
+            "TOOL_COMPASS_CONFIG": str(config_file),
+            "TOOL_COMPASS_GATEWAY_AUTH_TOKEN": "",  # exported but empty
+        }
+        with patch.dict(os.environ, env):
+            config = load_config()
+        assert config.gateway_auth_token == "file-token"
+
+
+class TestAllNewFieldsRoundtrip:
+    """Contract-level: a config dict containing EVERY new field parses,
+    serializes, and re-parses identically (load->dump->load stability)."""
+
+    def test_full_roundtrip(self):
+        data = {
+            "backends": {
+                "srv": {
+                    "type": "stdio",
+                    "command": "python",
+                    "args": ["-m", "server"],
+                    "env": {"K": "V"},
+                    "default_timeout": 45.0,
+                    "tool_timeouts": {"slow": 120.0},
+                    "allow_tools": ["read_*"],
+                    "deny_tools": ["delete_*"],
+                },
+                "api": {
+                    "type": "http",
+                    "url": "http://x:1",
+                    "default_timeout": 30.0,
+                    "tool_timeouts": {"heavy": 300.0},
+                    "allow_tools": ["search_*"],
+                    "deny_tools": ["admin_*"],
+                },
+                "local": {
+                    "type": "import",
+                    "module": "m",
+                    "allow_tools": ["*"],
+                    "deny_tools": ["danger_*"],
+                },
+            },
+            "hybrid_search": False,
+            "exact_name_boost": False,
+            "exact_match_confidence": 0.5,
+            "analytics_retention_days": 14,
+            "gateway_auth_token": "tok-abc",
+        }
+        first = CompassConfig.from_dict(data)
+        dumped = first.to_dict()
+        second = CompassConfig.from_dict(dumped)
+
+        # Stable across a second round-trip.
+        assert second.to_dict() == dumped
+        # Spot-check per-backend fields survived both hops.
+        assert second.backends["srv"].default_timeout == 45.0
+        assert second.backends["srv"].tool_timeouts == {"slow": 120.0}
+        assert second.backends["srv"].allow_tools == ["read_*"]
+        assert second.backends["srv"].deny_tools == ["delete_*"]
+        assert second.backends["api"].default_timeout == 30.0
+        assert second.backends["local"].allow_tools == ["*"]
+        assert second.hybrid_search is False
+        assert second.exact_name_boost is False
+        assert second.exact_match_confidence == 0.5
+        assert second.analytics_retention_days == 14
+        assert second.gateway_auth_token == "tok-abc"
+
+    def test_absent_fields_take_defaults(self):
+        """Back-compat: an old minimal config still loads with defaults."""
+        config = CompassConfig.from_dict({"backends": {}})
+        assert config.hybrid_search is True
+        assert config.exact_name_boost is True
+        assert config.exact_match_confidence == 1.0
+        assert config.analytics_retention_days == 30
+        assert config.gateway_auth_token is None
