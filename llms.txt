@@ -102,9 +102,11 @@ User Intent → compass() → HNSW Vector Search → Ranked Tools
 ## Configuration
 
 Environment variables:
-- `OLLAMA_HOST`: Ollama server URL (default: http://localhost:11434)
-- `COMPASS_INDEX_PATH`: Where to store the HNSW index
-- `COMPASS_LOG_LEVEL`: Logging verbosity (DEBUG, INFO, WARN, ERROR)
+- `OLLAMA_URL`: Ollama server URL (default: http://localhost:11434)
+- `TOOL_COMPASS_DATA_DIR`: Where to store the HNSW index + analytics DB (default: platform-specific)
+- `TOOL_COMPASS_CONFIG`: Path to the compass config JSON (default: ~/.config/tool-compass/compass_config.json)
+- `LOG_LEVEL`: Logging verbosity (DEBUG, INFO, WARNING, ERROR, CRITICAL)
+- `PORT`: Set to enable HTTP transport for the MCP gateway (unset = stdio)
 
 ## Links
 

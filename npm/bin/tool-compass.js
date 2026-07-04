@@ -7,8 +7,8 @@ process.env.MCPTOOLSHOP_LAUNCH_CONFIG = JSON.stringify({
   toolName: "tool-compass",
   owner: "mcp-tool-shop-org",
   repo: "tool-compass",
-  version: "2.4.0",
-  tag: "v2.4.0",
+  version: "2.5.0",
+  tag: "v2.5.0",
 });
 
 require("@mcptoolshop/npm-launcher/bin/mcptoolshop-launch.js");

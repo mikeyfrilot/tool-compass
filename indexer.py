@@ -97,6 +97,17 @@ class CompassIndex:
         self._cache_hits = 0
         self._cache_misses = 0
 
+        # IDX-COMPOSED-002: while build_index holds its BEGIN IMMEDIATE
+        # rebuild transaction, embedding-cache mutations must NOT commit the
+        # shared connection (a mid-rebuild commit prematurely persists the
+        # DELETE + INSERTs, so a later HNSW-save failure can't roll them back →
+        # DB/HNSW divergence). During a rebuild this holds a list of deferred
+        # cache ops; _cache_put / _cache_get's self-heal append to it instead
+        # of committing, and build_index flushes it AFTER its own commit. When
+        # None (the normal case, e.g. add_single_tool), cache writes commit
+        # immediately as before.
+        self._deferred_cache_ops: Optional[List[tuple]] = None
+
         # BE-A-003: serialize DB writes across threads. search_sync() dispatches
         # search() to a worker thread via ThreadPoolExecutor when called from
         # inside a running event loop (Gradio, nested MCP). The sqlite3
@@ -152,11 +163,7 @@ class CompassIndex:
         dim = int(row["dim"])
         if dim != EMBEDDING_DIM:
             # Stale entry from a different-dim model — drop and miss.
-            with self._db_write_lock:
-                self.db.execute(
-                    "DELETE FROM embedding_cache WHERE text_hash = ?", (text_hash,)
-                )
-                self.db.commit()
+            self._delete_cache_row(text_hash)
             return None
         # SC-002: the column-dim check above is NOT sufficient. A row whose
         # dim==EMBEDDING_DIM but whose BLOB byte length is inconsistent
@@ -169,23 +176,50 @@ class CompassIndex:
         # column-dim-mismatch branch above) so the next pass re-populates it.
         blob = row["vector"]
         if blob is None or len(blob) != dim * 4:
-            with self._db_write_lock:
-                self.db.execute(
-                    "DELETE FROM embedding_cache WHERE text_hash = ?", (text_hash,)
-                )
-                self.db.commit()
+            self._delete_cache_row(text_hash)
             return None
         vector = np.frombuffer(blob, dtype=np.float32).reshape(dim)
         # frombuffer returns a read-only view; copy so hnswlib can use it.
         return vector.copy()
 
+    def _delete_cache_row(self, text_hash: str) -> None:
+        """Self-heal delete of a bad embedding_cache row (IDX-COMPOSED-002).
+
+        During a build_index rebuild (``self._deferred_cache_ops`` is a list)
+        the delete is DEFERRED — committing here would end build_index's open
+        BEGIN IMMEDIATE transaction prematurely. Otherwise it deletes + commits
+        immediately, preserving the original self-heal behaviour outside a
+        rebuild (e.g. add_single_tool, direct _cache_get probes).
+        """
+        if self.db is None:
+            return
+        if self._deferred_cache_ops is not None:
+            self._deferred_cache_ops.append(("delete", text_hash))
+            return
+        with self._db_write_lock:
+            self.db.execute(
+                "DELETE FROM embedding_cache WHERE text_hash = ?", (text_hash,)
+            )
+            self.db.commit()
+
     def _cache_put(
         self, text_hash: str, vector: np.ndarray, dim: int, provider: str
     ) -> None:
-        """BLOB-encode and store a vector. No-op if DB is unavailable."""
+        """BLOB-encode and store a vector. No-op if DB is unavailable.
+
+        IDX-COMPOSED-002: during a build_index rebuild the write is DEFERRED
+        (appended to ``self._deferred_cache_ops``) and flushed AFTER the
+        rebuild's own commit, so it can't prematurely commit the open
+        transaction. Outside a rebuild it writes + commits immediately.
+        """
         if self.db is None:
             return
         vec_f32 = np.asarray(vector, dtype=np.float32).reshape(-1)
+        if self._deferred_cache_ops is not None:
+            self._deferred_cache_ops.append(
+                ("put", text_hash, vec_f32.tobytes(), int(dim), provider)
+            )
+            return
         try:
             with self._db_write_lock:
                 self.db.execute(
@@ -198,6 +232,41 @@ class CompassIndex:
                 self.db.commit()
         except sqlite3.OperationalError as e:
             logger.debug(f"embedding_cache put failed: {e}")
+
+    def _flush_deferred_cache_ops_list(self, ops: List[tuple]) -> None:
+        """Apply deferred embedding-cache ops AFTER build_index's own commit.
+
+        IDX-COMPOSED-002: cache puts/deletes accumulated during a rebuild are
+        applied here in a single committed batch. Called only on the success
+        path (after the rebuild's commit); the failure path discards the
+        pending ops so a rolled-back rebuild leaves no cache side effects.
+        Best-effort: a cache-table problem must never fail the rebuild that
+        already succeeded.
+        """
+        if not ops or self.db is None:
+            return
+        try:
+            with self._db_write_lock:
+                for op in ops:
+                    if op[0] == "put":
+                        _, text_hash, blob, dim, provider = op
+                        self.db.execute(
+                            """
+                            INSERT OR REPLACE INTO embedding_cache
+                                (text_hash, vector, dim, provider)
+                            VALUES (?, ?, ?, ?)
+                            """,
+                            (text_hash, blob, dim, provider),
+                        )
+                    elif op[0] == "delete":
+                        _, text_hash = op
+                        self.db.execute(
+                            "DELETE FROM embedding_cache WHERE text_hash = ?",
+                            (text_hash,),
+                        )
+                self.db.commit()
+        except sqlite3.OperationalError as e:
+            logger.debug(f"deferred embedding_cache flush failed: {e}")
 
     def get_cache_stats(self) -> Dict:
         """Return embedding-cache hit/miss/size stats (IDX-FT-003)."""
@@ -235,10 +304,11 @@ class CompassIndex:
                     description TEXT NOT NULL,
                     category TEXT NOT NULL,
                     server TEXT NOT NULL,
-                    parameters TEXT,  -- JSON
+                    parameters TEXT,  -- JSON (collapsed {param:type} view)
                     examples TEXT,    -- JSON
                     is_core INTEGER DEFAULT 0,
                     embedding_text TEXT,
+                    raw_schema TEXT,  -- FEAT-01: full JSON inputSchema (nullable)
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 );
 
@@ -259,6 +329,19 @@ class CompassIndex:
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 );
             """)
+
+            # FEAT-01: idempotent migration for pre-existing DBs. A tools table
+            # created by an older build (before the raw_schema column existed)
+            # is created by CREATE TABLE IF NOT EXISTS above WITHOUT the new
+            # column, so a bare ALTER upgrades it in place — no rebuild needed.
+            # On a fresh DB the column already exists and the ALTER raises
+            # "duplicate column name", which we swallow (mirrors the
+            # backend_sync_state forward-compat pattern in sync_manager).
+            try:
+                self.db.execute("ALTER TABLE tools ADD COLUMN raw_schema TEXT")
+            except sqlite3.OperationalError:
+                pass  # column already exists
+
             self.db.commit()
 
         # Runtime cache hit/miss counters (IDX-FT-003). Reset only on process
@@ -345,6 +428,15 @@ class CompassIndex:
         # Wrap the DELETE → INSERT → embed → add_items sequence in a single
         # transaction. Only commit AFTER HNSW save succeeds, so a failure
         # leaves the previous DB state intact (no orphan SQLite rows).
+        #
+        # IDX-COMPOSED-002: route embedding-cache mutations made during this
+        # rebuild into a deferred list so _cache_put / _cache_get's self-heal
+        # can't commit the shared connection mid-transaction (which would
+        # prematurely persist the DELETE + INSERTs and defeat the atomic
+        # rollback below). The list is flushed AFTER the rebuild's own commit
+        # on success, and discarded on failure. _deferred_cache_ops is always
+        # reset to None (post-rebuild cache writes commit immediately again).
+        self._deferred_cache_ops = []
         self.db.execute("BEGIN IMMEDIATE")
         try:
             # Clear existing data
@@ -358,11 +450,18 @@ class CompassIndex:
                 embedding_text = tool.embedding_text()
                 embedding_texts.append(embedding_text)
 
-                # Insert into SQLite (still inside the open transaction)
+                # Insert into SQLite (still inside the open transaction).
+                # FEAT-01: persist the full inputSchema as JSON in raw_schema,
+                # or SQL NULL when the tool carries no schema. The collapsed
+                # `parameters` column is kept exactly as before.
+                raw_schema = getattr(tool, "raw_schema", None)
+                raw_schema_json = (
+                    json.dumps(raw_schema) if raw_schema is not None else None
+                )
                 cursor = self.db.execute(
                     """
-                    INSERT INTO tools (name, description, category, server, parameters, examples, is_core, embedding_text)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    INSERT INTO tools (name, description, category, server, parameters, examples, is_core, embedding_text, raw_schema)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                     (
                         tool.name,
@@ -373,6 +472,7 @@ class CompassIndex:
                         json.dumps(tool.examples),
                         1 if tool.is_core else 0,
                         embedding_text,
+                        raw_schema_json,
                     ),
                 )
                 tool_ids.append(cursor.lastrowid)
@@ -506,8 +606,18 @@ class CompassIndex:
             self.db.commit()
         except Exception:
             self.db.rollback()
+            # IDX-COMPOSED-002: discard deferred cache ops — the rebuild rolled
+            # back, so its cache writes/self-heals must not be applied.
+            self._deferred_cache_ops = None
             logger.error("build_index failed; rolled back SQLite transaction")
             raise
+        else:
+            # IDX-COMPOSED-002: the rebuild's own commit landed — now (and only
+            # now) flush the deferred cache puts/deletes in their own batch.
+            pending = self._deferred_cache_ops
+            self._deferred_cache_ops = None
+            if pending:
+                self._flush_deferred_cache_ops_list(pending)
 
         # Load ID mapping
         self._load_id_mapping()
@@ -884,6 +994,14 @@ class CompassIndex:
             )
             existing = cursor.fetchone()
 
+            # FEAT-01: preserve the full inputSchema on the incremental path too
+            # (as JSON, or SQL NULL when absent) so sync's add-based branch keeps
+            # schema fidelity alongside the full-rebuild branch.
+            raw_schema = getattr(tool, "raw_schema", None)
+            raw_schema_json = (
+                json.dumps(raw_schema) if raw_schema is not None else None
+            )
+
             with self._db_write_lock:
                 self.db.execute("BEGIN IMMEDIATE")
                 try:
@@ -896,7 +1014,7 @@ class CompassIndex:
                             UPDATE tools SET
                                 description = ?, category = ?, server = ?,
                                 parameters = ?, examples = ?, is_core = ?,
-                                embedding_text = ?
+                                embedding_text = ?, raw_schema = ?
                             WHERE id = ?
                         """,
                             (
@@ -907,6 +1025,7 @@ class CompassIndex:
                                 json.dumps(tool.examples),
                                 1 if tool.is_core else 0,
                                 embedding_text,
+                                raw_schema_json,
                                 tool_id,
                             ),
                         )
@@ -914,8 +1033,8 @@ class CompassIndex:
                         # Insert new tool
                         cursor = self.db.execute(
                             """
-                            INSERT INTO tools (name, description, category, server, parameters, examples, is_core, embedding_text)
-                            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                            INSERT INTO tools (name, description, category, server, parameters, examples, is_core, embedding_text, raw_schema)
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                         """,
                             (
                                 tool.name,
@@ -926,6 +1045,7 @@ class CompassIndex:
                                 json.dumps(tool.examples),
                                 1 if tool.is_core else 0,
                                 embedding_text,
+                                raw_schema_json,
                             ),
                         )
                         tool_id = cursor.lastrowid

@@ -9,6 +9,12 @@ primary_region = "iad"
 [env]
   PORT = "8080"
   PYTHONUNBUFFERED = "1"
+  # ci-infra-01: gateway.py's _run_http defaults HOST to 127.0.0.1 (loopback);
+  # without this the deployed machine binds loopback and Fly's proxy/health
+  # checks (see [[http_service.checks]] below) can never reach /health. Binding
+  # 0.0.0.0 is the documented reverse-proxy path — Fly's authenticated edge +
+  # force_https sit in front, matching gateway.py's stated requirement.
+  HOST = "0.0.0.0"
 
 [http_service]
   internal_port = 8080

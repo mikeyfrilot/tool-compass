@@ -21,7 +21,7 @@ import hashlib
 import threading
 from collections import deque
 import numpy as np
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional, List, Dict, Any, Deque
 from dataclasses import dataclass
@@ -574,6 +574,85 @@ class CompassAnalytics:
             # MCC-B-005: chain pattern save failure degrades analytics only.
             self._note_degraded("_save_chain_pattern", e)
 
+    async def prune_old_records(self, retention_days: int) -> int:
+        """Delete analytics rows older than the retention window (FEAT-04).
+
+        DELETEs from BOTH append-only tables — tool_calls and search_queries —
+        whose created_at is older than `retention_days` days, and returns the
+        total number of rows removed. A sibling gateway agent calls this as
+        ``await analytics.prune_old_records(config.analytics_retention_days)``.
+
+        retention_days <= 0 -> NO-OP (keep forever), returns 0.
+
+        CA-001 discipline: created_at is stamped by SQLite CURRENT_TIMESTAMP,
+        which is UTC. We compute the cutoff INSIDE SQLite via
+        ``datetime('now', '-N days')`` so BOTH sides of the comparison are UTC
+        — never datetime.now() naive local wall-clock, which would skew the
+        cutoff by the host's UTC offset (the exact bug fixed in
+        get_analytics_summary).
+
+        MCC-B-005 discipline: wrapped in the same _degraded / try-except the
+        other write methods use — a prune failure must degrade analytics, not
+        raise up through the caller. Respects the thread-safe lazy connection
+        and the write lock (self._lock) the rest of the module uses.
+        """
+        if self._degraded:
+            return 0
+        # retention_days <= 0 means "keep forever" — nothing to prune.
+        if retention_days <= 0:
+            return 0
+
+        total_deleted = 0
+        try:
+            db = self._get_db()
+
+            # Push the cutoff into SQL so it is evaluated in UTC by SQLite,
+            # matching how created_at was written. datetime('now', ?) with a
+            # '-N days' modifier yields a UTC 'YYYY-MM-DD HH:MM:SS' bound.
+            modifier = f"-{int(retention_days)} days"
+
+            with self._lock:
+                cur = db.execute(
+                    "DELETE FROM tool_calls "
+                    "WHERE created_at < datetime('now', ?)",
+                    (modifier,),
+                )
+                total_deleted += cur.rowcount or 0
+
+                cur = db.execute(
+                    "DELETE FROM search_queries "
+                    "WHERE created_at < datetime('now', ?)",
+                    (modifier,),
+                )
+                total_deleted += cur.rowcount or 0
+
+                db.commit()
+        except sqlite3.Error as e:
+            # MCC-B-005: a prune failure degrades analytics; it must never
+            # break the caller (the gateway prunes as housekeeping).
+            self._note_degraded("prune_old_records", e)
+            return 0
+
+        # VACUUM reclaims the pages freed by a large delete. It CANNOT run
+        # inside a transaction and takes its own file lock, so run it
+        # best-effort AFTER the committed delete and swallow any failure —
+        # reclaiming space is a nice-to-have, never worth raising for. Guard on
+        # a non-trivial delete so we don't VACUUM the whole DB on every no-op
+        # prune. Held under the write lock so it doesn't race another writer.
+        if total_deleted > 0:
+            try:
+                with self._lock:
+                    db.execute("VACUUM")
+            except sqlite3.Error as e:
+                logger.debug(f"VACUUM after prune skipped (non-fatal): {e}")
+
+        if total_deleted:
+            logger.info(
+                f"Pruned {total_deleted} analytics row(s) older than "
+                f"{retention_days} day(s)."
+            )
+        return total_deleted
+
     async def refresh_hot_cache(self, embedder=None, index=None):
         """
         Update the hot cache with top N most used tools.
@@ -798,7 +877,12 @@ class CompassAnalytics:
 
         # Parse timeframe
         hours = {"1h": 1, "24h": 24, "7d": 168, "30d": 720}.get(timeframe, 24)
-        since = datetime.now() - timedelta(hours=hours)
+        # CA-001: created_at is written by SQLite CURRENT_TIMESTAMP, which is UTC.
+        # Compute the window bound in UTC too — datetime.now() is naive LOCAL
+        # wall-clock, so a naive bound skews every window by the host's UTC
+        # offset. strftime drops the tz suffix, yielding a UTC
+        # 'YYYY-MM-DD HH:MM:SS' string that matches CURRENT_TIMESTAMP.
+        since = datetime.now(timezone.utc) - timedelta(hours=hours)
         # Use SQLite-compatible format (YYYY-MM-DD HH:MM:SS) for timestamp comparison
         since_str = since.strftime("%Y-%m-%d %H:%M:%S")
 
@@ -926,26 +1010,60 @@ class CompassAnalytics:
             ORDER BY rank
         """)
 
+        # PC-B-001: this runs on the mandatory init path — get_analytics_instance()
+        # awaits it unconditionally and compass()/execute() call that UNWRAPPED,
+        # so a raw exception here surfaces as a bare traceback through the MCP
+        # JSON-RPC envelope (violates the BE-B-004 "handlers never raise"
+        # invariant). Persisted blobs can be corrupt: a bad schema_json raises
+        # json.JSONDecodeError and a truncated embedding blob raises ValueError
+        # from np.frombuffer — neither is a sqlite3.Error, so nothing above
+        # catches them. Guard per-row and SKIP a bad row rather than aborting the
+        # whole load, matching record_search / record_tool_call which degrade
+        # instead of raising. A per-row skip keeps every good row loadable.
+        skipped = 0
         for row in cursor.fetchall():
-            embedding = None
-            if row["embedding"]:
-                embedding = np.frombuffer(row["embedding"], dtype=np.float32)
+            try:
+                embedding = None
+                if row["embedding"]:
+                    blob = row["embedding"]
+                    # SC-002 (indexer._cache_get): validate the blob byte length
+                    # before np.frombuffer. float32 == 4 bytes/element; a length
+                    # that is not a whole multiple of 4 is a truncated/corrupt
+                    # write and would raise ValueError.
+                    if len(blob) % 4 != 0:
+                        raise ValueError(
+                            f"corrupt embedding blob for {row['tool_name']}: "
+                            f"{len(blob)} bytes not a multiple of 4"
+                        )
+                    embedding = np.frombuffer(blob, dtype=np.float32)
 
-            schema = None
-            if row["schema_json"]:
-                schema = json.loads(row["schema_json"])
+                schema = None
+                if row["schema_json"]:
+                    schema = json.loads(row["schema_json"])
 
-            self._hot_cache[row["tool_name"]] = HotToolEntry(
-                tool_name=row["tool_name"],
-                rank=row["rank"],
-                call_count=row["call_count"],
-                embedding=embedding,
-                schema=schema,
-                description=row["description"] or "",
-                last_called_at=None,
-            )
+                self._hot_cache[row["tool_name"]] = HotToolEntry(
+                    tool_name=row["tool_name"],
+                    rank=row["rank"],
+                    call_count=row["call_count"],
+                    embedding=embedding,
+                    schema=schema,
+                    description=row["description"] or "",
+                    last_called_at=None,
+                )
+            except (json.JSONDecodeError, ValueError, TypeError, sqlite3.Error) as e:
+                # Skip the bad row; a single corrupt persisted blob must not
+                # take down the whole hot-cache load (and thus the first
+                # compass()/execute() of the process).
+                skipped += 1
+                logger.warning(
+                    f"Skipping corrupt hot_tools row "
+                    f"'{row['tool_name'] if 'tool_name' in row.keys() else '?'}': {e}"
+                )
 
-        logger.info(f"Loaded {len(self._hot_cache)} tools into hot cache from DB")
+        logger.info(
+            f"Loaded {len(self._hot_cache)} tools into hot cache from DB"
+            + (f" ({skipped} corrupt row(s) skipped)" if skipped else "")
+        )
 
     def close(self):
         """Close database connection.

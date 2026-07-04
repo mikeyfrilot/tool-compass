@@ -4,6 +4,9 @@ Tests for Tool Compass indexer module.
 Tests HNSW index building, searching, and metadata management.
 """
 
+import json
+from unittest.mock import patch
+
 import numpy as np
 import pytest
 
@@ -225,6 +228,136 @@ class TestEmbeddingCacheSelfHeal:
         # And search still works after the self-heal.
         results = await index.search("read a file", top_k=3)
         assert len(results) > 0
+
+        await index.close()
+
+
+class TestBuildIndexAtomicRollbackWithCacheMiss:
+    """IDX-COMPOSED-002: a cache write during build_index must NOT commit the
+    open BEGIN IMMEDIATE transaction mid-rebuild.
+
+    build_index wraps DELETE FROM tools + per-tool INSERTs + HNSW save in a
+    single BEGIN IMMEDIATE txn whose documented purpose is atomic rollback:
+    'Only commit AFTER HNSW save succeeds, so a failure leaves the previous DB
+    state intact (no orphan SQLite rows).' But on a cache MISS the loop calls
+    _cache_put, which issued self.db.commit() on the SHARED connection —
+    prematurely committing the DELETE + INSERTs. If the subsequent HNSW save
+    then failed, the tool rows were already committed with a stale/missing HNSW
+    index → DB/HNSW divergence, silently degrading recall until the next
+    successful full rebuild.
+
+    The fix defers cache writes made during a rebuild and flushes them AFTER
+    build_index's own commit; so when the HNSW save fails, rollback genuinely
+    restores the previous tools table.
+    """
+
+    @pytest.mark.asyncio
+    async def test_hnsw_save_failure_after_cache_miss_leaves_tools_unchanged(
+        self, temp_index_path, temp_db_path, mock_embedder, sample_tools
+    ):
+        """Force an HNSW-save failure partway through a rebuild that had a
+        cache miss; the tools table must reflect the PREVIOUS state (rows NOT
+        committed by the cache write)."""
+        import hnswlib
+
+        index = CompassIndex(
+            index_path=temp_index_path,
+            db_path=temp_db_path,
+            embedder=mock_embedder,
+        )
+
+        # First build: legitimate, populates the tools table + embedding cache.
+        await index.build_index(sample_tools)
+
+        pre_names = {
+            r["name"]
+            for r in index.db.execute("SELECT name FROM tools").fetchall()
+        }
+        assert pre_names == {t.name for t in sample_tools}, "precondition"
+        pre_count = len(pre_names)
+
+        # A DIFFERENT tool set with a BRAND-NEW embedding_text -> guaranteed
+        # cache MISS -> _cache_put runs during the open rebuild txn.
+        new_tools = [
+            ToolDefinition(
+                name="test:brand_new_alpha",
+                description="A brand new alpha tool never seen before",
+                category="other",
+                server="test",
+                parameters={"x": "str"},
+                examples=["totally novel embedding text alpha"],
+                is_core=False,
+            ),
+            ToolDefinition(
+                name="test:brand_new_beta",
+                description="A brand new beta tool never seen before",
+                category="other",
+                server="test",
+                parameters={"y": "int"},
+                examples=["totally novel embedding text beta"],
+                is_core=False,
+            ),
+        ]
+
+        # Make the HNSW index created DURING this rebuild fail on save_index,
+        # AFTER the DELETE/INSERT and the cache-miss _cache_put have run.
+        class _FailingSaveIndex(hnswlib.Index):
+            def save_index(self, *args, **kwargs):
+                raise RuntimeError("simulated HNSW save failure")
+
+        # The rebuild must raise (save fails inside the txn) and roll back.
+        with patch.object(hnswlib, "Index", _FailingSaveIndex):
+            with pytest.raises(RuntimeError, match="simulated HNSW save failure"):
+                await index.build_index(new_tools)
+
+        # THE INVARIANT: rollback restored the previous tools table — the
+        # cache write did NOT prematurely commit the DELETE + new INSERTs.
+        post_names = {
+            r["name"]
+            for r in index.db.execute("SELECT name FROM tools").fetchall()
+        }
+        assert post_names == pre_names, (
+            "build_index rollback must leave the previous tools table intact; "
+            "a cache-miss _cache_put committed the open rebuild transaction"
+        )
+        post_count = index.db.execute(
+            "SELECT COUNT(*) AS c FROM tools"
+        ).fetchone()["c"]
+        assert post_count == pre_count
+        # The failed rebuild's brand-new rows must NOT be present.
+        assert "test:brand_new_alpha" not in post_names
+        assert "test:brand_new_beta" not in post_names
+
+        await index.close()
+
+    @pytest.mark.asyncio
+    async def test_successful_rebuild_still_persists_cache_entries(
+        self, temp_index_path, temp_db_path, mock_embedder, sample_tools
+    ):
+        """The deferral must not lose cache entries on the happy path: after a
+        successful rebuild with misses, the embedding_cache is populated (so a
+        subsequent rebuild registers hits)."""
+        index = CompassIndex(
+            index_path=temp_index_path,
+            db_path=temp_db_path,
+            embedder=mock_embedder,
+        )
+
+        # First build populates cache via deferred-then-flushed puts.
+        await index.build_index(sample_tools)
+
+        cache_size = index.db.execute(
+            "SELECT COUNT(*) AS c FROM embedding_cache"
+        ).fetchone()["c"]
+        assert cache_size == len(sample_tools), (
+            "deferred cache puts must be flushed after a successful rebuild"
+        )
+
+        # Second identical build should be all cache HITS (proves the flushed
+        # entries are readable and keyed correctly).
+        hits_before = index._cache_hits
+        await index.build_index(sample_tools)
+        assert index._cache_hits >= hits_before + len(sample_tools)
 
         await index.close()
 
@@ -501,3 +634,200 @@ class TestCacheKeyIncorporatesProvider:
         h = idx._compute_text_hash("some text")
         assert isinstance(h, str)
         assert len(h) == 64
+
+
+class TestRawSchemaColumnFEAT01:
+    """v2.5.0 FEAT-01: the tools table gains a nullable `raw_schema TEXT`
+    column that round-trips the full JSON inputSchema (ToolDefinition.raw_schema
+    from Wave A). build_index stores json.dumps(tool.raw_schema) (or NULL when
+    None); the collapsed `parameters` column is kept exactly as before. An
+    idempotent migration ALTERs the column onto pre-existing DBs so old on-disk
+    DBs upgrade without a rebuild. Downstream gateway.describe() reads this
+    exact column name: `raw_schema`.
+    """
+
+    _RICH_SCHEMA = {
+        "type": "object",
+        "properties": {
+            "path": {"type": "string", "description": "File path"},
+            "mode": {"type": "string", "enum": ["r", "rb"]},
+        },
+        "required": ["path"],
+    }
+
+    def test_table_has_raw_schema_column(
+        self, temp_index_path, temp_db_path, mock_embedder
+    ):
+        """A freshly-created tools table must expose a `raw_schema` column."""
+        index = CompassIndex(
+            index_path=temp_index_path,
+            db_path=temp_db_path,
+            embedder=mock_embedder,
+        )
+        index._init_db()
+
+        cursor = index.db.execute("PRAGMA table_info(tools)")
+        columns = {row[1] for row in cursor.fetchall()}
+        assert "raw_schema" in columns
+
+    @pytest.mark.asyncio
+    async def test_build_index_round_trips_raw_schema(
+        self, temp_index_path, temp_db_path, mock_embedder
+    ):
+        """A tool with raw_schema set -> after build_index,
+        SELECT raw_schema returns the round-tripped JSON."""
+        index = CompassIndex(
+            index_path=temp_index_path,
+            db_path=temp_db_path,
+            embedder=mock_embedder,
+        )
+        tools = [
+            ToolDefinition(
+                name="test:read_file",
+                description="Read a file",
+                category="file",
+                server="test",
+                parameters={"path": "string", "mode": "string"},
+                examples=["read file"],
+                is_core=True,
+                raw_schema=self._RICH_SCHEMA,
+            ),
+        ]
+
+        await index.build_index(tools)
+
+        row = index.db.execute(
+            "SELECT raw_schema FROM tools WHERE name = ?", ("test:read_file",)
+        ).fetchone()
+        assert row["raw_schema"] is not None
+        assert json.loads(row["raw_schema"]) == self._RICH_SCHEMA
+
+        await index.close()
+
+    @pytest.mark.asyncio
+    async def test_build_index_stores_null_when_no_raw_schema(
+        self, temp_index_path, temp_db_path, mock_embedder, sample_tools
+    ):
+        """A tool with raw_schema=None (default) stores SQL NULL, not the
+        string 'null'."""
+        index = CompassIndex(
+            index_path=temp_index_path,
+            db_path=temp_db_path,
+            embedder=mock_embedder,
+        )
+        await index.build_index(sample_tools)
+
+        row = index.db.execute(
+            "SELECT raw_schema FROM tools WHERE name = ?", ("test:read_file",)
+        ).fetchone()
+        assert row["raw_schema"] is None
+
+        await index.close()
+
+    @pytest.mark.asyncio
+    async def test_add_single_tool_persists_raw_schema(
+        self, temp_index_path, temp_db_path, mock_embedder, sample_tools
+    ):
+        """The incremental add path (add_single_tool) also persists
+        raw_schema so sync's incremental branch keeps schema fidelity."""
+        index = CompassIndex(
+            index_path=temp_index_path,
+            db_path=temp_db_path,
+            embedder=mock_embedder,
+        )
+        await index.build_index(sample_tools)
+
+        new_tool = ToolDefinition(
+            name="test:schema_tool",
+            description="Has a rich schema",
+            category="other",
+            server="test",
+            parameters={"path": "string"},
+            examples=["x"],
+            raw_schema=self._RICH_SCHEMA,
+        )
+        assert await index.add_single_tool(new_tool) is True
+
+        row = index.db.execute(
+            "SELECT raw_schema FROM tools WHERE name = ?", ("test:schema_tool",)
+        ).fetchone()
+        assert json.loads(row["raw_schema"]) == self._RICH_SCHEMA
+
+        await index.close()
+
+    def test_migration_adds_column_to_legacy_db(
+        self, temp_index_path, temp_db_path, mock_embedder
+    ):
+        """Idempotent migration: a tools table created WITHOUT raw_schema
+        (simulating an old on-disk DB) must gain the column on _init_db, and
+        an existing row reads NULL for raw_schema.
+        """
+        import sqlite3
+
+        # Hand-build the OLD schema (no raw_schema column) + seed a row.
+        legacy = sqlite3.connect(str(temp_db_path))
+        legacy.execute(
+            """
+            CREATE TABLE tools (
+                id INTEGER PRIMARY KEY,
+                name TEXT UNIQUE NOT NULL,
+                description TEXT NOT NULL,
+                category TEXT NOT NULL,
+                server TEXT NOT NULL,
+                parameters TEXT,
+                examples TEXT,
+                is_core INTEGER DEFAULT 0,
+                embedding_text TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+        legacy.execute(
+            "INSERT INTO tools (name, description, category, server, parameters, "
+            "examples, is_core, embedding_text) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            ("old:tool", "legacy", "other", "old", "{}", "[]", 0, "x"),
+        )
+        legacy.commit()
+        legacy.close()
+
+        # Opening via CompassIndex must ALTER the column in (migration).
+        index = CompassIndex(
+            index_path=temp_index_path,
+            db_path=temp_db_path,
+            embedder=mock_embedder,
+        )
+        index._init_db()
+
+        columns = {
+            row[1] for row in index.db.execute("PRAGMA table_info(tools)").fetchall()
+        }
+        assert "raw_schema" in columns, "migration must add raw_schema to legacy DB"
+
+        # The pre-existing row reads NULL for the new column.
+        row = index.db.execute(
+            "SELECT raw_schema FROM tools WHERE name = ?", ("old:tool",)
+        ).fetchone()
+        assert row["raw_schema"] is None
+
+        index.db.close()
+
+    def test_migration_is_idempotent(
+        self, temp_index_path, temp_db_path, mock_embedder
+    ):
+        """Calling _init_db twice must not raise (duplicate-column ALTER is
+        swallowed)."""
+        index = CompassIndex(
+            index_path=temp_index_path,
+            db_path=temp_db_path,
+            embedder=mock_embedder,
+        )
+        index._init_db()
+        # Second init on the already-migrated DB must be a no-op, not a raise.
+        index._init_db()
+
+        columns = {
+            row[1] for row in index.db.execute("PRAGMA table_info(tools)").fetchall()
+        }
+        assert "raw_schema" in columns
+
+        index.db.close()

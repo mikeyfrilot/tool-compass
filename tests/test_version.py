@@ -41,21 +41,39 @@ class TestVersionConsistency:
         assert version in changelog, f"CHANGELOG missing version {version}"
 
     def test_version_file_reads_pyproject(self):
-        """_version.py fallback should find pyproject.toml version."""
+        """_version._get_version() must read pyproject.toml when package
+        metadata is unavailable.
+
+        TST-RA-004: this used to reimplement the regex inline and never touched
+        _version.py, so a broken fallback in _version.py would go undetected.
+        We now import the real module in a subprocess and force the pyproject
+        branch by making importlib.metadata.version raise, then assert the
+        returned string is the pyproject version.
+        """
+        # Force _get_version()'s importlib.metadata lookup to fail so the real
+        # pyproject-reading fallback executes, then invoke it and print the
+        # resolved version.
+        script = (
+            "import importlib.metadata as m\n"
+            "m.version = lambda *a, **k: (_ for _ in ()).throw(m.PackageNotFoundError())\n"
+            "import _version\n"
+            "print(_version._get_version())\n"
+        )
         result = subprocess.run(
-            [sys.executable, "-c",
-             "import re; from pathlib import Path; "
-             "m = re.search(r'^version\\s*=\\s*\"([^\"]+)\"', "
-             "Path('pyproject.toml').read_text(), re.MULTILINE); "
-             "print(m.group(1))"],
+            [sys.executable, "-c", script],
             capture_output=True,
             text=True,
             cwd=str(ROOT),
         )
-        assert result.returncode == 0
+        assert result.returncode == 0, result.stderr
         file_version = result.stdout.strip()
         pyproject_version = _read_pyproject_version()
-        assert file_version == pyproject_version
+        assert file_version == pyproject_version, (
+            f"_version._get_version() fallback returned {file_version!r}, "
+            f"expected pyproject version {pyproject_version!r}"
+        )
+        # Guard against the fallback silently returning the "0.0.0" sentinel.
+        assert file_version != "0.0.0", "fallback hit the 0.0.0 sentinel"
 
     def test_cli_version_flag(self):
         """Verify the gateway module can be imported without crashing."""

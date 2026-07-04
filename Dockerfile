@@ -72,10 +72,14 @@ ENV PYTHONUNBUFFERED=1 \
     PYTHONPATH=/app \
     # Tool Compass settings
     TOOL_COMPASS_BASE_PATH=/app \
-    OLLAMA_URL=http://host.docker.internal:11434 \
-    # Gradio settings
-    GRADIO_SERVER_NAME=0.0.0.0 \
-    GRADIO_SERVER_PORT=7860
+    OLLAMA_URL=http://host.docker.internal:11434
+# UI-DOCKER-BIND-001: the container UI bind is set explicitly on the CMD below
+# (--host 0.0.0.0), NOT via GRADIO_SERVER_NAME. ui.py calls
+# demo.launch(server_name=args.host, ...) with a truthy default, which
+# overrides Gradio's native GRADIO_SERVER_NAME env support — so setting that env
+# here was a silent no-op and left the containerized UI bound to loopback
+# (unreachable through the published port). The prior GRADIO_SERVER_NAME/PORT
+# ENV lines were dropped to remove that misleading dead configuration.
 
 # Expose Gradio UI port
 EXPOSE 7860
@@ -87,8 +91,12 @@ USER compass
 HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
     CMD python -c "from indexer import CompassIndex; idx = CompassIndex(); print('healthy' if idx.load_index() else 'no index')" || exit 1
 
-# Default command: Run Gradio UI
-CMD ["python", "ui.py"]
+# Default command: Run Gradio UI.
+# UI-DOCKER-BIND-001: bind 0.0.0.0 explicitly so the UI is reachable through the
+# published port mapping (inside the container the container boundary is the
+# isolation layer; external exposure is controlled by `docker run -p` /
+# compose `ports:`). Without this the UI bound to 127.0.0.1 and was unreachable.
+CMD ["python", "ui.py", "--host", "0.0.0.0", "--port", "7860"]
 
 # =============================================================================
 # Stage 3: MCP Gateway (alternative entrypoint)
@@ -96,7 +104,13 @@ CMD ["python", "ui.py"]
 FROM production AS mcp-gateway
 
 # Override for HTTP mode (Fly.io / Smithery)
-ENV PORT=8080
+# ci-infra-01: gateway.py's _run_http defaults HOST to 127.0.0.1 (loopback), so
+# without this the published image binds loopback and any orchestrator's proxy /
+# health check (the HEALTHCHECK below hits localhost, but Fly/Smithery reach the
+# container over the network) can't reach the gateway. 0.0.0.0 is the documented
+# reverse-proxy path — this image is meant to sit behind an authenticated edge.
+ENV PORT=8080 \
+    HOST=0.0.0.0
 
 # Expose MCP HTTP port
 EXPOSE 8080

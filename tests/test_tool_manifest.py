@@ -270,6 +270,66 @@ class TestToolSerialization:
         assert not hasattr(tool, "another_new_key")
 
 
+class TestRawSchema:
+    """FEAT-01: ToolDefinition preserves the full JSON inputSchema in
+    raw_schema through sync. embedding_text stays description-based and the
+    collapsed `parameters` behavior is unchanged."""
+
+    def test_default_is_none(self):
+        tool = ToolDefinition(
+            name="test:tool",
+            description="Test",
+            category="test",
+            server="test",
+        )
+        assert tool.raw_schema is None
+
+    def test_roundtrips_raw_schema(self):
+        schema = {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "search text"},
+                "limit": {"type": "integer"},
+            },
+            "required": ["query"],
+        }
+        original = ToolDefinition(
+            name="test:search",
+            description="Search",
+            category="search",
+            server="test",
+            parameters={"query": "str", "limit": "int?"},
+            raw_schema=schema,
+        )
+        data = original.to_dict()
+        assert data["raw_schema"] == schema
+        restored = ToolDefinition.from_dict(data)
+        assert restored.raw_schema == schema
+        # Collapsed parameters view is untouched.
+        assert restored.parameters == {"query": "str", "limit": "int?"}
+
+    def test_embedding_text_unchanged_by_raw_schema(self):
+        """raw_schema must not leak into embedding_text (stays description-based)."""
+        schema = {"type": "object", "properties": {"secret_prop": {}}}
+        with_schema = ToolDefinition(
+            name="test:tool",
+            description="A description",
+            category="test",
+            server="test",
+            parameters={"a": "str"},
+            raw_schema=schema,
+        )
+        without = ToolDefinition(
+            name="test:tool",
+            description="A description",
+            category="test",
+            server="test",
+            parameters={"a": "str"},
+        )
+        assert with_schema.embedding_text() == without.embedding_text()
+        assert "secret_prop" not in with_schema.embedding_text()
+
+
 # =============================================================================
 # TOOLS Constant Tests
 # =============================================================================

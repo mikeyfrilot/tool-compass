@@ -47,9 +47,10 @@ O Tool Compass usa **busca semântica** para encontrar ferramentas relevantes a 
 
 ```bash
 npx @mcptoolshop/tool-compass --help
-npx @mcptoolshop/tool-compass serve     # MCP gateway
-npx @mcptoolshop/tool-compass ui        # Gradio UI
-npx @mcptoolshop/tool-compass doctor    # Diagnose setup
+npx @mcptoolshop/tool-compass serve                 # MCP gateway
+npx @mcptoolshop/tool-compass ui                    # Gradio UI
+npx @mcptoolshop/tool-compass doctor                # Diagnose setup
+npx @mcptoolshop/tool-compass execute fs:read_file '{"path":"README.md"}'  # Smoke-test a proxied call
 ```
 
 Baixa um binário de plataforma verificado na primeira execução (SHA256 verificado em relação ao lançamento do GitHub). Armazenado localmente – invocações subsequentes são iniciadas instantaneamente. Consulte [@mcptoolshop/tool-compass](https://www.npmjs.com/package/@mcptoolshop/tool-compass) no npm.
@@ -110,13 +111,13 @@ docker-compose --profile with-ollama up
 
 ## Recursos
 
-- **Busca Semântica** – Encontre ferramentas descrevendo o que você deseja fazer.
-- **Divulgação Progressiva** – `compass()` → `describe()` → `execute()`
-- **Cache Dinâmico** – Ferramentas frequentemente usadas são pré-carregadas.
-- **Detecção de Cadeia** – Descobre automaticamente fluxos de trabalho comuns de ferramentas.
-- **Análise** – Rastreie padrões de uso e desempenho das ferramentas.
-- **Multiplataforma** – Windows, macOS, Linux
-- **Pronto para Docker** – Implantação com um único comando.
+- **Pesquisa Híbrida** - Semântica (HNSW) + fusão léxica com reforço de nome exato — descreva o que deseja ou cole o nome de uma ferramenta e ela será classificada como a primeira.
+- **Divulgação Progressiva do Esquema Completo** - `compass()` → `describe()` → `execute()`; `describe()` retorna o `inputSchema` completo (campos obrigatórios, descrições, enumerações, valores padrão).
+- **Backends stdio + HTTP** - Servidores MCP locais de subprocesso *e* servidores remotos/SaaS via streamable-http, com autenticação opcional por token.
+- **Tempos limite e permissões/restrições por ferramenta** - Substitua o tempo limite padrão por backend/ferramenta; exponha um subconjunto seguro de um backend amplo.
+- **Cache Dinâmico e Detecção de Cadeia** - Ferramentas frequentemente usadas pré-carregadas; fluxos de trabalho comuns detectados automaticamente.
+- **Análise** - Rastreie padrões de uso e desempenho da ferramenta (com retenção/limpeza).
+- **Compatível com várias plataformas e pronto para Docker** - Windows, macOS, Linux; implantação com um único comando.
 
 ## Arquitetura
 
@@ -173,15 +174,17 @@ Retorna:
 
 | Ferramenta | Descrição |
 |------|-------------|
-| `compass(intent)` | Busca semântica de ferramentas |
-| `describe(tool_name)` | Obtenha o esquema completo de uma ferramenta |
+| `compass(intent)` | Pesquisa híbrida semântica + léxica com reforço de nome exato. |
+| `describe(tool_name)` | Obtenha o `inputSchema` completo para uma ferramenta (campos obrigatórios/enumerações/valores padrão). |
 | `execute(tool_name, args)` | Execute uma ferramenta em seu backend |
 | `compass_categories()` | Liste categorias e servidores |
-| `compass_status()` | Saúde do sistema e configuração |
+| `compass_status(active)` | Saúde e configuração do sistema; `active=True` executa um teste de funcionamento em tempo real do backend. |
 | `compass_analytics(timeframe)` | Estatísticas de uso |
 | `compass_chains(action)` | Gerencie fluxos de trabalho de ferramentas |
 | `compass_sync(force)` | Reconstrua o índice a partir dos backends |
 | `compass_audit()` | Relatório completo do sistema |
+
+As mesmas ações estão disponíveis na CLI — incluindo `tool-compass execute <ferramenta> '<json>'` para testar uma chamada proxy a partir do terminal.
 
 ### Padrão de Divulgação Progressiva
 
@@ -226,13 +229,14 @@ O campo `hint` nos resultados do compass guia esse fluxo, sugerindo quando usar 
 | `OLLAMA_URL` | URL do servidor Ollama | `http://localhost:11434` |
 | `COMFYUI_URL` | Servidor ComfyUI | `http://localhost:8188` |
 | `PORT` | Defina para habilitar o transporte HTTP (por exemplo, para Fly.io) | não definido (stdio) |
+| `TOOL_COMPASS_GATEWAY_AUTH_TOKEN` | Token necessário no transporte HTTP (opcional; substitui o campo de configuração `gateway_auth_token`). | desativado (sem autenticação). |
 
 **Diretórios de dados padrão:**
 - **Windows:** `%LOCALAPPDATA%\tool-compass\`
 - **macOS:** `~/Library/Application Support/tool-compass/`
 - **Linux:** `~/.config/tool-compass/` (ou `$XDG_CONFIG_HOME/tool-compass/`)
 
-Consulte [`.env.example`](.env.example) para todas as opções.
+Configurações do arquivo de configuração (em `compass_config.json`) adicionadas na v2.5.0 — `hybrid_search`, `exact_name_boost`, `default_timeout` / `tool_timeouts` por backend, `allow_tools` / `deny_tools`, `analytics_retention_days` e backends HTTP (`type: "http"`) — estão documentados no [Handbook → Configuration](https://mcp-tool-shop-org.github.io/tool-compass/handbook/configuration/). Consulte o arquivo [`env.example`](.env.example) para opções de variáveis de ambiente.
 
 ## Desempenho
 
@@ -316,14 +320,16 @@ O Tool Compass é uma ferramenta de desenvolvimento **local-first**. Consulte [S
 As pontuações por categoria são regeneradas após a execução em lote por meio do comando:
 `bash scripts/regenerate-scorecard.sh` (que envolve `npx @mcptoolshop/shipcheck audit`). Consulte [SCORECARD.md](SCORECARD.md) para obter a análise detalhada mais recente — a tabela abaixo é um espelho e não foi criada manualmente. As seções selecionadas manualmente (Lacunas Conhecidas, Histórico de Correção) estão fora das tags `<!-- SHIPCHECK-AUTO-START/END -->` no arquivo SCORECARD.md e permanecem após as regenerações.
 
+Última auditoria `shipcheck`: **32 verificados · 0 não verificados · 5 ignorados · 100% aprovados — todas as barreiras rígidas foram superadas.**
+
 | Categoria | Pontuação | Observações |
 |----------|-------|-------|
-| A. Segurança | A definir | Ações com hash SHA; imagem base com hash de digestão; rastreabilidade SLSA + SBOM no PyPI + GHCR; verificação de segredos pré-commit |
-| B. Tratamento de erros | A definir | Resultados estruturados, degradação gradual, códigos de saída |
-| C. Documentação para operadores | A definir | README, CHANGELOG, LICENSE, Makefile `verify` + `verify-metrics` + `scorecard` |
-| D. Boas práticas de distribuição | A definir | CI consolidado; tempo limite em minutos + dias de retenção em cada tarefa; configuração pytest em pyproject.toml |
-| E. Identidade (suave) | A definir | Logotipo, página inicial, metadados do GitHub; mantenedores explícitos em pyproject.toml |
-| **Total** | **TBD** | Regenerar com `make scorecard` |
+| A. Segurança | ✅ Aprovado. | Ações com SHA fixo; imagem base com hash de digestão fixo; proveniência SLSA + SBOM no PyPI + GHCR; verificação pré-commit de segredos; autenticação opcional por token do gateway. |
+| B. Tratamento de erros | ✅ Aprovado. | Resultados estruturados, degradação gradual, códigos de saída |
+| C. Documentação para operadores | ✅ Aprovado. | README, CHANGELOG, LICENSE, Makefile `verify` + `verify-metrics` + `scorecard` |
+| D. Boas práticas de distribuição | ✅ Aprovado. | CI consolidado; tempo limite em minutos + dias de retenção em cada tarefa; configuração pytest em pyproject.toml |
+| E. Identidade (suave) | ✅ Aprovado. | Logotipo, página inicial, metadados do GitHub; mantenedores explícitos em pyproject.toml |
+| **Total** | **100%** | Todas as barreiras rígidas foram superadas — gere novamente usando `make scorecard`. |
 
 ## Licença
 

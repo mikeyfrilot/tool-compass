@@ -7,6 +7,8 @@ Environment Variables:
     TOOL_COMPASS_PYTHON: Path to Python executable (default: auto-detect from venv)
     TOOL_COMPASS_CONFIG: Path to config file (default: <user_config_dir>/compass_config.json)
     TOOL_COMPASS_DATA_DIR: Override user data directory (default: platform-specific)
+    TOOL_COMPASS_GATEWAY_AUTH_TOKEN: Bearer token for the HTTP transport (OPS-1).
+        Overrides the config gateway_auth_token field; secret (never printed).
     OLLAMA_URL: Ollama server URL (default: http://localhost:11434)
 
 Default config directories by platform:
@@ -40,6 +42,16 @@ class StdioBackend:
     args: List[str] = field(default_factory=list)
     env: Dict[str, str] = field(default_factory=dict)
     cwd: Optional[str] = None
+    # INT-02: per-backend tool-call outer deadline in seconds. None = no
+    # per-backend deadline. Clamped to [1.0, 600.0] in validate_and_clamp.
+    default_timeout: Optional[float] = None
+    # INT-02: per-tool timeout override, keyed by BARE tool name (not the
+    # server:tool qualified name). Each value clamped to [1.0, 600.0].
+    tool_timeouts: Dict[str, float] = field(default_factory=dict)
+    # FEAT-06: glob allowlist; empty list = allow all tools from this backend.
+    allow_tools: List[str] = field(default_factory=list)
+    # FEAT-06: glob denylist; deny takes precedence over allow.
+    deny_tools: List[str] = field(default_factory=list)
 
 
 @dataclass
@@ -50,6 +62,17 @@ class HttpBackend:
     url: str = ""
     headers: Dict[str, str] = field(default_factory=dict)
     timeout: float = 30.0
+    # INT-02: per-backend tool-call outer deadline in seconds (distinct from
+    # `timeout`, the transport/connect timeout). None = no per-backend
+    # deadline. Clamped to [1.0, 600.0] in validate_and_clamp.
+    default_timeout: Optional[float] = None
+    # INT-02: per-tool timeout override, keyed by BARE tool name. Clamped to
+    # [1.0, 600.0].
+    tool_timeouts: Dict[str, float] = field(default_factory=dict)
+    # FEAT-06: glob allowlist; empty list = allow all tools from this backend.
+    allow_tools: List[str] = field(default_factory=list)
+    # FEAT-06: glob denylist; deny takes precedence over allow.
+    deny_tools: List[str] = field(default_factory=list)
 
 
 @dataclass
@@ -59,6 +82,10 @@ class ImportBackend:
     type: Literal["import"] = "import"
     module: str = ""
     server_var: str = "mcp"  # Variable name of the FastMCP instance
+    # FEAT-06: glob allowlist; empty list = allow all tools from this backend.
+    allow_tools: List[str] = field(default_factory=list)
+    # FEAT-06: glob denylist; deny takes precedence over allow.
+    deny_tools: List[str] = field(default_factory=list)
 
 
 BackendConfig = StdioBackend | HttpBackend | ImportBackend
@@ -100,6 +127,25 @@ class CompassConfig:
     # Search settings
     default_top_k: int = 5
     min_confidence: float = 0.3
+
+    # Hybrid search (DISC-01): blend semantic + keyword retrieval. Default on.
+    hybrid_search: bool = True
+
+    # Exact-name boost (DISC-02): when a query exactly matches a tool name,
+    # promote it and assign exact_match_confidence to the hit.
+    exact_name_boost: bool = True
+    exact_match_confidence: float = 1.0
+
+    # Analytics retention (FEAT-04): prune analytics rows older than N days.
+    # 0 = keep forever. Clamped to >= 0 in validate_and_clamp.
+    analytics_retention_days: int = 30
+
+    # Gateway auth (OPS-1): opt-in bearer token for the HTTP transport.
+    # None = no auth. Treated as a SECRET: ${VAR}-resolved at load like other
+    # secret-bearing fields, falls back to the TOOL_COMPASS_GATEWAY_AUTH_TOKEN
+    # env var when unset (apply_env_overrides), and is redacted in
+    # doctor()/show_config output (name ends in _token -> _SECRET_FIELD_HINTS).
+    gateway_auth_token: Optional[str] = None
 
     # Progressive disclosure (reduces tokens further)
     progressive_disclosure: bool = True
@@ -235,6 +281,20 @@ class CompassConfig:
 
         # Parse backends
         for name, backend_data in data.get("backends", {}).items():
+            # BR-A-018: a backend NAME containing ':' makes the "backend:tool"
+            # qualified-name scheme ambiguous. qualified_name.split(":", 1) —
+            # used by the router (backend_client_simple), the sync_manager
+            # allow/deny policy check, and the gateway policy check — mis-splits
+            # e.g. "grp:svc:tool" to server "grp", finds no config, and the
+            # FEAT-06 allow/deny policy FAILS OPEN (a denied tool gets indexed
+            # AND executed). Reject the ambiguous name here (fail-closed) so the
+            # hole is closed at the source rather than papered over downstream.
+            if ":" in name:
+                raise ValueError(
+                    f"Backend name {name!r} contains ':' which is reserved as "
+                    f"the backend:tool separator — rename the backend without a "
+                    f"colon."
+                )
             backend_type = backend_data.get("type", "stdio")
             if backend_type == "stdio":
                 config.backends[name] = StdioBackend(
@@ -242,17 +302,30 @@ class CompassConfig:
                     args=backend_data.get("args", []),
                     env=backend_data.get("env", {}),
                     cwd=backend_data.get("cwd"),
+                    # INT-02 / FEAT-06: per-backend timeout + tool filters.
+                    default_timeout=backend_data.get("default_timeout"),
+                    tool_timeouts=backend_data.get("tool_timeouts", {}),
+                    allow_tools=backend_data.get("allow_tools", []),
+                    deny_tools=backend_data.get("deny_tools", []),
                 )
             elif backend_type == "http":
                 config.backends[name] = HttpBackend(
                     url=backend_data.get("url", ""),
                     headers=backend_data.get("headers", {}),
                     timeout=backend_data.get("timeout", 30.0),
+                    # INT-02 / FEAT-06: per-backend timeout + tool filters.
+                    default_timeout=backend_data.get("default_timeout"),
+                    tool_timeouts=backend_data.get("tool_timeouts", {}),
+                    allow_tools=backend_data.get("allow_tools", []),
+                    deny_tools=backend_data.get("deny_tools", []),
                 )
             elif backend_type == "import":
                 config.backends[name] = ImportBackend(
                     module=backend_data.get("module", ""),
                     server_var=backend_data.get("server_var", "mcp"),
+                    # FEAT-06: tool filters (import backends carry no timeout).
+                    allow_tools=backend_data.get("allow_tools", []),
+                    deny_tools=backend_data.get("deny_tools", []),
                 )
 
         # Other settings
@@ -282,6 +355,22 @@ class CompassConfig:
         config.min_confidence = data.get("min_confidence", config.min_confidence)
         config.progressive_disclosure = data.get(
             "progressive_disclosure", config.progressive_disclosure
+        )
+
+        # Hybrid search + exact-name boost (DISC-01/DISC-02) + analytics
+        # retention (FEAT-04) + gateway auth token (OPS-1).
+        config.hybrid_search = data.get("hybrid_search", config.hybrid_search)
+        config.exact_name_boost = data.get(
+            "exact_name_boost", config.exact_name_boost
+        )
+        config.exact_match_confidence = data.get(
+            "exact_match_confidence", config.exact_match_confidence
+        )
+        config.analytics_retention_days = data.get(
+            "analytics_retention_days", config.analytics_retention_days
+        )
+        config.gateway_auth_token = data.get(
+            "gateway_auth_token", config.gateway_auth_token
         )
 
         # Sync settings
@@ -373,6 +462,11 @@ class CompassConfig:
             ("hnsw_m", int),
             ("hnsw_ef_construction", int),
             ("hnsw_ef_search", int),
+            # DISC-02 / FEAT-04: coerce the new numeric knobs up front too, so
+            # a hand-edited string/null resets to default instead of crashing
+            # the range checks below.
+            ("exact_match_confidence", float),
+            ("analytics_retention_days", int),
         ):
             value = getattr(self, fname)
             try:
@@ -505,6 +599,30 @@ class CompassConfig:
                 f"{original} to {self.hnsw_ef_search}"
             )
 
+        # DISC-02: exact_match_confidence is a confidence score in [0.0, 1.0].
+        if not 0.0 <= self.exact_match_confidence <= 1.0:
+            original = self.exact_match_confidence
+            clamped = max(0.0, min(1.0, float(self.exact_match_confidence)))
+            logger.warning(
+                f"Config value exact_match_confidence clamped from "
+                f"{original} to {clamped}"
+            )
+            self.exact_match_confidence = clamped
+
+        # FEAT-04: analytics_retention_days >= 0. 0 disables pruning (keep
+        # forever) by design; a negative would be meaningless as a cutoff.
+        if self.analytics_retention_days < 0:
+            original = self.analytics_retention_days
+            clamped = max(0, int(self.analytics_retention_days))
+            logger.warning(
+                f"Config value analytics_retention_days clamped from "
+                f"{original} to {clamped}"
+            )
+            self.analytics_retention_days = clamped
+
+        # INT-02 / FEAT-06: normalize per-backend timeout + tool-filter fields.
+        self._validate_and_clamp_backends()
+
         # BE-FT-PE-001: validate embedding_provider against the known
         # providers; an unknown value warns + falls back to "ollama" so a
         # typo degrades to working behavior rather than breaking the embed
@@ -529,6 +647,93 @@ class CompassConfig:
         else:
             # Store the normalized (lower-cased, stripped) name.
             self.embedding_provider = normalized
+
+    # INT-02 / FEAT-06: per-backend timeout + tool-filter bounds. Shared with
+    # the CompassConfig-level clamps so hand-edited backend configs are just as
+    # safe as top-level ones.
+    _TIMEOUT_MIN = 1.0
+    _TIMEOUT_MAX = 600.0
+
+    def _validate_and_clamp_backends(self) -> None:
+        """Coerce/clamp the per-backend timeout + tool-filter fields.
+
+        Mirrors the "warn on every clamp" convention used for the top-level
+        numeric knobs:
+
+        - INT-02 default_timeout: coerce to float or reset to None (with a
+          warning) if non-numeric; else clamp to [1.0, 600.0].
+        - INT-02 tool_timeouts: drop non-numeric entries (with a warning);
+          clamp each surviving value to [1.0, 600.0].
+        - FEAT-06 allow_tools / deny_tools: coerce to list-of-str; a non-list
+          resets to [] with a warning.
+        """
+        for name, backend in self.backends.items():
+            # default_timeout / tool_timeouts only exist on stdio + http.
+            if hasattr(backend, "default_timeout"):
+                dt = backend.default_timeout
+                if dt is not None:
+                    try:
+                        dt = float(dt)
+                    except (TypeError, ValueError):
+                        logger.warning(
+                            f"Backend {name!r} default_timeout={dt!r} is not "
+                            f"numeric; resetting to None"
+                        )
+                        dt = None
+                    else:
+                        clamped = max(
+                            self._TIMEOUT_MIN, min(self._TIMEOUT_MAX, dt)
+                        )
+                        if clamped != dt:
+                            logger.warning(
+                                f"Backend {name!r} default_timeout clamped from "
+                                f"{dt} to {clamped}"
+                            )
+                            dt = clamped
+                    backend.default_timeout = dt
+
+            if hasattr(backend, "tool_timeouts"):
+                raw = backend.tool_timeouts
+                if not isinstance(raw, dict):
+                    logger.warning(
+                        f"Backend {name!r} tool_timeouts is not a mapping; "
+                        f"resetting to {{}}"
+                    )
+                    backend.tool_timeouts = {}
+                else:
+                    cleaned: Dict[str, float] = {}
+                    for tool_name, value in raw.items():
+                        try:
+                            fval = float(value)
+                        except (TypeError, ValueError):
+                            logger.warning(
+                                f"Backend {name!r} tool_timeouts[{tool_name!r}]="
+                                f"{value!r} is not numeric; dropping entry"
+                            )
+                            continue
+                        clamped = max(
+                            self._TIMEOUT_MIN, min(self._TIMEOUT_MAX, fval)
+                        )
+                        if clamped != fval:
+                            logger.warning(
+                                f"Backend {name!r} tool_timeouts[{tool_name!r}] "
+                                f"clamped from {fval} to {clamped}"
+                            )
+                        cleaned[str(tool_name)] = clamped
+                    backend.tool_timeouts = cleaned
+
+            # FEAT-06: allow_tools / deny_tools exist on all three backends.
+            for attr in ("allow_tools", "deny_tools"):
+                if hasattr(backend, attr):
+                    value = getattr(backend, attr)
+                    if isinstance(value, list):
+                        setattr(backend, attr, [str(v) for v in value])
+                    else:
+                        logger.warning(
+                            f"Backend {name!r} {attr} is not a list; "
+                            f"resetting to []"
+                        )
+                        setattr(backend, attr, [])
 
     def resolved_embedding_base_url(self) -> str:
         """Return the base URL the embedder should POST to (BE-FT-PE-001).
@@ -563,6 +768,10 @@ class CompassConfig:
                     "args": backend.args,
                     "env": backend.env,
                     "cwd": backend.cwd,
+                    "default_timeout": backend.default_timeout,
+                    "tool_timeouts": backend.tool_timeouts,
+                    "allow_tools": backend.allow_tools,
+                    "deny_tools": backend.deny_tools,
                 }
             elif isinstance(backend, HttpBackend):
                 backends[name] = {
@@ -570,12 +779,18 @@ class CompassConfig:
                     "url": backend.url,
                     "headers": backend.headers,
                     "timeout": backend.timeout,
+                    "default_timeout": backend.default_timeout,
+                    "tool_timeouts": backend.tool_timeouts,
+                    "allow_tools": backend.allow_tools,
+                    "deny_tools": backend.deny_tools,
                 }
             elif isinstance(backend, ImportBackend):
                 backends[name] = {
                     "type": "import",
                     "module": backend.module,
                     "server_var": backend.server_var,
+                    "allow_tools": backend.allow_tools,
+                    "deny_tools": backend.deny_tools,
                 }
 
         return {
@@ -591,6 +806,11 @@ class CompassConfig:
             "auto_sync": self.auto_sync,
             "default_top_k": self.default_top_k,
             "min_confidence": self.min_confidence,
+            "hybrid_search": self.hybrid_search,
+            "exact_name_boost": self.exact_name_boost,
+            "exact_match_confidence": self.exact_match_confidence,
+            "analytics_retention_days": self.analytics_retention_days,
+            "gateway_auth_token": self.gateway_auth_token,
             "progressive_disclosure": self.progressive_disclosure,
             "sync_check_on_startup": self.sync_check_on_startup,
             "sync_polling_interval": self.sync_polling_interval,
@@ -719,6 +939,15 @@ def apply_env_overrides(config: CompassConfig) -> CompassConfig:
     raw_api_key = os.environ.get("TOOL_COMPASS_EMBEDDING_API_KEY")
     if raw_api_key is not None and raw_api_key.strip() != "":
         config.embedding_api_key = raw_api_key
+        changed = True
+
+    # OPS-1: the gateway auth token is a secret — prefer the env var over a
+    # value baked into the config file so operators can keep the token off
+    # disk. An empty string is ignored (treated as "not set") so an
+    # exported-but-empty var doesn't blank out a file value.
+    raw_gw_token = os.environ.get("TOOL_COMPASS_GATEWAY_AUTH_TOKEN")
+    if raw_gw_token is not None and raw_gw_token.strip() != "":
+        config.gateway_auth_token = raw_gw_token
         changed = True
 
     # Re-clamp so the hot_cache_size env value lands in the same safe range

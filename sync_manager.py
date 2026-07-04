@@ -5,6 +5,7 @@ Detects backend changes and triggers index rebuilds.
 
 import asyncio
 import contextlib
+import fnmatch
 import hashlib
 import json
 import sqlite3
@@ -166,14 +167,33 @@ class SyncManager:
     def _compute_tool_hash(self, tools: List[Any]) -> str:
         """
         Compute deterministic hash of tool list for change detection.
-        Uses sorted tool names to ensure consistency.
+
+        FEAT-02: the fingerprint hashes a sorted list of
+        ``(qualified_name, description, canonical_json(input_schema))`` tuples,
+        NOT just names. Hashing names alone meant a backend that revised a
+        tool's description or inputSchema in place (same name) read as
+        "unchanged" and was never re-synced/re-embedded. The schema is
+        serialized with ``json.dumps(..., sort_keys=True)`` so dict key
+        ordering can't cause spurious hash churn (two byte-different but
+        structurally-identical schemas hash the same).
         """
         if not tools:
             return hashlib.sha256(b"empty").hexdigest()[:32]
 
-        # Sort by qualified name for deterministic ordering
-        sorted_names = sorted([t.qualified_name for t in tools])
-        content = json.dumps(sorted_names, sort_keys=True)
+        # Per-tool fingerprint: (qualified_name, description, canonical schema).
+        # sort_keys canonicalizes nested dicts so key reordering is a no-op.
+        fingerprints = []
+        for t in tools:
+            schema = getattr(t, "input_schema", None) or {}
+            canonical_schema = json.dumps(schema, sort_keys=True)
+            fingerprints.append(
+                (t.qualified_name, t.description or "", canonical_schema)
+            )
+
+        # Sort the tuples for deterministic ordering independent of the
+        # backend's tool-list ordering.
+        fingerprints.sort()
+        content = json.dumps(fingerprints, sort_keys=True)
         return hashlib.sha256(content.encode()).hexdigest()[:32]
 
     async def get_stored_hash(self, backend_name: str) -> Optional[str]:
@@ -301,11 +321,134 @@ class SyncManager:
             logger.debug(f"_get_backend_tool_names({backend_name}) failed: {e}")
         return names
 
-    async def _rebuild_for_backends(self, backend_names: List[str]):
-        """Rebuild index for specified backends."""
+    def _tool_allowed(self, backend_name: str, bare_name: str) -> bool:
+        """FEAT-06 (index-time half): decide whether a tool is indexable under
+        the resolving backend's allow_tools/deny_tools glob lists.
+
+        Semantics (matched against the BARE tool name via fnmatch):
+        - deny wins over allow — a name matching any deny glob is excluded even
+          if it also matches an allow glob.
+        - an empty allow_tools list = allow all (back-compat).
+        - a non-empty allow_tools = only names matching at least one allow glob.
+
+        A backend the SyncManager can't resolve (not in self.config.backends,
+        or a config with no filter attrs) degrades to "allowed" so unknown
+        backends aren't silently starved.
+        """
+        backend = self.config.backends.get(backend_name)
+        if backend is None:
+            return True
+        deny = getattr(backend, "deny_tools", None) or []
+        allow = getattr(backend, "allow_tools", None) or []
+
+        # Deny takes precedence.
+        for pattern in deny:
+            if fnmatch.fnmatch(bare_name, pattern):
+                return False
+        # Empty allow-list = allow all.
+        if not allow:
+            return True
+        # Non-empty allow-list = only-those.
+        return any(fnmatch.fnmatch(bare_name, pattern) for pattern in allow)
+
+    def _tool_infos_to_definitions(self, tools: List[Any]) -> List[Any]:
+        """Convert a backend's ToolInfo list into ToolDefinition objects.
+
+        BE-COMPACT-001: factored out of _rebuild_for_backends / full_sync so
+        the compaction path can rebuild the CURRENT FULL tool set (across every
+        connected backend) with identical conversion semantics — the qualified
+        name stays the globally-unique ToolDefinition.name, server is parsed
+        from the "server:tool" prefix, and list-typed param schemas collapse to
+        a "/"-joined string.
+
+        FEAT-01: the FULL inputSchema is preserved verbatim onto
+        ToolDefinition.raw_schema (the Wave-A field) — the collapsed
+        ``parameters`` view is still built (embedding_text + back-compat depend
+        on it), but the lossless original survives for downstream describe().
+
+        FEAT-06: the resolving backend's allow_tools/deny_tools globs are
+        applied so denied tools are NEVER indexed (skipped here → never
+        embedded, never in the index). Sibling B2 enforces the same filter at
+        the execute() boundary for defense-in-depth.
+        """
         from tool_manifest import ToolDefinition
 
-        # Collect all tools from changed backends
+        definitions: List[Any] = []
+        for tool in tools:
+            # Parse server from the qualified name ("server:tool"). The short
+            # name is intentionally dropped — ToolDefinition.name uses
+            # tool.qualified_name (fully-qualified) to keep names globally
+            # unique across backends.
+            if ":" in tool.qualified_name:
+                server, _short_name = tool.qualified_name.split(":", 1)
+            else:
+                # No colon — fall back to the backend-reported server.
+                server = tool.server
+
+            # FEAT-06: apply the resolving backend's allow/deny globs against
+            # the BARE tool name. Denied tools are skipped entirely (not
+            # indexed, not embedded).
+            if not self._tool_allowed(server, tool.name):
+                logger.debug(
+                    f"Tool {tool.qualified_name} filtered out by "
+                    f"allow/deny globs for backend {server}"
+                )
+                continue
+
+            params = {}
+            if tool.input_schema and "properties" in tool.input_schema:
+                for param_name, param_info in tool.input_schema[
+                    "properties"
+                ].items():
+                    param_type = param_info.get("type", "any")
+                    if isinstance(param_type, list):
+                        param_type = "/".join(param_type)
+                    params[param_name] = param_type
+
+            # FEAT-01: carry the full inputSchema verbatim. Normalize an empty
+            # / falsy schema to None so the DB stores SQL NULL rather than "{}"
+            # — "no schema captured" reads cleanly downstream.
+            raw_schema = tool.input_schema if tool.input_schema else None
+
+            definitions.append(
+                ToolDefinition(
+                    name=tool.qualified_name,
+                    description=tool.description,
+                    category=self._categorize_tool(tool.name, tool.description),
+                    server=server,
+                    parameters=params,
+                    examples=[],
+                    is_core=False,
+                    raw_schema=raw_schema,
+                )
+            )
+        return definitions
+
+    def _collect_all_connected_tools(self) -> List[Any]:
+        """Collect ToolDefinitions from EVERY currently-connected backend.
+
+        BE-COMPACT-001: build_index is a FULL table-truncating replace, so the
+        orphan-vector compaction rebuild MUST see the whole live catalog, not
+        just the changed subset. Iterate all configured backends and gather
+        tools from those that are connected (get_backend_tools already returns
+        [] for a disconnected backend, so an explicit is_backend_connected
+        check keeps us defensive when the manager exposes it).
+        """
+        all_tools: List[Any] = []
+        for backend_name in self.config.backends.keys():
+            is_connected = getattr(self.backends, "is_backend_connected", None)
+            if callable(is_connected) and not is_connected(backend_name):
+                continue
+            tools = self.backends.get_backend_tools(backend_name)
+            if not tools:
+                continue
+            all_tools.extend(self._tool_infos_to_definitions(tools))
+        return all_tools
+
+    async def _rebuild_for_backends(self, backend_names: List[str]):
+        """Rebuild index for specified backends."""
+        # Collect all tools from changed backends (ToolDefinition conversion is
+        # delegated to _tool_infos_to_definitions, which imports ToolDefinition).
         all_tools = []
         db = self._get_db()
 
@@ -341,43 +484,9 @@ class SyncManager:
             }
             staged_backends.append(backend_name)
 
-            # Convert to ToolDefinition format
-            for tool in tools:
-                # Parse server from the qualified name ("server:tool").
-                # The short name is intentionally dropped here — ToolDefinition.name
-                # below uses tool.qualified_name (fully-qualified) to keep names
-                # globally unique across backends.
-                if ":" in tool.qualified_name:
-                    server, _short_name = tool.qualified_name.split(":", 1)
-                else:
-                    # No colon — fall back to the backend-reported server.
-                    # Note: tool.qualified_name is unqualified in this case; we
-                    # still use it as ToolDefinition.name below, accepting that
-                    # a server-less name can collide with tools from other backends.
-                    server = tool.server
-
-                # Extract parameters from schema
-                params = {}
-                if tool.input_schema and "properties" in tool.input_schema:
-                    for param_name, param_info in tool.input_schema[
-                        "properties"
-                    ].items():
-                        param_type = param_info.get("type", "any")
-                        if isinstance(param_type, list):
-                            param_type = "/".join(param_type)
-                        params[param_name] = param_type
-
-                all_tools.append(
-                    ToolDefinition(
-                        name=tool.qualified_name,
-                        description=tool.description,
-                        category=self._categorize_tool(tool.name, tool.description),
-                        server=server,
-                        parameters=params,
-                        examples=[],
-                        is_core=False,
-                    )
-                )
+            # Convert to ToolDefinition format (BE-COMPACT-001: shared helper
+            # so the compaction full-set path below uses identical semantics).
+            all_tools.extend(self._tool_infos_to_definitions(tools))
 
             # DEG-02: write an interim 'rebuilding' state (not 'synced') with
             # the fresh count/hash. The terminal 'synced' is written only once
@@ -421,17 +530,27 @@ class SyncManager:
         ):
             # Enough churn has accumulated — do a real rebuild so orphaned
             # vectors no longer eat the fixed search candidate window.
+            #
+            # BE-COMPACT-001: build_index is a FULL table-truncating replace
+            # (DELETE FROM tools + rebuild HNSW from ONLY the passed tools).
+            # `all_tools` here holds ONLY the changed subset (backend_names),
+            # so passing it would silently delete every OTHER connected
+            # backend's tools — compass() would then return "no matching tool"
+            # for them until a manual full_sync. Re-collect the CURRENT FULL
+            # catalog across every connected backend and rebuild from that.
+            full_tools = self._collect_all_connected_tools()
             logger.info(
                 f"Orphan-vector compaction: {self._incremental_cycles_since_rebuild} "
                 f"incremental cycles with removals reached threshold "
                 f"({self._rebuild_after_incremental_cycles}); doing a full "
-                f"build_index rebuild of {len(all_tools)} tool(s)."
+                f"build_index rebuild of {len(full_tools)} tool(s) across all "
+                f"connected backends (changed subset: {len(all_tools)})."
             )
-            await self.index.build_index(all_tools)
+            await self.index.build_index(full_tools)
             self._incremental_cycles_since_rebuild = 0
             logger.info(
-                f"Full rebuild complete: {len(all_tools)} tools from "
-                f"backends: {backend_names}"
+                f"Full rebuild complete: {len(full_tools)} tools across all "
+                f"connected backends (triggered by: {backend_names})"
             )
             # DEG-02: rebuild succeeded — promote staged backends to 'synced'.
             self._mark_backends_synced(staged_backends)
@@ -513,9 +632,9 @@ class SyncManager:
             connected_backends = [n for n, ok in connect_results.items() if ok]
             failed_backends = [n for n, ok in connect_results.items() if not ok]
 
-            # Collect all tools
-            from tool_manifest import ToolDefinition
-
+            # Collect all tools (ToolDefinition conversion — incl. FEAT-01
+            # raw_schema + FEAT-06 filtering — is delegated to the shared
+            # _tool_infos_to_definitions helper below).
             all_tools = []
             db = self._get_db()
 
@@ -575,37 +694,11 @@ class SyncManager:
                     "removed": len(old_names - new_names),
                 }
 
-                # Convert to ToolDefinition
-                for tool in tools:
-                    # See sibling comment in _rebuild_for_backends — short name
-                    # is intentionally dropped; ToolDefinition.name uses the
-                    # qualified form.
-                    if ":" in tool.qualified_name:
-                        server, _short_name = tool.qualified_name.split(":", 1)
-                    else:
-                        server = tool.server
-
-                    params = {}
-                    if tool.input_schema and "properties" in tool.input_schema:
-                        for param_name, param_info in tool.input_schema[
-                            "properties"
-                        ].items():
-                            param_type = param_info.get("type", "any")
-                            if isinstance(param_type, list):
-                                param_type = "/".join(param_type)
-                            params[param_name] = param_type
-
-                    all_tools.append(
-                        ToolDefinition(
-                            name=tool.qualified_name,
-                            description=tool.description,
-                            category=self._categorize_tool(tool.name, tool.description),
-                            server=server,
-                            parameters=params,
-                            examples=[],
-                            is_core=False,
-                        )
-                    )
+                # Convert to ToolDefinition via the shared helper so full_sync
+                # inherits identical semantics: FEAT-01 raw_schema fidelity and
+                # FEAT-06 allow/deny filtering (previously this path had its own
+                # inline copy that dropped the schema and ignored the filters).
+                all_tools.extend(self._tool_infos_to_definitions(tools))
 
                 # DEG-02: interim 'rebuilding' state; promoted to 'synced'
                 # only after build_index succeeds below.

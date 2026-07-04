@@ -6,7 +6,10 @@ Tests usage tracking, hot cache, and chain detection.
 
 import asyncio
 import threading
+from datetime import datetime, timedelta, timezone
+from unittest.mock import patch
 
+import numpy as np
 import pytest
 
 from analytics import HotToolEntry
@@ -338,6 +341,138 @@ class TestChainDetection:
         assert ab["occurrence_count"] == 2, ab["occurrence_count"]
 
 
+class TestRetentionPrune:
+    """FEAT-04: prune_old_records deletes rows older than the retention window.
+
+    tool_calls + search_queries append one row per call/search forever with no
+    TTL. prune_old_records(retention_days) DELETEs rows whose created_at is
+    older than the window and returns the total deleted. These tests insert
+    rows with EXPLICIT UTC created_at timestamps (SQLite CURRENT_TIMESTAMP is
+    UTC) so the assertions are host-timezone-independent — they must not depend
+    on the machine's local offset, mirroring the CA-001 UTC discipline.
+    """
+
+    @staticmethod
+    def _utc_stamp(days_ago: float) -> str:
+        """A 'YYYY-MM-DD HH:MM:SS' UTC string N days in the past.
+
+        Matches the format SQLite CURRENT_TIMESTAMP writes into created_at, so
+        the string compares correctly against the SQL cutoff regardless of the
+        host timezone.
+        """
+        dt = datetime.now(timezone.utc) - timedelta(days=days_ago)
+        return dt.strftime("%Y-%m-%d %H:%M:%S")
+
+    def _insert_call(self, analytics, tool_name: str, days_ago: float) -> None:
+        db = analytics._get_db()
+        with analytics._lock:
+            db.execute(
+                "INSERT INTO tool_calls "
+                "(tool_name, server, success, latency_ms, created_at) "
+                "VALUES (?, ?, 1, 1.0, ?)",
+                (tool_name, "test", self._utc_stamp(days_ago)),
+            )
+            db.commit()
+
+    def _insert_search(self, analytics, query: str, days_ago: float) -> None:
+        db = analytics._get_db()
+        with analytics._lock:
+            db.execute(
+                "INSERT INTO search_queries "
+                "(query, result_count, latency_ms, created_at) "
+                "VALUES (?, 0, 1.0, ?)",
+                (query, self._utc_stamp(days_ago)),
+            )
+            db.commit()
+
+    def _count(self, analytics, table: str) -> int:
+        db = analytics._get_db()
+        return db.execute(f"SELECT COUNT(*) AS n FROM {table}").fetchone()["n"]
+
+    @pytest.mark.asyncio
+    async def test_prune_deletes_only_old_rows_and_returns_count(
+        self, test_analytics
+    ):
+        """prune_old_records(30) deletes only rows older than 30 days across
+        BOTH tables, returns the total deleted, and leaves recent rows."""
+        # 2 old tool_calls (well past the window), 1 recent tool_call.
+        self._insert_call(test_analytics, "test:old_a", days_ago=45)
+        self._insert_call(test_analytics, "test:old_b", days_ago=31)
+        self._insert_call(test_analytics, "test:recent", days_ago=1)
+        # 1 old search_query, 1 recent search_query.
+        self._insert_search(test_analytics, "old query", days_ago=60)
+        self._insert_search(test_analytics, "recent query", days_ago=2)
+
+        deleted = await test_analytics.prune_old_records(30)
+
+        # 2 old calls + 1 old search = 3 rows removed.
+        assert deleted == 3, deleted
+        # Recent rows survive in each table.
+        assert self._count(test_analytics, "tool_calls") == 1
+        assert self._count(test_analytics, "search_queries") == 1
+
+    @pytest.mark.asyncio
+    async def test_prune_zero_retention_is_noop(self, test_analytics):
+        """retention_days=0 keeps everything forever — deletes nothing."""
+        self._insert_call(test_analytics, "test:ancient", days_ago=365)
+        self._insert_search(test_analytics, "ancient query", days_ago=365)
+
+        deleted = await test_analytics.prune_old_records(0)
+
+        assert deleted == 0
+        assert self._count(test_analytics, "tool_calls") == 1
+        assert self._count(test_analytics, "search_queries") == 1
+
+    @pytest.mark.asyncio
+    async def test_prune_negative_retention_is_noop(self, test_analytics):
+        """retention_days < 0 is treated like 0 — no-op, returns 0."""
+        self._insert_call(test_analytics, "test:ancient", days_ago=365)
+
+        deleted = await test_analytics.prune_old_records(-5)
+
+        assert deleted == 0
+        assert self._count(test_analytics, "tool_calls") == 1
+
+    @pytest.mark.asyncio
+    async def test_prune_recent_rows_survive_boundary(self, test_analytics):
+        """A row just INSIDE the window (younger than the cutoff) is kept."""
+        # 29 days old with a 30-day window -> inside the window, must survive.
+        self._insert_call(test_analytics, "test:inside_window", days_ago=29)
+
+        deleted = await test_analytics.prune_old_records(30)
+
+        assert deleted == 0
+        assert self._count(test_analytics, "tool_calls") == 1
+
+    @pytest.mark.asyncio
+    async def test_prune_on_degraded_db_does_not_raise(self, test_analytics):
+        """A prune while already degraded is a silent no-op (returns 0),
+        never raising — matching record_search / record_tool_call."""
+        test_analytics._degraded = True
+
+        # Must not raise even though the instance is degraded.
+        deleted = await test_analytics.prune_old_records(30)
+        assert deleted == 0
+
+    @pytest.mark.asyncio
+    async def test_prune_on_broken_db_degrades_not_raises(self, test_analytics):
+        """If the underlying DB errors mid-prune, the method degrades (sets
+        _degraded, returns 0) rather than propagating sqlite3.Error."""
+        # Prime the connection, then close it out from under the method so the
+        # DELETE raises sqlite3.ProgrammingError / sqlite3.Error. We do NOT go
+        # through close() (which sets _closed and refuses reopen) — we want the
+        # write itself to fail, exercising the try/except degradation path.
+        db = test_analytics._get_db()
+        db.close()  # underlying handle now unusable; self.db still references it
+
+        # Insert is impossible now, but prune must swallow the error, mark
+        # degraded, and return 0 instead of raising.
+        deleted = await test_analytics.prune_old_records(30)
+
+        assert deleted == 0
+        assert test_analytics._degraded is True
+
+
 class TestAnalyticsSummary:
     """Test analytics summary generation."""
 
@@ -373,6 +508,54 @@ class TestAnalyticsSummary:
         assert summary["tool_calls"]["total"] >= 3
         # Success rate should reflect 2/3 successes (approximately 66.7%)
 
+    @pytest.mark.asyncio
+    async def test_summary_window_bound_is_utc_not_local(self, test_analytics):
+        """CA-001: the timeframe window bound must be computed in UTC.
+
+        `created_at` columns are written by SQLite CURRENT_TIMESTAMP (UTC).
+        If get_analytics_summary computes `since` from naive local wall-clock
+        (datetime.now()), then on an ahead-of-UTC host the local bound
+        overshoots the just-inserted UTC row and it silently vanishes from the
+        window. This test forces that skew regardless of the real host TZ by
+        making naive datetime.now() report a time well ahead of true UTC while
+        datetime.now(timezone.utc) still returns real UTC. The row must still
+        appear in the "1h" window — which only holds if the bound is UTC.
+        """
+
+        class MockResult:
+            class MockTool:
+                name = "test:read_file"
+
+            tool = MockTool()
+
+        # Record a search first — SQLite stamps created_at in real UTC.
+        await test_analytics.record_search(
+            query="utc window bound check",
+            results=[MockResult()],
+            latency_ms=12.0,
+        )
+
+        real_utc = datetime.now(timezone.utc)
+        # Simulate an ahead-of-UTC host: naive now() is 6h in the future
+        # relative to the UTC-stored row. A buggy local-time bound of
+        # (naive_now - 1h) = real_utc + 5h excludes the just-inserted row;
+        # a correct UTC bound of (real_utc - 1h) includes it.
+        fake_local_now = real_utc.replace(tzinfo=None) + timedelta(hours=6)
+
+        class _FrozenDateTime(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                if tz is None:
+                    return fake_local_now
+                return datetime.now(tz)
+
+        with patch("analytics.datetime", _FrozenDateTime):
+            summary = await test_analytics.get_analytics_summary("1h")
+
+        # The row is within the last hour of real UTC, so a correct UTC bound
+        # must include it. Fails today because the bound is naive-local.
+        assert summary["searches"]["total"] >= 1
+
 
 class TestPersistence:
     """Test analytics data persistence."""
@@ -405,6 +588,54 @@ class TestPersistence:
         entry = test_analytics._hot_cache["test:persistent_tool"]
         assert entry.tool_name == "test:persistent_tool"
         assert entry.call_count == 5
+
+    @pytest.mark.asyncio
+    async def test_load_hot_cache_skips_corrupt_rows(self, test_analytics):
+        """PC-B-001: a corrupt schema_json or truncated embedding blob in
+        hot_tools must NOT raise out of load_hot_cache_from_db().
+
+        load_hot_cache_from_db runs on the mandatory init path (awaited
+        unconditionally inside get_analytics_instance(), which compass() and
+        execute() call unwrapped). Before the fix it called json.loads /
+        np.frombuffer directly on persisted blobs, so one corrupt row raised a
+        raw JSONDecodeError / ValueError through the MCP envelope. It must
+        degrade to "skip the bad row" and still load the good rows, mirroring
+        record_search / record_tool_call.
+        """
+        db = test_analytics._get_db()
+
+        # A well-formed good row that must survive.
+        good_vec = np.arange(4, dtype=np.float32).tobytes()
+        # A row with corrupt (non-JSON) schema_json → json.JSONDecodeError.
+        # A row with a truncated embedding blob (not a multiple of 4 bytes)
+        # → ValueError from np.frombuffer.
+        with test_analytics._lock:
+            db.execute(
+                "INSERT INTO hot_tools (tool_name, rank, call_count, embedding, schema_json, description) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                ("test:good", 0, 3, good_vec, '{"ok": true}', "good tool"),
+            )
+            db.execute(
+                "INSERT INTO hot_tools (tool_name, rank, call_count, embedding, schema_json, description) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                ("test:bad_schema", 1, 2, None, "{not valid json", "bad schema"),
+            )
+            db.execute(
+                "INSERT INTO hot_tools (tool_name, rank, call_count, embedding, schema_json, description) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                ("test:bad_embedding", 2, 1, b"\x01\x02\x03", None, "bad embedding"),
+            )
+            db.commit()
+
+        test_analytics._hot_cache.clear()
+
+        # Must NOT raise despite the two corrupt rows.
+        await test_analytics.load_hot_cache_from_db()
+
+        # Good row is still loaded; corrupt rows are skipped, not fatal.
+        assert "test:good" in test_analytics._hot_cache
+        assert "test:bad_schema" not in test_analytics._hot_cache
+        assert "test:bad_embedding" not in test_analytics._hot_cache
 
     def test_close(self, test_analytics):
         """Should close database connection cleanly."""
