@@ -47,9 +47,10 @@ Tool Compassは、**セマンティック検索**を使用して、自然言語�
 
 ```bash
 npx @mcptoolshop/tool-compass --help
-npx @mcptoolshop/tool-compass serve     # MCP gateway
-npx @mcptoolshop/tool-compass ui        # Gradio UI
-npx @mcptoolshop/tool-compass doctor    # Diagnose setup
+npx @mcptoolshop/tool-compass serve                 # MCP gateway
+npx @mcptoolshop/tool-compass ui                    # Gradio UI
+npx @mcptoolshop/tool-compass doctor                # Diagnose setup
+npx @mcptoolshop/tool-compass execute fs:read_file '{"path":"README.md"}'  # Smoke-test a proxied call
 ```
 
 初回実行時に検証済みのプラットフォームバイナリをダウンロードします（SHA256でGitHubリリースに対してチェックされます）。ローカルにキャッシュされ、その後の呼び出しは瞬時に開始されます。npmの[@mcptoolshop/tool-compass](https://www.npmjs.com/package/@mcptoolshop/tool-compass)を参照してください。
@@ -109,13 +110,13 @@ docker-compose --profile with-ollama up
 
 ## 機能
 
-- **セマンティック検索** - 実行したい内容を記述することでツールを見つける
-- **段階的な情報開示** - `compass()` → `describe()` → `execute()`
-- **ホットキャッシュ** - よく使用されるツールは事前にロードされる
-- **チェーン検出** - 一般的なツールのワークフローを自動的に検出する
-- **分析** - 使用パターンとツールのパフォーマンスを追跡する
-- **クロスプラットフォーム** - Windows、macOS、Linux
-- **Docker対応** - 1つのコマンドでデプロイ可能
+- **ハイブリッド検索** - セマンティック（HNSW）+ レキシカル融合、完全一致する名前による優先度向上 — 必要なものを記述するか、ツールの名前を貼り付けると、最も関連性の高い結果が上位に表示されます。
+- **フルスキーマの段階的な開示** - `compass()` → `describe()` → `execute()`；`describe()` は完全な `inputSchema`（必須フィールド、説明、列挙型、デフォルト値）を返します。
+- **stdio + HTTP バックエンド** - ローカルサブプロセス MCP サーバーと、ストリーミング可能な HTTP を介したリモート/SaaS サーバーを使用。オプションでベアラー・トークン認証を設定できます。
+- **ツールごとのタイムアウトと許可/拒否** - 各バックエンド/ツールのデフォルトのタイムアウトをオーバーライドします。広範なバックエンドから安全なサブセットを公開します。
+- **ホットキャッシュとチェーン検出** - よく使用されるツールは事前にロードされます。一般的なツールのワークフローは自動的に検出されます。
+- **分析** - 使用状況パターンとツールのパフォーマンスを追跡します（保持/削除）。
+- **クロスプラットフォーム対応 & Docker 対応** - Windows、macOS、Linux；ワンコマンドでデプロイできます。
 
 ## アーキテクチャ
 
@@ -172,15 +173,17 @@ compass(
 
 | ツール | 説明 |
 |------|-------------|
-| `compass(intent)` | ツールのセマンティック検索 |
-| `describe(tool_name)` | ツールの完全なスキーマを取得する |
+| `compass(intent)` | 完全一致する名前による優先度向上の機能を備えたハイブリッドセマンティック + レキシカル検索 |
+| `describe(tool_name)` | ツールの完全な `inputSchema`（必須/列挙型/デフォルト値）を取得します。 |
 | `execute(tool_name, args)` | バックエンドでツールを実行する |
 | `compass_categories()` | カテゴリとサーバーを一覧表示する |
-| `compass_status()` | システムの状態と構成 |
+| `compass_status(active)` | システムの健全性と構成；`active=True` は、ライブバックエンドの稼働状況をチェックします。 |
 | `compass_analytics(timeframe)` | 使用状況の統計情報 |
 | `compass_chains(action)` | ツールのワークフローを管理する |
 | `compass_sync(force)` | バックエンドからインデックスを再構築する |
 | `compass_audit()` | 完全なシステムレポート |
+
+同じ操作は CLI からも実行できます。ターミナルからプロキシされた呼び出しをテストするために、`tool-compass execute <ツール> '<json>'` を使用することもできます。
 
 ### 段階的な情報開示パターン
 
@@ -225,13 +228,14 @@ execute("comfy:comfy_generate", {"prompt": "a sunset over mountains"})
 | `OLLAMA_URL` | OllamaサーバーのURL | `http://localhost:11434` |
 | `COMFYUI_URL` | ComfyUIサーバー | `http://localhost:8188` |
 | `PORT` | HTTPトランスポートを有効にするために設定します（例：Fly.io用）。 | 未設定（stdio） |
+| `TOOL_COMPASS_GATEWAY_AUTH_TOKEN` | HTTP トランスポートではベアラー・トークンが必要です（オプションで設定可能；`gateway_auth_token` 構成フィールドをオーバーライドします）。 | 設定なし（認証なし） |
 
 **デフォルトのデータディレクトリ:**
 - **Windows:** `%LOCALAPPDATA%\tool-compass\`
 - **macOS:** `~/Library/Application Support/tool-compass/`
 - **Linux:** `~/.config/tool-compass/`（または `$XDG_CONFIG_HOME/tool-compass/`）
 
-すべてのオプションについては、[`.env.example`](.env.example)を参照してください。
+v2.5.0 で追加された構成ファイルの設定（`compass_config.json` 内）：`hybrid_search`、`exact_name_boost`、バックエンドごとの `default_timeout` / `tool_timeouts`、`allow_tools` / `deny_tools`、`analytics_retention_days`、および HTTP (`type: "http"`) バックエンド。これらは [ハンドブック → 構成](https://mcp-tool-shop-org.github.io/tool-compass/handbook/configuration/) に記載されています。環境変数のオプションについては、[`.env.example`](.env.example) を参照してください。
 
 ## パフォーマンス
 
@@ -315,14 +319,16 @@ Tool Compassは、**ローカル優先**の開発ツールです。[SECURITY.md]
 カテゴリごとのスコアは、スワーム処理後に以下のコマンドで再生成される:
 `bash scripts/regenerate-scorecard.sh` (これは `npx @mcptoolshop/shipcheck audit` をラップしたもの)。現在の公式な詳細については [SCORECARD.md](SCORECARD.md) を参照してください。以下に示す表は、それを反映したものであり、意図的に手動で作成されていません。手動で編集されたセクション (既知の課題、修正履歴) は、`<!-- SHIPCHECK-AUTO-START/END -->` マーカーの外に SCORECARD.md に存在し、再生成時に保持されます。
 
+最新の `shipcheck audit`：**32 個チェック済み · 0 個未チェック · 5 個スキップ · 合格率 100% — すべての必須条件を満たしています。**
+
 | カテゴリ | スコア | 注釈 |
 |----------|-------|-------|
-| A. セキュリティ | 未定 (TBD) | SHA で固定されたアクション、ダイジェストで固定されたベースイメージ、SLSA プロベナンス + SBOM を PyPI および GHCR に適用、pre-commit によるシークレットスキャン |
-| B. エラー処理 | 未定 (TBD) | 構造化された結果、適切なフォールバック、終了コード |
-| C. 運用ドキュメント | 未定 (TBD) | README、CHANGELOG、LICENSE、Makefile の `verify` + `verify-metrics` + `scorecard` コマンド |
-| D. リリース衛生管理 | 未定 (TBD) | CI を統合、すべてのジョブでタイムアウト時間と保持期間を設定、pytest 設定を pyproject.toml に記述 |
-| E. アイデンティティ (ソフト) | 未定 (TBD) | ロゴ、ランディングページ、GitHub メタデータ、pyproject.toml で明示的に指定されたメンテナー |
-| **Total** | **TBD** | `make scorecard` コマンドで再生成 |
+| A. セキュリティ | ✅ 合格 | SHA で固定されたアクション；ダイジェストで固定されたベースイメージ；PyPI および GHCR 上の SLSA プロビナンス + SBOM；プリコミット時のシークレットスキャン；オプションのゲートウェイベアラー認証。 |
+| B. エラー処理 | ✅ 合格 | 構造化された結果、適切なフォールバック、終了コード |
+| C. 運用ドキュメント | ✅ 合格 | README、CHANGELOG、LICENSE、Makefile の `verify` + `verify-metrics` + `scorecard` コマンド |
+| D. リリース衛生管理 | ✅ 合格 | CI を統合、すべてのジョブでタイムアウト時間と保持期間を設定、pytest 設定を pyproject.toml に記述 |
+| E. アイデンティティ (ソフト) | ✅ 合格 | ロゴ、ランディングページ、GitHub メタデータ、pyproject.toml で明示的に指定されたメンテナー |
+| **Total** | **100%** | すべての必須条件を満たしています — `make scorecard` を使用して再生成します。 |
 
 ## ライセンス
 

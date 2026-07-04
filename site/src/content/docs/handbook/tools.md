@@ -12,7 +12,7 @@ gateway log lines for that request. See the
 
 ## compass
 
-Semantic search for tools. Describe what you want to do and get back only the relevant tools. Also searches for matching tool chains (workflows).
+Search for tools. Describe what you want to do and get back only the relevant tools. By default (`hybrid_search`) the semantic (HNSW) and lexical signals are fused with Reciprocal Rank Fusion, and an exact tool-name paste (`exact_name_boost`) ranks #1. Also searches for matching tool chains (workflows).
 
 :::note
 When Ollama is unreachable, `compass()` falls back to SQLite `LIKE`
@@ -45,13 +45,13 @@ Returns matched tools with confidence scores, token savings, hints, and any matc
 
 ## describe
 
-Get the full JSON schema for a specific tool before calling it. This is the second step in the progressive disclosure flow.
+Get the full schema for a specific tool before calling it. This is the second step in the progressive disclosure flow.
 
 | Parameter | Required | Description |
 |-----------|----------|-------------|
 | `tool_name` | yes | Fully qualified tool name (e.g., `comfy:comfy_generate`) |
 
-Returns full tool schema including parameters, types, examples, and a hint for next steps.
+Returns the tool's complete `inputSchema` — required fields, per-parameter descriptions, enums, and defaults — alongside the collapsed `parameters` view and a hint for next steps, so you can build a correct `execute()` call in one hop.
 
 ## execute
 
@@ -68,7 +68,11 @@ List all tool categories and connected MCP servers. Use this to understand what 
 
 ## compass_status
 
-System health and configuration overview. Returns index stats, backend connection status, hot cache status, sync status, and chain info. Takes no arguments.
+System health and configuration overview. Returns index stats, backend connection status, hot cache status, sync status, chain info, and the analytics degraded flag.
+
+| Parameter | Required | Description |
+|-----------|----------|-------------|
+| `active` | no | When `true`, runs a live per-backend liveness probe (catches hung-but-connected backends). Default `false` (passive counters only). |
 
 ## compass_analytics
 

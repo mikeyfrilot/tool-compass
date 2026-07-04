@@ -61,6 +61,51 @@ If no config file is found, built-in defaults are used. See `compass_config.exam
 | `hnsw_ef_construction` | int | `200` | HNSW build-time search width; higher = better index quality, slower build (clamped `40`–`800`) |
 | `hnsw_ef_search` | int | `50` | HNSW query-time search width; higher = better recall, slower search (clamped `10`–`400`) |
 
+#### Added in v2.5.0
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `hybrid_search` | bool | `true` | Fuse the semantic (HNSW) and lexical signals with Reciprocal Rank Fusion on the healthy path. `false` = pure-semantic ordering. |
+| `exact_name_boost` | bool | `true` | An exact tool-name match (full `server:tool` or the bare tool name) is boosted to rank #1. |
+| `exact_match_confidence` | float | `1.0` | Confidence assigned to an exact-name match (clamped `0.0`–`1.0`). |
+| `analytics_retention_days` | int | `30` | Prune analytics rows older than this on startup sync (`0` = keep forever). |
+| `gateway_auth_token` | string \| null | `null` | Bearer token required on the HTTP transport (opt-in). Set here or via `TOOL_COMPASS_GATEWAY_AUTH_TOKEN` (env wins). Redacted in `doctor` output. Never affects stdio. |
+
+**Per-backend options** (set inside a `backends.<name>` object):
+
+| Key | Type | Applies to | Description |
+|-----|------|------------|-------------|
+| `default_timeout` | float \| null | stdio, http | Per-backend tool-call timeout in seconds, overriding the 15 s default (clamped `1.0`–`600.0`). |
+| `tool_timeouts` | object | stdio, http | Per-tool timeout override, keyed by the **bare** tool name (e.g. `{"generate_image": 120}`). |
+| `allow_tools` | string[] | stdio, http, import | Glob allowlist — only matching tools are indexed/executed (empty = allow all). |
+| `deny_tools` | string[] | stdio, http, import | Glob denylist — matching tools are never indexed/executed (deny wins over allow). |
+
+> Backend **names must not contain `:`** — it is the reserved `backend:tool`
+> separator. A colon in a backend name is rejected at config load.
+
+### HTTP (remote) backends
+
+Beyond local stdio subprocess servers, a backend can be a remote MCP server
+spoken over streamable-http:
+
+```json
+{
+  "backends": {
+    "remote-fs": {
+      "type": "http",
+      "url": "https://mcp.example.com/mcp",
+      "headers": { "Authorization": "Bearer ${REMOTE_MCP_TOKEN}" },
+      "default_timeout": 30,
+      "deny_tools": ["*delete*", "*write*"]
+    }
+  }
+}
+```
+
+Response headers are redacted in `doctor`/`show_config` output. To require a
+token on **your** gateway's HTTP endpoint (as opposed to an upstream backend),
+set `gateway_auth_token`.
+
 ### Variable substitution
 
 The config file supports `${VAR}` substitution. Values are resolved from environment variables first, then from a `defaults` block in the config file:

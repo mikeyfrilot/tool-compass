@@ -7,6 +7,86 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.5.0] - 2026-07-04
+
+Dogfood swarm v4 — a composed re-audit health pass (Stage A bug/security →
+B/C/D proactive/humanization/visual) followed by a 12-feature pass, each
+feature closed by an adversarial cross-wave re-audit. Tests 1148 → 1337
+(88.6% coverage); ruff clean. No breaking API changes — every new config
+field defaults to today's behavior and all existing tool/CLI responses keep
+their shape. Two behavior changes are called out under **Changed**.
+
+### Added
+- **HTTP / streamable-http backend transport.** Backends of type `http` now
+  connect at runtime via the MCP SDK's Streamable HTTP client — tool-compass
+  can front remote / SaaS MCP servers, not just local stdio subprocesses.
+  `url` + `headers` (headers redacted in `doctor` output) as before.
+- **Optional bearer-token gateway auth** (`gateway_auth_token`, or the
+  `TOOL_COMPASS_GATEWAY_AUTH_TOKEN` env var). When set, the HTTP transport
+  requires `Authorization: Bearer <token>` (constant-time compare, `/health`
+  and `/ready` stay open). Opt-in and fail-closed only when enabled; the stdio
+  transport is never affected.
+- **Hybrid search + exact-name boost.** `compass()` now fuses the semantic
+  (HNSW) and lexical signals with Reciprocal Rank Fusion on the healthy path
+  (not only as an Ollama-outage fallback), and an exact tool-name paste
+  (`fs:read_file`, or the bare `read_file`) ranks #1. Toggles: `hybrid_search`,
+  `exact_name_boost`, `exact_match_confidence`.
+- **Full-schema `describe()`.** The complete JSON `inputSchema`
+  (required fields, per-parameter descriptions, enums, defaults) is now
+  preserved through sync and returned by `describe()` alongside the collapsed
+  `parameters` — so an agent can build a correct `execute()` call in one hop.
+- **Per-backend / per-tool timeouts** (`default_timeout`, `tool_timeouts`) —
+  override the 15 s default so slow image/video/LLM backends aren't cut off.
+- **`tool-compass execute <tool> '<json-args>'`** — run a proxied tool call
+  from the terminal to smoke-test a backend. `--timeout`, `--json`.
+- **Per-backend tool allow/deny** (`allow_tools` / `deny_tools` glob lists) —
+  expose a safe subset of a broad backend. Enforced at index time and at the
+  `execute()` boundary (defense-in-depth).
+- **Active liveness probe** on `compass_status(active=True)` — surfaces
+  hung-but-connected backends a passive connection check would miss.
+- **Analytics retention** (`analytics_retention_days`, default 30, `0` =
+  forever) with an automatic prune on startup sync, so the analytics DB no
+  longer grows without bound.
+- **Auto-refresh polling** — `sync_polling_interval` is now honored at runtime
+  (the gateway starts a background re-sync loop when it is `> 0`).
+- **Schema-aware change detection** — a backend that revises a tool's
+  description or parameters (same name) is now re-synced and re-embedded
+  (previously only name changes were detected).
+
+### Fixed
+- **Multi-backend index data loss (HIGH).** Orphan-vector compaction rebuilt
+  the index from only the changed-backend subset, silently deleting every
+  other backend's tools after ~20 churn cycles. Compaction now rebuilds from
+  the full connected catalog.
+- **Analytics time-window skew (HIGH).** Timeframe queries compared naive
+  local time against UTC-stored timestamps, shifting every windowed summary by
+  the host's UTC offset. All analytics windows are now computed in UTC.
+- **Docker UI unreachable.** The published image ran the Gradio UI bound to
+  `127.0.0.1` (loopback) despite the port mapping — `docker-compose up` served
+  nothing on `localhost:7860`. The image now binds `0.0.0.0`.
+- `compass()` no longer raises an unhandled `IndexError` on an empty-match +
+  zero-confidence-chain query; `compass_chains(create/detect)` returns the
+  structured service-unavailable envelope when Ollama is down instead of a raw
+  exception; `compass_chains(detect)` now actually indexes detected chains
+  (was reporting success without indexing them).
+- The embedding-cache write no longer commits inside `build_index`'s atomic
+  rebuild transaction (a failed HNSW save could leave DB/HNSW divergence).
+- CLI `search` now catches the real Ollama-down exception types and falls back
+  to keyword search (matching the UI/gateway), so `--help`'s promise holds.
+- `requirements.txt` now includes `rich` (the Docker image was missing it);
+  `.env.example` / `llms.txt` corrected to the env vars the code actually reads.
+- Several test-integrity fixes (coroutine leak, tautological/mis-named tests).
+
+### Changed
+- **Hybrid search is on by default** (`hybrid_search=True`). This changes the
+  default result ranking (for the better); set `hybrid_search=false` to restore
+  pure-semantic ordering. The response envelope, `min_confidence`, and `top_k`
+  contracts are unchanged.
+- **Backend names containing `:` are now rejected at config load** with a clear
+  error — a colon is the reserved `backend:tool` separator and made routing and
+  the allow/deny policy ambiguous. Rename any such backend (this only rejects
+  configs that were already mis-routing).
+
 ## [2.4.0] - 2026-06-20
 
 Dogfood swarm v3 — full health pass (bug/security → proactive → humanization

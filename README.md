@@ -47,9 +47,10 @@ Tool Compass uses **semantic search** to find relevant tools from a natural lang
 
 ```bash
 npx @mcptoolshop/tool-compass --help
-npx @mcptoolshop/tool-compass serve     # MCP gateway
-npx @mcptoolshop/tool-compass ui        # Gradio UI
-npx @mcptoolshop/tool-compass doctor    # Diagnose setup
+npx @mcptoolshop/tool-compass serve                 # MCP gateway
+npx @mcptoolshop/tool-compass ui                    # Gradio UI
+npx @mcptoolshop/tool-compass doctor                # Diagnose setup
+npx @mcptoolshop/tool-compass execute fs:read_file '{"path":"README.md"}'  # Smoke-test a proxied call
 ```
 
 Downloads a verified platform binary on first run (SHA256-checked against the GitHub Release). Cached locally — subsequent invocations launch instantly. See [@mcptoolshop/tool-compass](https://www.npmjs.com/package/@mcptoolshop/tool-compass) on npm.
@@ -110,13 +111,13 @@ docker-compose --profile with-ollama up
 
 ## Features
 
-- **Semantic Search** - Find tools by describing what you want to do
-- **Progressive Disclosure** - `compass()` → `describe()` → `execute()`
-- **Hot Cache** - Frequently used tools are pre-loaded
-- **Chain Detection** - Automatically discovers common tool workflows
-- **Analytics** - Track usage patterns and tool performance
-- **Cross-Platform** - Windows, macOS, Linux
-- **Docker Ready** - One-command deployment
+- **Hybrid Search** - Semantic (HNSW) + lexical fusion with exact-name boost — describe what you want, or paste a tool name and it ranks #1
+- **Full-Schema Progressive Disclosure** - `compass()` → `describe()` → `execute()`; `describe()` returns the complete `inputSchema` (required fields, descriptions, enums, defaults)
+- **stdio + HTTP backends** - Front local subprocess MCP servers *and* remote / SaaS servers over streamable-http, with optional bearer-token auth
+- **Per-tool timeouts & allow/deny** - Override the default timeout per backend/tool; expose a safe subset of a broad backend
+- **Hot Cache & Chain Detection** - Frequently used tools pre-loaded; common tool workflows discovered automatically
+- **Analytics** - Track usage patterns and tool performance (with retention/prune)
+- **Cross-Platform & Docker Ready** - Windows, macOS, Linux; one-command deployment
 
 ## Architecture
 
@@ -173,15 +174,17 @@ Returns:
 
 | Tool | Description |
 |------|-------------|
-| `compass(intent)` | Semantic search for tools |
-| `describe(tool_name)` | Get full schema for a tool |
+| `compass(intent)` | Hybrid semantic + lexical search with exact-name boost |
+| `describe(tool_name)` | Get the full `inputSchema` for a tool (required/enums/defaults) |
 | `execute(tool_name, args)` | Run a tool on its backend |
 | `compass_categories()` | List categories and servers |
-| `compass_status()` | System health and config |
+| `compass_status(active)` | System health and config; `active=True` runs a live backend liveness probe |
 | `compass_analytics(timeframe)` | Usage statistics |
 | `compass_chains(action)` | Manage tool workflows |
 | `compass_sync(force)` | Rebuild index from backends |
 | `compass_audit()` | Full system report |
+
+The same actions are available from the CLI — including `tool-compass execute <tool> '<json>'` to smoke-test a proxied call from the terminal.
 
 ### Progressive Disclosure Pattern
 
@@ -226,13 +229,18 @@ The `hint` field in compass results guides this flow, suggesting when to use `de
 | `OLLAMA_URL` | Ollama server URL | `http://localhost:11434` |
 | `COMFYUI_URL` | ComfyUI server | `http://localhost:8188` |
 | `PORT` | Set to enable HTTP transport (e.g., for Fly.io) | unset (stdio) |
+| `TOOL_COMPASS_GATEWAY_AUTH_TOKEN` | Bearer token required on the HTTP transport (opt-in; overrides the `gateway_auth_token` config field) | unset (no auth) |
 
 **Default data directories:**
 - **Windows:** `%LOCALAPPDATA%\tool-compass\`
 - **macOS:** `~/Library/Application Support/tool-compass/`
 - **Linux:** `~/.config/tool-compass/` (or `$XDG_CONFIG_HOME/tool-compass/`)
 
-See [`.env.example`](.env.example) for all options.
+Config-file settings (in `compass_config.json`) added in v2.5.0 — `hybrid_search`,
+`exact_name_boost`, per-backend `default_timeout` / `tool_timeouts`,
+`allow_tools` / `deny_tools`, `analytics_retention_days`, and HTTP (`type: "http"`)
+backends — are documented in the [Handbook → Configuration](https://mcp-tool-shop-org.github.io/tool-compass/handbook/configuration/).
+See [`.env.example`](.env.example) for env-var options.
 
 ## Performance
 
@@ -321,14 +329,16 @@ intentionally not hand-authored. Hand-curated sections (Known Gaps,
 Remediation History) live outside the `<!-- SHIPCHECK-AUTO-START/END -->`
 markers in SCORECARD.md and survive regenerations.
 
+Latest `shipcheck audit`: **32 checked · 0 unchecked · 5 skipped · 100% pass — all hard gates pass.**
+
 | Category | Score | Notes |
 |----------|-------|-------|
-| A. Security | TBD | SHA-pinned actions; digest-pinned base image; SLSA provenance + SBOM on PyPI + GHCR; pre-commit secrets scan |
-| B. Error Handling | TBD | Structured results, graceful degradation, exit codes |
-| C. Operator Docs | TBD | README, CHANGELOG, LICENSE, Makefile `verify` + `verify-metrics` + `scorecard` |
-| D. Shipping Hygiene | TBD | CI consolidated; timeout-minutes + retention-days on every job; pytest config in pyproject.toml |
-| E. Identity (soft) | TBD | Logo, landing page, GitHub metadata; explicit maintainers in pyproject.toml |
-| **Total** | **TBD** | Regenerate via `make scorecard` |
+| A. Security | ✅ Pass | SHA-pinned actions; digest-pinned base image; SLSA provenance + SBOM on PyPI + GHCR; pre-commit secrets scan; opt-in gateway bearer auth |
+| B. Error Handling | ✅ Pass | Structured results, graceful degradation, exit codes |
+| C. Operator Docs | ✅ Pass | README, CHANGELOG, LICENSE, Makefile `verify` + `verify-metrics` + `scorecard` |
+| D. Shipping Hygiene | ✅ Pass | CI consolidated; timeout-minutes + retention-days on every job; pytest config in pyproject.toml |
+| E. Identity (soft) | ✅ Pass | Logo, landing page, GitHub metadata; explicit maintainers in pyproject.toml |
+| **Total** | **100%** | All hard gates pass — regenerate via `make scorecard` |
 
 ## License
 
