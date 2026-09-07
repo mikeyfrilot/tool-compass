@@ -1,3 +1,14 @@
+# --- Measured CI cost (dogfood-swarm SKILL item 8) --------------------------
+# 10 billable min per push across 8 jobs (6.1 min actual wall time),
+# measured 2026-07-04 from run 28722872805. Most expensive jobs:
+#     2 min  Org URL sanity check  (1.1 min wall)
+#     2 min  Python 3.11 on ubuntu-latest  (1.9 min wall)
+#     2 min  Integration Tests  (1.4 min wall)
+# GitHub bills per JOB, rounded UP to the minute, x2 Windows / x10 macOS, so
+# billable minutes exceed wall time - many short jobs cost more than one long
+# one. This number is measured, never estimated; re-measure after any change:
+#   gh api repos/mcp-tool-shop-org/tool-compass/actions/runs/<id>/jobs
+# ---------------------------------------------------------------------------
 # Tool Compass CI Pipeline
 # Runs tests on pushes and PRs that touch code or config.
 # Also handles GitHub Pages deploy for site/** changes on main (folded in from
