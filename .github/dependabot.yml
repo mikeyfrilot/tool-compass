@@ -63,7 +63,7 @@ updates:
   # =============================================================================
   # docker — Dockerfile base-image FROM directives (CT-B-005)
   # =============================================================================
-  # Pairs with the digest-pinned `FROM python:3.11-slim@sha256:...` in
+  # Pairs with the digest-pinned `FROM python:3.12-slim@sha256:...` in
   # Dockerfile (CT-B-003). Without this ecosystem entry the digest pin
   # would become a stale anchor with no machine-readable refresh path.
   - package-ecosystem: "docker"
