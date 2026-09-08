@@ -9,17 +9,10 @@
     "preview": "astro preview"
   },
   "dependencies": {
-    "@astrojs/starlight": "^0.38.3",
-    "@mcptoolshop/site-theme": "^0.2.4",
+    "@astrojs/starlight": "^0.42.0",
+    "@mcptoolshop/site-theme": "^2.2.0",
     "@tailwindcss/vite": "^4.2.0",
-    "astro": "^6.4.6",
+    "astro": "^7.3.1",
     "tailwindcss": "^4.2.0"
-  },
-  "overrides": {
-    "esbuild": "^0.28.1",
-    "vite": "^7.3.5",
-    "postcss": "^8.5.10",
-    "devalue": "^5.8.1",
-    "js-yaml": "^4.2.0"
   }
 }
