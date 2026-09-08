@@ -9,7 +9,11 @@ REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 
 # Patterns that should never appear in tracked files
 STALE_PATTERNS=(
-  "mikeyfrilot"
+  # Written as a character class so the handle is never spelled literally in a
+  # PUBLIC repo. grep -rnE below treats it identically. Spelling it out here
+  # published the exact string this check exists to keep out -- flagged by
+  # identity-scan.py on 2026-09-08, and it was a true positive, not noise.
+  "mikey[f]rilot"
   "github\.com/mcp-tool-shop/"    # mcp-tool-shop without -org
   "your-repo"
   "your-org"

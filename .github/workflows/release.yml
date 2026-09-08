@@ -83,12 +83,12 @@ jobs:
 
       # ubuntu-latest's default python3 is not pinned to a particular minor
       # version. tomllib lives in Python 3.11+ stdlib — falling through to a
-      # 3.10 default would ImportError. Pin 3.11 explicitly (same setup-python
+      # 3.10 default would ImportError. Pin 3.12 explicitly (same setup-python
       # SHA as ci.yml + publish.yml) so the version check is reproducible.
       - name: Setup Python for pyproject version check
         uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6
         with:
-          python-version: '3.11'
+          python-version: '3.12'
 
       - name: Verify tag matches pyproject.toml version
         run: |
